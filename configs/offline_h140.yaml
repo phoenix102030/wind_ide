@@ -1,0 +1,48 @@
+measurement_file: ~/Projects/wind_ide/data/measurement/wv_h100_180_offline_imputed.mat
+nwp_file: ~/Projects/wind_ide/data/nwp/data_grid_offline.mat
+
+device: mps
+seed: 42
+dt: 1.0
+seq_len: 4
+chunk_len: 16
+forecast_horizon: 12
+
+out_dir: outputs/offline_140m_01
+
+# IDE stage
+ide_batch_size: 32
+ide_lr: 0.001
+ide_epochs: 30
+ide_max_steps: 100
+
+init_log_q_proc: -2.0
+init_log_r_obs: -2.0
+init_log_p0: 0.0
+init_log_damping: 0.0
+noise_reg_weight: 0.0001
+
+# ML stage
+hidden_dim: 32
+embed_dim: 32
+num_heads: 4
+num_layers: 2
+ff_dim: 64
+dropout: 0.1
+
+ml_batch_size: 16
+ml_lr: 0.001
+ml_epochs: 40
+ml_max_steps: 100
+stat_lr: 0.0001
+smoothness_weight: 0.001
+mu_scale: 0.5
+chol_offdiag_scale: 0.15
+chol_diag_max: 1.5
+chol_eps: 0.0001
+offline_rounds: 3
+stat_epochs_per_round: 5
+adv_epochs_per_round: 10
+stat_max_steps: 100
+adv_max_steps: 100
+use_advection_in_stat: true
