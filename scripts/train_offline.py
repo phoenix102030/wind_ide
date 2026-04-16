@@ -63,11 +63,14 @@ def main():
     chunk_len = cfg.get("chunk_len", 16)
 
     bundle = build_aligned_bundle(meas_file, nwp_file)
+    cfg = dict(cfg)
+    cfg["ide_total_steps"] = int(bundle.z_meas.shape[0])
     out_dir = Path(cfg.get("out_dir", "outputs/measurement_140m_two_stage"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("device:", device)
     print(f"advection_seq_len={seq_len}")
+    print(f"ide_param_window={cfg.get('ide_param_window', 4)}")
 
     ide_base_ds = IDEBaselineDataset(bundle, chunk_len=chunk_len)
     n_total = len(ide_base_ds)
@@ -80,6 +83,8 @@ def main():
 
     ide_model = IDEStateSpaceModel(
         dt=cfg.get("dt", 1.0),
+        total_steps=cfg.get("ide_total_steps", 1),
+        param_window=cfg.get("ide_param_window", 4),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
@@ -107,15 +112,12 @@ def main():
             noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
         )
 
-        coupling = ide_model.base_coupling.detach().cpu()
         print(
             f"[OFFLINE-STAT-ZERO][epoch {epoch}] "
             f"train={tr:.6f} val={va:.6f} "
             f"damping={float(ide_model.damping.detach().cpu()):.4f} "
             f"q_proc={float(ide_model.q_proc.detach().cpu()):.4f} "
-            f"r_obs={float(ide_model.r_obs.detach().cpu()):.4f} "
-            f"b12={float(coupling[0, 1]):.4f} "
-            f"b21={float(coupling[1, 0]):.4f}"
+            f"r_obs={float(ide_model.r_obs.detach().cpu()):.4f}"
         )
 
         torch.save({"model_state": ide_model.state_dict(), "config": cfg}, out_dir / "ide_last.pt")
@@ -182,16 +184,13 @@ def main():
                 use_advection=use_advection_in_stat,
             )
 
-            coupling = ide_model.base_coupling.detach().cpu()
             print(
                 f"[OFFLINE-STAT][round {round_idx} epoch {epoch}] "
                 f"train={tr['loss']:.6f} val={va['loss']:.6f} "
                 f"train_nll={tr['nll']:.6f} val_nll={va['nll']:.6f} "
                 f"damping={float(ide_model.damping.detach().cpu()):.4f} "
                 f"q_proc={float(ide_model.q_proc.detach().cpu()):.4f} "
-                f"r_obs={float(ide_model.r_obs.detach().cpu()):.4f} "
-                f"b12={float(coupling[0, 1]):.4f} "
-                f"b21={float(coupling[1, 0]):.4f}"
+                f"r_obs={float(ide_model.r_obs.detach().cpu()):.4f}"
             )
 
         for epoch in range(adv_epochs):

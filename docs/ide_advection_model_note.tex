@@ -1,0 +1,217 @@
+\documentclass[11pt,a4paper]{article}
+
+% --- Essential Packages ---
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,bm,mathtools}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+% --- Hyperref Setup ---
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+% --- Custom Math Commands ---
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\Cov}{\mathrm{Cov}}
+\newcommand{\Normal}{\mathcal{N}}
+\newcommand{\vect}{\mathrm{vec}}
+\newcommand{\tr}{\mathrm{tr}}
+\newcommand{\Id}{I}
+
+\title{\textbf{Wind IDE-Advection Model Specification}}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Document Purpose}
+
+This document outlines the current implementation of the IDE-Advection model. The goal is to clarify the following:
+\begin{enumerate}[label=\arabic*.]
+  \item Definition of state variables;
+  \item Advection network output parameterization;
+  \item Integration of covariance $\Sigma_t$ into the propagation shape;
+  \item Allocation of parameters between the IDE and Machine Learning modules;
+  \item Offline two-stage training and multi-step validation procedures.
+\end{enumerate}
+
+\section{State Variables and Observations}
+
+We consider 3 spatial stations, each with two-dimensional wind components $(u, v)$. At time $t$, the state vector is defined as:
+\begin{equation}
+Y_t
+=
+\begin{bmatrix}
+u_t(s_1) & v_t(s_1) & u_t(s_2) & v_t(s_2) & u_t(s_3) & v_t(s_3)
+\end{bmatrix}^{\!\top}
+\in \R^6.
+\end{equation}
+
+The observation vector is given by:
+\begin{equation}
+Z_t = Y_t + \varepsilon_t,
+\qquad
+\varepsilon_t \sim \Normal(0, R),
+\end{equation}
+where in the current implementation:
+\begin{equation}
+R = r_{\mathrm{obs}}^2 \Id_6.
+\end{equation}
+Thus, the observation equation is a linear Gaussian model where the observation matrix is the identity matrix.
+
+\section{Random Advection Matrix}
+
+\subsection{Definition of Random Advection}
+Instead of treating advection as two separate 2D vectors, we represent it as a single random $2\times 2$ matrix:
+\begin{equation}
+M_t \in \R^{2\times 2}.
+\end{equation}
+Let $\vect(M_t) \in \R^4$ be the flattened vector. The model assumes:
+\begin{equation}
+\vect(M_t) \sim \Normal(\mu_t, \Sigma_t),
+\qquad
+\mu_t \in \R^4,\ \Sigma_t \in \R^{4\times 4}.
+\end{equation}
+
+\subsection{Network Output Parameterization}
+The advection network extracts features from an NWP time window of length $L$ and outputs two sets of parameters:
+\begin{enumerate}[label=\arabic*.]
+  \item \textbf{Mean parameters} $\mu_t$: 4 values;
+  \item \textbf{Cholesky parameters} for covariance: 10 values.
+\end{enumerate}
+Specifically, the network outputs:
+\begin{equation}
+o_t = (\mu_1, \dots, \mu_4, a_1, \dots, a_4, b_{21}, b_{31}, b_{32}, b_{41}, b_{42}, b_{43}).
+\end{equation}
+The lower triangular matrix is constructed as:
+\begin{equation}
+d_i = \mathrm{softplus}(a_i) + \varepsilon,
+\quad
+L_t=
+\begin{pmatrix}
+d_1 & 0 & 0 & 0\\
+b_{21} & d_2 & 0 & 0\\
+b_{31} & b_{32} & d_3 & 0\\
+b_{41} & b_{42} & b_{43} & d_4
+\end{pmatrix},
+\quad
+\Sigma_t = L_t L_t^\top.
+\end{equation}
+
+\section{Spatial Propagation Kernel}
+
+\subsection{Propagation Shape derived from $\Sigma_t$}
+The previous trainable length-scale parameters $\text{diag}(\ell_\parallel^2, \ell_\perp^2)$ have been removed. The propagation shape is now governed solely by the advection covariance $\Sigma_t$. For each block $(i, j)$ corresponding to target/source components:
+\begin{equation}
+m_{ij}(t) = d_{ij}\mu_t \in \R^2, \quad S_{ij}(t) = d_{ij}\Sigma_t d_{ij}^\top \in \R^{2\times 2},
+\end{equation}
+\begin{equation}
+D_{ij}(t) = \Id_2 + 2\Delta t^2 S_{ij}(t) + \epsilon \Id_2.
+\end{equation}
+Here, $\Id_2$ is the fixed identity basis, $2\Delta t^2 S_{ij}(t)$ represents uncertainty propagation, and $\epsilon \Id_2$ is for numerical stability.
+
+\subsection{Gaussian Propagation Kernel}
+For each block $(i, j)$, define the modified displacement:
+\begin{equation}
+h'_{ij}(h,t) = h - \Delta t\, m_{ij}(t),
+\end{equation}
+The Gaussian kernel is defined as:
+\begin{equation}
+K_{ij}(h,t) \propto |D_{ij}(t)|^{-1/2} \exp\left( -\frac{1}{2} h'_{ij}(h,t)^\top D_{ij}(t)^{-1} h'_{ij}(h,t) \right).
+\end{equation}
+
+
+\section{State Transition Equation}
+
+The full spatial propagation operator $G_t$ is constructed by assembling the block kernels:
+\begin{equation}
+G_t =
+\begin{bmatrix}
+K_{11}(t) & K_{12}(t)\\
+K_{21}(t) & K_{22}(t)
+\end{bmatrix}.
+\end{equation}
+There is no separate static coupling matrix $B$ in the current implementation. The state transition is:
+\begin{equation}
+Y_{t+1} = A_t Y_t + \eta_t, \quad \eta_t \sim \Normal(0, Q_t),
+\end{equation}
+\begin{equation}
+A_t = \Id_6 + \Delta t (G_t - \lambda(t) \Id_6), \quad Q_t = q_{\mathrm{proc}}(t)^2 \Id_6.
+\end{equation}
+where $\lambda(t)$ is the time-varying damping parameter.
+
+\section{Time-varying IDE Parameters}
+
+The IDE parameters are no longer global constants. Instead, they are learned as time-varying sequences indexed by the absolute time location of each training window.
+
+To avoid introducing a separate NWP-driven IDE network, the current code uses a piecewise-constant parameterization. Let the total sequence length be $T$, and let $w$ be a configurable temporal window size. Then each IDE parameter is first learned on a coarse knot grid:
+\begin{equation}
+\{\tilde q_k\}_{k=1}^{K},\quad
+\{\tilde r_k\}_{k=1}^{K},\quad
+\{\tilde p_k\}_{k=1}^{K},\quad
+\{\tilde \lambda_k\}_{k=1}^{K},\quad
+\{\tilde m_k\}_{k=1}^{K},
+\end{equation}
+with
+\begin{equation}
+K = \left\lceil \frac{T}{w} \right\rceil.
+\end{equation}
+Each knot value is then repeated within its window to produce the full time-varying series:
+\begin{equation}
+q_{\mathrm{proc}}(t), \quad
+r_{\mathrm{obs}}(t), \quad
+p_0(t), \quad
+\lambda(t), \quad
+m_0(t).
+\end{equation}
+
+This means:
+\begin{itemize}
+  \item $w=1$ gives the finest possible time resolution;
+  \item larger $w$ gives a smoother, coarser parameter trajectory.
+\end{itemize}
+
+\section{Two-Stage Offline Training}
+
+\subsection{Stage 1: Measurement-only IDE Fitting}
+Stage 1 assumes $\mu_t=0$ and $\Sigma_t=0$, so the system reduces to a measurement-only IDE model. In this stage, the model fits the time-varying IDE parameter trajectories
+\begin{equation}
+q_{\mathrm{proc}}(t),\quad r_{\mathrm{obs}}(t),\quad p_0(t),\quad \lambda(t),\quad m_0(t)
+\end{equation}
+directly from measurement data.
+
+\subsection{Stage 2: Alternating Training}
+\begin{itemize}
+  \item \textbf{Statistical Step}: Fix the advection network, update the time-varying IDE parameters $\theta_{\mathrm{ide}}$.
+  \item \textbf{Advection Step}: Fix IDE parameters, update advection network parameters $\theta_{\mathrm{adv}}$ using a smoothness penalty on $\mu_t$ and $\Sigma_t$.
+\end{itemize}
+
+The optimized parameter groups are therefore:
+\begin{align}
+\theta_{\mathrm{ide}}
+&=
+\left\{
+\{\log \tilde q_k\}_{k=1}^{K},
+\{\log \tilde r_k\}_{k=1}^{K},
+\{\log \tilde p_k\}_{k=1}^{K},
+\{\log \tilde \lambda_k\}_{k=1}^{K},
+\{\tilde m_k\}_{k=1}^{K}
+\right\}, \\
+\theta_{\mathrm{adv}}
+&=
+\text{all trainable parameters in the NWP encoder, temporal encoder, mean head, and Cholesky head.}
+\end{align}
+
+\section{Multi-step Validation}
+
+Validation uses a \textit{rolling forecast origin} approach. After filtering through the \texttt{history\_len}, the model predicts $H$ steps into the future using only NWP-generated $\mu_t$ and $\Sigma_t$, without feeding in future ground truth observations.
+
+\end{document}

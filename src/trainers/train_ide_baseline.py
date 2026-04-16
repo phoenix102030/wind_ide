@@ -32,6 +32,7 @@ def train_ide_baseline_one_epoch(
             z_seq=z,
             site_lon=batch["site_lon"],
             site_lat=batch["site_lat"],
+            start_idx=batch["time_idx_start"],
         )
         loss = nll + noise_reg_weight * ide_model.noise_regularization()
 
@@ -61,6 +62,7 @@ def eval_ide_baseline(ide_model, loader, device, max_steps=None, noise_reg_weigh
             z_seq=z,
             site_lon=batch["site_lon"],
             site_lat=batch["site_lat"],
+            start_idx=batch["time_idx_start"],
         )
         loss = nll + noise_reg_weight * ide_model.noise_regularization()
         losses.append(float(loss.cpu()))

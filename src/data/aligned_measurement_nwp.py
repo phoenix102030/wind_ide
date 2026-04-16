@@ -130,6 +130,7 @@ class IDEBaselineDataset(Dataset):
             "z_seq_full": torch.from_numpy(z).float(),        # [chunk_len+1, 3, 2]
             "site_lat": torch.from_numpy(self.bundle.meas_lat).float(),
             "site_lon": torch.from_numpy(self.bundle.meas_lon).float(),
+            "time_idx_start": torch.tensor(start, dtype=torch.long),
         }
 
 
@@ -178,4 +179,5 @@ class MLMuDataset(Dataset):
             "nwp_seq_full": torch.from_numpy(x).float(),
             "site_lat": torch.from_numpy(self.bundle.meas_lat).float(),
             "site_lon": torch.from_numpy(self.bundle.meas_lon).float(),
+            "time_idx_start": torch.tensor(start, dtype=torch.long),
         }

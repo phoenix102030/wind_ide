@@ -1,4 +1,5 @@
 import math
+
 import torch
 from torch import nn
 
@@ -31,21 +32,22 @@ class IDEStateSpaceModel(nn.Module):
     """
     State Y_t is stored as [u(s1), v(s1), ..., u(sS), v(sS)].
 
-    The global IDE parameters live in this model:
-      - process / observation noise
-      - damping
-      - static cross-component coupling B
-
-    The ML model supplies the time-varying advection parameters:
-      vec(M_t) ~ N_4(mu_t, Sigma_t)
+    The ML model supplies time-varying advection parameters
+        vec(M_t) ~ N_4(mu_t, Sigma_t)
 
     and Sigma_t enters the propagation shape directly through D_ij.
+
+    The IDE parameters are also time-varying, but are learned directly as
+    piecewise-constant sequences over absolute time rather than being driven by
+    a separate NWP network.
     """
 
     def __init__(
         self,
         dt=1.0,
         num_sites=3,
+        total_steps=1,
+        param_window=1,
         init_log_ell_par=0.5,
         init_log_ell_perp=0.0,
         init_log_q_proc=-2.0,
@@ -54,18 +56,22 @@ class IDEStateSpaceModel(nn.Module):
         init_log_damping=0.0,
     ):
         super().__init__()
+        del init_log_ell_par
+        del init_log_ell_perp
+
         self.dt = dt
         self.num_sites = num_sites
         self.vec_dim = 2
         self.state_dim = num_sites * self.vec_dim
+        self.total_steps = max(int(total_steps), 1)
+        self.param_window = max(int(param_window), 1)
+        self.num_knots = math.ceil(self.total_steps / self.param_window)
 
-        self.log_q_proc = nn.Parameter(torch.tensor(float(init_log_q_proc)))
-        self.log_r_obs = nn.Parameter(torch.tensor(float(init_log_r_obs)))
-        self.log_p0 = nn.Parameter(torch.tensor(float(init_log_p0)))
-        self.log_damping = nn.Parameter(torch.tensor(float(init_log_damping)))
-
-        self.init_mean = nn.Parameter(torch.zeros(self.state_dim))
-        self.coupling_raw = nn.Parameter(torch.zeros(self.vec_dim, self.vec_dim))
+        self.log_q_proc_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_q_proc)))
+        self.log_r_obs_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_r_obs)))
+        self.log_p0_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_p0)))
+        self.log_damping_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_damping)))
+        self.init_mean_knots = nn.Parameter(torch.zeros(self.num_knots, self.state_dim))
 
         selector = torch.zeros(self.vec_dim, self.vec_dim, self.vec_dim * self.vec_dim)
         selector[0, :, 0:2] = torch.eye(self.vec_dim)
@@ -74,59 +80,78 @@ class IDEStateSpaceModel(nn.Module):
 
     @property
     def ell_par(self):
-        return self.log_q_proc.new_tensor(1.0)
+        return self.log_q_proc_knots.new_tensor(1.0)
 
     @property
     def ell_perp(self):
-        return self.log_q_proc.new_tensor(1.0)
+        return self.log_q_proc_knots.new_tensor(1.0)
+
+    def _expand_scalar_series(self, knots):
+        return knots.repeat_interleave(self.param_window, dim=0)[:self.total_steps]
+
+    def _expand_vector_series(self, knots):
+        return knots.repeat_interleave(self.param_window, dim=0)[:self.total_steps]
+
+    @property
+    def q_proc_series(self):
+        return torch.exp(self._expand_scalar_series(self.log_q_proc_knots))
+
+    @property
+    def r_obs_series(self):
+        return torch.exp(self._expand_scalar_series(self.log_r_obs_knots))
+
+    @property
+    def p0_series(self):
+        return torch.exp(self._expand_scalar_series(self.log_p0_knots))
+
+    @property
+    def damping_series(self):
+        return torch.exp(self._expand_scalar_series(self.log_damping_knots))
+
+    @property
+    def init_mean_series(self):
+        return self._expand_vector_series(self.init_mean_knots)
 
     @property
     def q_proc(self):
-        return torch.exp(self.log_q_proc)
+        return self.q_proc_series.mean()
 
     @property
     def r_obs(self):
-        return torch.exp(self.log_r_obs)
+        return self.r_obs_series.mean()
 
     @property
     def p0(self):
-        return torch.exp(self.log_p0)
+        return self.p0_series.mean()
 
     @property
     def damping(self):
-        return torch.exp(self.log_damping)
-
-    @property
-    def base_coupling(self):
-        eye2 = torch.eye(self.vec_dim, device=self.coupling_raw.device, dtype=self.coupling_raw.dtype)
-        return eye2 + 0.25 * torch.tanh(self.coupling_raw)
+        return self.damping_series.mean()
 
     def noise_regularization(self):
-        return self.q_proc.square() + self.r_obs.square()
+        return self.q_proc_series.square().mean() + self.r_obs_series.square().mean()
 
     @torch.no_grad()
     def clamp_parameters_(self, log_min=-4.0, log_max=2.0):
-        self.log_q_proc.clamp_(log_min, log_max)
-        self.log_r_obs.clamp_(log_min, log_max)
-        self.log_p0.clamp_(log_min, log_max)
-        self.log_damping.clamp_(log_min, log_max)
+        self.log_q_proc_knots.clamp_(log_min, log_max)
+        self.log_r_obs_knots.clamp_(log_min, log_max)
+        self.log_p0_knots.clamp_(log_min, log_max)
+        self.log_damping_knots.clamp_(log_min, log_max)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        for legacy_key in ("log_ell_par", "log_ell_perp"):
+        for legacy_key in (
+            "log_ell_par",
+            "log_ell_perp",
+            "coupling_raw",
+            "init_mean",
+            "log_q_proc",
+            "log_r_obs",
+            "log_p0",
+            "log_damping",
+        ):
             full_key = f"{prefix}{legacy_key}"
             if full_key in state_dict:
                 state_dict.pop(full_key)
-        coupling_key = f"{prefix}coupling_raw"
-        if coupling_key in state_dict:
-            coupling = state_dict[coupling_key]
-            if tuple(coupling.shape) == (self.state_dim, self.state_dim):
-                blocks = []
-                for i in range(self.num_sites):
-                    for j in range(self.num_sites):
-                        r0 = i * self.vec_dim
-                        c0 = j * self.vec_dim
-                        blocks.append(coupling[r0:r0 + self.vec_dim, c0:c0 + self.vec_dim])
-                state_dict[coupling_key] = torch.stack(blocks, dim=0).mean(dim=0)
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -183,14 +208,47 @@ class IDEStateSpaceModel(nn.Module):
             return self._selector(i, device, dtype)
         return 0.5 * (self._selector(i, device, dtype) + self._selector(j, device, dtype))
 
+    def _prepare_start_idx(self, start_idx, batch_size, device):
+        if start_idx is None:
+            return torch.zeros(batch_size, dtype=torch.long, device=device)
+        if not torch.is_tensor(start_idx):
+            start_idx = torch.tensor(start_idx, device=device)
+        start_idx = start_idx.to(device=device, dtype=torch.long)
+        if start_idx.ndim == 0:
+            start_idx = start_idx.unsqueeze(0).expand(batch_size)
+        return start_idx.reshape(batch_size)
+
+    def _time_indices(self, start_idx, length):
+        offsets = torch.arange(length, device=start_idx.device, dtype=torch.long)
+        idx = start_idx[:, None] + offsets[None, :]
+        return idx.clamp_min(0).clamp_max(self.total_steps - 1)
+
+    def _gather_scalar(self, series, idx):
+        flat = idx.reshape(-1)
+        gathered = series.index_select(0, flat)
+        return gathered.reshape(*idx.shape)
+
+    def _gather_vector(self, series, idx):
+        flat = idx.reshape(-1)
+        gathered = series.index_select(0, flat)
+        return gathered.reshape(*idx.shape, series.shape[-1])
+
+    def _get_time_params(self, idx):
+        return {
+            "q_proc": self._gather_scalar(self.q_proc_series, idx),
+            "r_obs": self._gather_scalar(self.r_obs_series, idx),
+            "p0": self._gather_scalar(self.p0_series, idx),
+            "damping": self._gather_scalar(self.damping_series, idx),
+            "init_mean": self._gather_vector(self.init_mean_series, idx),
+        }
+
     def build_component_kernels(self, site_lon, site_lat, dynamics_t, device, dtype):
         batch_size = site_lon.shape[0] if site_lon.ndim > 1 else dynamics_t["mu"].shape[0]
         site_lon, site_lat = self._expand_sites(site_lon, site_lat, batch_size)
-        coords = project_lon_lat(site_lon, site_lat)                         # [B,S,2]
-        h = coords[:, :, None, :] - coords[:, None, :, :]                    # [B,S,S,2]
+        coords = project_lon_lat(site_lon, site_lat)
+        h = coords[:, :, None, :] - coords[:, None, :, :]
 
         mu_t, sigma_t = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
-
         eye2 = torch.eye(2, device=device, dtype=dtype).unsqueeze(0)
         base_D = eye2.expand(batch_size, -1, -1)
 
@@ -198,9 +256,9 @@ class IDEStateSpaceModel(nn.Module):
         for target_idx in range(self.vec_dim):
             row_kernels = []
             for source_idx in range(self.vec_dim):
-                selector = self._pair_selector(target_idx, source_idx, device, dtype)      # [2,4]
-                drift_mean = torch.einsum("ab,nb->na", selector, mu_t)                      # [B,2]
-                drift_cov = torch.einsum("ab,nbc,dc->nad", selector, sigma_t, selector)     # [B,2,2]
+                selector = self._pair_selector(target_idx, source_idx, device, dtype)
+                drift_mean = torch.einsum("ab,nb->na", selector, mu_t)
+                drift_cov = torch.einsum("ab,nbc,dc->nad", selector, sigma_t, selector)
                 drift_cov = 0.5 * (drift_cov + drift_cov.transpose(-1, -2))
 
                 D = base_D + 2.0 * (self.dt ** 2) * drift_cov + 1e-4 * eye2
@@ -214,10 +272,11 @@ class IDEStateSpaceModel(nn.Module):
                 kernel = kernel / kernel.sum(dim=-1, keepdim=True).clamp_min(1e-6)
                 row_kernels.append(kernel)
             kernels.append(torch.stack(row_kernels, dim=1))
-        return torch.stack(kernels, dim=1)                                   # [B,2,2,S,S]
+        return torch.stack(kernels, dim=1)
 
-    def build_transition_matrix(self, site_lon, site_lat, dynamics_t, device, dtype):
-        batch_size = site_lon.shape[0] if site_lon.ndim > 1 else 1
+    def build_transition_matrix(self, site_lon, site_lat, dynamics_t, transition_idx, device, dtype):
+        transition_idx = transition_idx.to(device=device, dtype=torch.long).reshape(-1)
+        batch_size = transition_idx.shape[0]
         kernels = self.build_component_kernels(
             site_lon=site_lon,
             site_lat=site_lat,
@@ -226,14 +285,15 @@ class IDEStateSpaceModel(nn.Module):
             dtype=dtype,
         )
 
-        coupling = self.base_coupling.to(device=device, dtype=dtype).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-        operator_blocks = kernels * coupling                                 # [B,2,2,S,S]
-        operator = operator_blocks.permute(0, 1, 3, 2, 4).reshape(batch_size, self.state_dim, self.state_dim)
-
+        operator = kernels.permute(0, 1, 3, 2, 4).reshape(batch_size, self.state_dim, self.state_dim)
         eye = torch.eye(self.state_dim, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
-        damping_t = self.damping.to(device=device, dtype=dtype)
-        A = eye + self.dt * (operator - damping_t * eye)
-        Q = (self.q_proc.to(device=device, dtype=dtype) ** 2) * eye
+
+        time_params = self._get_time_params(transition_idx[:, None])
+        damping_t = time_params["damping"][:, 0].to(dtype=dtype)
+        q_proc_t = time_params["q_proc"][:, 0].to(dtype=dtype)
+
+        A = eye + self.dt * (operator - damping_t[:, None, None] * eye)
+        Q = q_proc_t[:, None, None].square() * eye
         return A, Q
 
     def _dynamics_at_t(self, dynamics_seq, t, batch_size, device, dtype):
@@ -244,14 +304,18 @@ class IDEStateSpaceModel(nn.Module):
             "sigma": dynamics_seq["sigma"][:, t],
         }
 
-    def _init_filter_state(self, batch_size, device, dtype):
+    def _init_filter_state(self, start_idx, device, dtype):
+        batch_size = start_idx.shape[0]
         eye = torch.eye(self.state_dim, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
-        Rm = (self.r_obs.to(device=device, dtype=dtype) ** 2) * eye
-        m = self.init_mean.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1)
-        P = (self.p0.to(device=device, dtype=dtype) ** 2) * eye
+        start_params = self._get_time_params(start_idx[:, None])
+        r0 = start_params["r_obs"][:, 0].to(dtype=dtype)
+        p0 = start_params["p0"][:, 0].to(dtype=dtype)
+        m = start_params["init_mean"][:, 0].to(dtype=dtype)
+        P = p0[:, None, None].square() * eye
+        Rm = r0[:, None, None].square() * eye
         return m, P, Rm, eye
 
-    def sequence_nll(self, z_seq, site_lon, site_lat, dynamics_seq=None):
+    def sequence_nll(self, z_seq, site_lon, site_lat, dynamics_seq=None, start_idx=None):
         z = self._flatten_state(z_seq)
         batch_size, steps, _ = z.shape
 
@@ -260,13 +324,19 @@ class IDEStateSpaceModel(nn.Module):
 
         device = z.device
         dtype = z.dtype
-        m, P, Rm, eye = self._init_filter_state(batch_size, device, dtype)
+        start_idx = self._prepare_start_idx(start_idx, batch_size, device)
+        obs_idx = self._time_indices(start_idx, steps)
+        trans_idx = self._time_indices(start_idx, max(steps - 1, 1))
+
+        m, P, _, eye = self._init_filter_state(start_idx, device, dtype)
+        r_obs_seq = self._gather_scalar(self.r_obs_series, obs_idx).to(dtype=dtype)
 
         total_nll = z.new_tensor(0.0)
         for t in range(steps):
             z_t = z[:, t]
+            Rm_t = r_obs_seq[:, t][:, None, None].square() * eye
             innov = z_t - m
-            S_mat = P + Rm + 1e-5 * eye
+            S_mat = P + Rm_t + 1e-5 * eye
 
             S_inv = torch.linalg.inv(S_mat)
             _, logdet = torch.linalg.slogdet(S_mat)
@@ -276,40 +346,46 @@ class IDEStateSpaceModel(nn.Module):
             K_gain = P @ S_inv
             m = m + torch.einsum("bij,bj->bi", K_gain, innov)
             I_K = eye - K_gain
-            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm @ K_gain.transpose(-1, -2)
+            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2)
 
             if t == steps - 1:
                 continue
 
             dynamics_t = self._dynamics_at_t(dynamics_seq, t, batch_size, device, dtype)
-            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, device, dtype)
+            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, trans_idx[:, t], device, dtype)
             m = torch.einsum("bij,bj->bi", A, m)
             P = A @ P @ A.transpose(-1, -2) + Q
 
         return total_nll / max(steps, 1)
 
     @torch.no_grad()
-    def predict_sequence(self, z_seq, site_lon, site_lat, dynamics_seq=None):
+    def predict_sequence(self, z_seq, site_lon, site_lat, dynamics_seq=None, start_idx=None):
         z = self._flatten_state(z_seq)
         batch_size, steps, _ = z.shape
         device = z.device
         dtype = z.dtype
-        m, P, Rm, eye = self._init_filter_state(batch_size, device, dtype)
+        start_idx = self._prepare_start_idx(start_idx, batch_size, device)
+        obs_idx = self._time_indices(start_idx, steps)
+        trans_idx = self._time_indices(start_idx, max(steps - 1, 1))
+
+        m, P, _, eye = self._init_filter_state(start_idx, device, dtype)
+        r_obs_seq = self._gather_scalar(self.r_obs_series, obs_idx).to(dtype=dtype)
 
         preds = []
         for t in range(steps - 1):
             z_t = z[:, t]
+            Rm_t = r_obs_seq[:, t][:, None, None].square() * eye
             innov = z_t - m
-            S_mat = P + Rm + 1e-5 * eye
+            S_mat = P + Rm_t + 1e-5 * eye
             S_inv = torch.linalg.inv(S_mat)
 
             K_gain = P @ S_inv
             m = m + torch.einsum("bij,bj->bi", K_gain, innov)
             I_K = eye - K_gain
-            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm @ K_gain.transpose(-1, -2)
+            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2)
 
             dynamics_t = self._dynamics_at_t(dynamics_seq, t, batch_size, device, dtype)
-            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, device, dtype)
+            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, trans_idx[:, t], device, dtype)
             m = torch.einsum("bij,bj->bi", A, m)
             P = A @ P @ A.transpose(-1, -2) + Q
             preds.append(m.reshape(batch_size, self.num_sites, self.vec_dim))
@@ -317,7 +393,7 @@ class IDEStateSpaceModel(nn.Module):
         return torch.stack(preds, dim=1)
 
     @torch.no_grad()
-    def forecast_next(self, z_hist, site_lon, site_lat, dynamics_seq):
+    def forecast_next(self, z_hist, site_lon, site_lat, dynamics_seq, start_idx=None):
         z = self._flatten_state(z_hist)
         batch_size, steps, _ = z.shape
         if dynamics_seq["mu"].shape[1] != steps:
@@ -325,28 +401,34 @@ class IDEStateSpaceModel(nn.Module):
 
         device = z.device
         dtype = z.dtype
-        m, P, Rm, eye = self._init_filter_state(batch_size, device, dtype)
+        start_idx = self._prepare_start_idx(start_idx, batch_size, device)
+        obs_idx = self._time_indices(start_idx, steps)
+        trans_idx = self._time_indices(start_idx, steps)
+
+        m, P, _, eye = self._init_filter_state(start_idx, device, dtype)
+        r_obs_seq = self._gather_scalar(self.r_obs_series, obs_idx).to(dtype=dtype)
 
         for t in range(steps):
             z_t = z[:, t]
+            Rm_t = r_obs_seq[:, t][:, None, None].square() * eye
             innov = z_t - m
-            S_mat = P + Rm + 1e-5 * eye
+            S_mat = P + Rm_t + 1e-5 * eye
             S_inv = torch.linalg.inv(S_mat)
 
             K_gain = P @ S_inv
             m = m + torch.einsum("bij,bj->bi", K_gain, innov)
             I_K = eye - K_gain
-            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm @ K_gain.transpose(-1, -2)
+            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2)
 
             dynamics_t = self._dynamics_at_t(dynamics_seq, t, batch_size, device, dtype)
-            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, device, dtype)
+            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, trans_idx[:, t], device, dtype)
             m = torch.einsum("bij,bj->bi", A, m)
             P = A @ P @ A.transpose(-1, -2) + Q
 
         return m.reshape(batch_size, self.num_sites, self.vec_dim)
 
     @torch.no_grad()
-    def forecast_multistep(self, z_hist, site_lon, site_lat, dynamics_hist, dynamics_future):
+    def forecast_multistep(self, z_hist, site_lon, site_lat, dynamics_hist, dynamics_future, start_idx=None):
         z = self._flatten_state(z_hist)
         batch_size, steps, _ = z.shape
         if dynamics_hist["mu"].shape[1] != steps - 1:
@@ -354,24 +436,32 @@ class IDEStateSpaceModel(nn.Module):
 
         device = z.device
         dtype = z.dtype
-        m, P, Rm, eye = self._init_filter_state(batch_size, device, dtype)
+        start_idx = self._prepare_start_idx(start_idx, batch_size, device)
+        obs_idx = self._time_indices(start_idx, steps)
+        hist_trans_idx = self._time_indices(start_idx, max(steps - 1, 1))
+        future_start = start_idx + steps - 1
+        future_trans_idx = self._time_indices(future_start, dynamics_future["mu"].shape[1])
+
+        m, P, _, eye = self._init_filter_state(start_idx, device, dtype)
+        r_obs_seq = self._gather_scalar(self.r_obs_series, obs_idx).to(dtype=dtype)
 
         for t in range(steps):
             z_t = z[:, t]
+            Rm_t = r_obs_seq[:, t][:, None, None].square() * eye
             innov = z_t - m
-            S_mat = P + Rm + 1e-5 * eye
+            S_mat = P + Rm_t + 1e-5 * eye
             S_inv = torch.linalg.inv(S_mat)
 
             K_gain = P @ S_inv
             m = m + torch.einsum("bij,bj->bi", K_gain, innov)
             I_K = eye - K_gain
-            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm @ K_gain.transpose(-1, -2)
+            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2)
 
             if t == steps - 1:
                 continue
 
             dynamics_t = self._dynamics_at_t(dynamics_hist, t, batch_size, device, dtype)
-            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, device, dtype)
+            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, hist_trans_idx[:, t], device, dtype)
             m = torch.einsum("bij,bj->bi", A, m)
             P = A @ P @ A.transpose(-1, -2) + Q
 
@@ -382,7 +472,7 @@ class IDEStateSpaceModel(nn.Module):
                 "mu": dynamics_future["mu"][:, h],
                 "sigma": dynamics_future["sigma"][:, h],
             }
-            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, device, dtype)
+            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, future_trans_idx[:, h], device, dtype)
             m = torch.einsum("bij,bj->bi", A, m)
             P = A @ P @ A.transpose(-1, -2) + Q + 1e-5 * eye
             preds.append(m.reshape(batch_size, self.num_sites, self.vec_dim))

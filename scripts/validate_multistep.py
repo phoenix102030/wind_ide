@@ -48,6 +48,8 @@ def reconstruct_models(ckpt, device):
     cfg = ckpt["config"]
     ide_model = IDEStateSpaceModel(
         dt=cfg.get("dt", 1.0),
+        total_steps=cfg.get("ide_total_steps", 1),
+        param_window=cfg.get("ide_param_window", 4),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
@@ -219,6 +221,7 @@ def main():
             site_lat=site_lat,
             dynamics_hist=dynamics_hist,
             dynamics_future=dynamics_future,
+            start_idx=torch.tensor([start + context_len - 1], device=device),
         )[0].cpu().numpy()
         truth = y_future_np
         persistence = np.repeat(z_hist_np[-1:], horizon, axis=0)

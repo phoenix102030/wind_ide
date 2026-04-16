@@ -52,6 +52,7 @@ def sigma_summary(dynamics_seq):
 def _aligned_inputs(batch, seq_len, mean_model=None):
     z_full = batch["z_seq_full"]
     nwp_full = batch["nwp_seq_full"]
+    start_idx = batch["time_idx_start"]
     batch_size = z_full.shape[0]
     chunk_len = nwp_full.shape[1] - seq_len + 1
 
@@ -66,15 +67,17 @@ def _aligned_inputs(batch, seq_len, mean_model=None):
         dynamics_seq = build_dynamics_sequence(mean_model, nwp_full, seq_len=seq_len)
 
     z_aligned = z_full[:, -(chunk_len + 1):]
-    return z_aligned, dynamics_seq
+    aligned_start_idx = start_idx + seq_len - 1
+    return z_aligned, dynamics_seq, aligned_start_idx
 
 
-def _stats_loss(ide_model, z_seq, site_lon, site_lat, dynamics_seq, noise_reg_weight):
+def _stats_loss(ide_model, z_seq, site_lon, site_lat, dynamics_seq, start_idx, noise_reg_weight):
     nll = ide_model.sequence_nll(
         z_seq=z_seq,
         site_lon=site_lon,
         site_lat=site_lat,
         dynamics_seq=dynamics_seq,
+        start_idx=start_idx,
     )
     noise_reg = ide_model.noise_regularization()
     loss = nll + noise_reg_weight * noise_reg
@@ -85,12 +88,13 @@ def _stats_loss(ide_model, z_seq, site_lon, site_lat, dynamics_seq, noise_reg_we
     }
 
 
-def _advection_loss(ide_model, z_seq, site_lon, site_lat, dynamics_seq, smoothness_weight):
+def _advection_loss(ide_model, z_seq, site_lon, site_lat, dynamics_seq, start_idx, smoothness_weight):
     nll = ide_model.sequence_nll(
         z_seq=z_seq,
         site_lon=site_lon,
         site_lat=site_lat,
         dynamics_seq=dynamics_seq,
+        start_idx=start_idx,
     )
     smoothness = dynamics_smoothness_penalty(dynamics_seq)
     loss = nll + smoothness_weight * smoothness
@@ -128,9 +132,9 @@ def train_statistical_one_epoch(
 
         if use_advection and mean_model is not None:
             with torch.no_grad():
-                z_aligned, dynamics_seq = _aligned_inputs(batch, seq_len, mean_model=mean_model)
+                z_aligned, dynamics_seq, aligned_start_idx = _aligned_inputs(batch, seq_len, mean_model=mean_model)
         else:
-            z_aligned, dynamics_seq = _aligned_inputs(batch, seq_len, mean_model=None)
+            z_aligned, dynamics_seq, aligned_start_idx = _aligned_inputs(batch, seq_len, mean_model=None)
 
         loss, stats = _stats_loss(
             ide_model=ide_model,
@@ -138,6 +142,7 @@ def train_statistical_one_epoch(
             site_lon=batch["site_lon"],
             site_lat=batch["site_lat"],
             dynamics_seq=dynamics_seq,
+            start_idx=aligned_start_idx,
             noise_reg_weight=noise_reg_weight,
         )
         loss.backward()
@@ -176,9 +181,9 @@ def eval_statistical(
 
         batch = move_batch_to_device(batch, device)
         if use_advection and mean_model is not None:
-            z_aligned, dynamics_seq = _aligned_inputs(batch, seq_len, mean_model=mean_model)
+            z_aligned, dynamics_seq, aligned_start_idx = _aligned_inputs(batch, seq_len, mean_model=mean_model)
         else:
-            z_aligned, dynamics_seq = _aligned_inputs(batch, seq_len, mean_model=None)
+            z_aligned, dynamics_seq, aligned_start_idx = _aligned_inputs(batch, seq_len, mean_model=None)
 
         _, stats = _stats_loss(
             ide_model=ide_model,
@@ -186,6 +191,7 @@ def eval_statistical(
             site_lon=batch["site_lon"],
             site_lat=batch["site_lat"],
             dynamics_seq=dynamics_seq,
+            start_idx=aligned_start_idx,
             noise_reg_weight=noise_reg_weight,
         )
         for key in metrics:
@@ -217,7 +223,7 @@ def train_advection_one_epoch(
 
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad()
-        z_aligned, dynamics_seq = _aligned_inputs(batch, seq_len, mean_model=mean_model)
+        z_aligned, dynamics_seq, aligned_start_idx = _aligned_inputs(batch, seq_len, mean_model=mean_model)
 
         loss, stats = _advection_loss(
             ide_model=ide_model,
@@ -225,6 +231,7 @@ def train_advection_one_epoch(
             site_lon=batch["site_lon"],
             site_lat=batch["site_lat"],
             dynamics_seq=dynamics_seq,
+            start_idx=aligned_start_idx,
             smoothness_weight=smoothness_weight,
         )
         loss.backward()
@@ -259,7 +266,7 @@ def eval_advection(
             break
 
         batch = move_batch_to_device(batch, device)
-        z_aligned, dynamics_seq = _aligned_inputs(batch, seq_len, mean_model=mean_model)
+        z_aligned, dynamics_seq, aligned_start_idx = _aligned_inputs(batch, seq_len, mean_model=mean_model)
 
         _, stats = _advection_loss(
             ide_model=ide_model,
@@ -267,6 +274,7 @@ def eval_advection(
             site_lon=batch["site_lon"],
             site_lat=batch["site_lat"],
             dynamics_seq=dynamics_seq,
+            start_idx=aligned_start_idx,
             smoothness_weight=smoothness_weight,
         )
         for key in metrics:
