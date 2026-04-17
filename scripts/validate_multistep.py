@@ -1,4 +1,5 @@
 import argparse
+import math
 import json
 from pathlib import Path
 import sys
@@ -57,6 +58,8 @@ def reconstruct_models(ckpt, device):
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
         init_log_damping=cfg.get("init_log_damping", 0.0),
+        damping_min=cfg.get("damping_min", math.exp(-4.0)),
+        damping_max=cfg.get("damping_max", 1.0),
     ).to(device)
     ide_model.load_state_dict(ckpt["ide_model_state"] if "ide_model_state" in ckpt else ckpt["model_state"])
     ide_model.eval()

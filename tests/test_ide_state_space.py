@@ -200,6 +200,14 @@ def test_loading_absolute_knots_into_global_mode_reduces_to_shared_value():
     assert torch.allclose(global_model.log_q_proc_knots, torch.tensor([-0.5]))
 
 
+def test_damping_is_clamped_to_configured_range():
+    model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2, damping_min=0.05, damping_max=1.0)
+    with torch.no_grad():
+        model.log_damping_knots.fill_(5.0)
+        model.clamp_parameters_()
+    assert torch.allclose(model.damping, torch.tensor(1.0), atol=1e-6)
+
+
 def test_legacy_coupling_key_is_ignored_on_load():
     model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2)
     state_dict = model.state_dict()

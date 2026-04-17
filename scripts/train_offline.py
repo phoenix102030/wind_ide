@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 from pathlib import Path
 import socket
@@ -315,6 +316,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
         init_log_damping=cfg.get("init_log_damping", 0.0),
+        damping_min=cfg.get("damping_min", math.exp(-4.0)),
+        damping_max=cfg.get("damping_max", 1.0),
     ).to(device)
     ide_model = maybe_wrap_ddp(ide_model, device, distributed)
     ide_opt = torch.optim.Adam(unwrap_model(ide_model).parameters(), lr=cfg.get("ide_lr", 1e-3))
