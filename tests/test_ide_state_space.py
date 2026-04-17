@@ -172,6 +172,22 @@ def test_advection_mean_net_outputs_matrix_mean_and_spd_covariance():
     assert torch.all(torch.linalg.eigvalsh(sigma) > 0)
 
 
+def test_advection_mean_net_can_anchor_mu_and_share_global_sigma():
+    model = AdvectionMeanNet(mu_mode="anchored", sigma_mode="global", mu_scale=0.5, init_global_sigma_diag=0.15)
+    x_seq = torch.randn(2, 4, 6, 8, 8)
+    x_seq[:, -1, 2:4] = 0.0
+
+    out = model(x_seq)
+
+    assert out["mu"].shape == (2, 4)
+    assert out["mu_coeff_matrix"].shape == (2, 2, 2)
+    assert out["wind_anchor"].shape == (2, 2)
+    assert torch.allclose(out["wind_anchor"], torch.zeros_like(out["wind_anchor"]))
+    assert torch.allclose(out["mu_matrix"], torch.zeros_like(out["mu_matrix"]), atol=1e-6)
+    assert torch.allclose(out["sigma"][0], out["sigma"][1], atol=1e-6)
+    assert torch.all(torch.linalg.eigvalsh(out["sigma"]) > 0)
+
+
 def test_forecast_multistep_runs_with_dynamic_advection_only():
     model = IDEStateSpaceModel(num_sites=3, total_steps=16, param_window=2)
     z_hist = torch.randn(2, 6, 3, 2)

@@ -1,5 +1,12 @@
+import math
+
 import torch
 from torch import nn
+
+
+def inverse_softplus(value, eps=1e-6):
+    value = max(float(value), float(eps))
+    return value + math.log(-math.expm1(-value))
 
 
 class SpatialEncoder(nn.Module):
@@ -60,12 +67,21 @@ class AdvectionMeanNet(nn.Module):
         chol_offdiag_scale=0.15,
         chol_diag_max=1.5,
         chol_eps=1e-4,
+        mu_mode="free",
+        sigma_mode="network",
+        init_global_sigma_diag=0.2,
     ):
         super().__init__()
         self.mu_scale = mu_scale
         self.chol_offdiag_scale = chol_offdiag_scale
         self.chol_diag_max = chol_diag_max
         self.chol_eps = chol_eps
+        self.mu_mode = str(mu_mode).lower()
+        self.sigma_mode = str(sigma_mode).lower()
+        if self.mu_mode not in {"free", "anchored"}:
+            raise ValueError(f"Unsupported mu_mode={mu_mode!r}; expected 'free' or 'anchored'.")
+        if self.sigma_mode not in {"network", "global"}:
+            raise ValueError(f"Unsupported sigma_mode={sigma_mode!r}; expected 'network' or 'global'.")
 
         self.spatial = SpatialEncoder(in_channels=6, hidden_dim=hidden_dim, out_dim=embed_dim)
         self.temporal = TemporalEncoder(
@@ -77,6 +93,24 @@ class AdvectionMeanNet(nn.Module):
         )
         self.mu_head = nn.Linear(embed_dim, 4)
         self.chol_head = nn.Linear(embed_dim, 10)
+        init_diag_raw = inverse_softplus(max(float(init_global_sigma_diag) - self.chol_eps, 1e-4))
+        global_chol_init = torch.zeros(10)
+        global_chol_init[:4] = init_diag_raw
+        self.global_chol_params = nn.Parameter(global_chol_init)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        global_key = f"{prefix}global_chol_params"
+        if global_key not in state_dict:
+            state_dict[global_key] = self.global_chol_params.detach().clone()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _build_cholesky(self, chol_raw):
         batch_size = chol_raw.shape[0]
@@ -100,6 +134,11 @@ class AdvectionMeanNet(nn.Module):
         chol[:, 3, 3] = diag[:, 3]
         return chol
 
+    def _extract_wind_anchor(self, x_seq):
+        latest_frame = x_seq[:, -1]
+        wind_uv = latest_frame[:, 2:4]
+        return wind_uv.mean(dim=(-1, -2))
+
     def forward(self, x_seq):
         # x_seq: [B, L, 6, Y, X]
         batch_size, seq_len, channels, height, width = x_seq.shape
@@ -109,13 +148,24 @@ class AdvectionMeanNet(nn.Module):
         feat = feat.reshape(batch_size, seq_len, embed_dim)
 
         h = self.temporal(feat)
-        mu_matrix = self.mu_scale * torch.tanh(self.mu_head(h)).reshape(batch_size, 2, 2)
+        mu_coeff_matrix = self.mu_scale * torch.tanh(self.mu_head(h)).reshape(batch_size, 2, 2)
+        if self.mu_mode == "anchored":
+            wind_anchor = self._extract_wind_anchor(x_seq)
+            mu_matrix = mu_coeff_matrix * wind_anchor.unsqueeze(1)
+        else:
+            wind_anchor = self._extract_wind_anchor(x_seq)
+            mu_matrix = mu_coeff_matrix
 
-        chol_factor = self._build_cholesky(self.chol_head(h))
+        if self.sigma_mode == "global":
+            chol_factor = self._build_cholesky(self.global_chol_params.unsqueeze(0).expand(batch_size, -1))
+        else:
+            chol_factor = self._build_cholesky(self.chol_head(h))
         sigma = chol_factor @ chol_factor.transpose(-1, -2)
         return {
             "mu": mu_matrix.reshape(batch_size, 4),
             "mu_matrix": mu_matrix,
+            "mu_coeff_matrix": mu_coeff_matrix,
+            "wind_anchor": wind_anchor,
             "sigma": sigma,
             "chol_factor": chol_factor,
         }

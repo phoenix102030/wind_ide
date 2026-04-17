@@ -60,6 +60,8 @@ num_heads: 4
 num_layers: 2
 ff_dim: 64
 dropout: 0.1
+mu_mode: anchored
+sigma_mode: global
 
 ml_batch_size: 128
 ml_lr: 0.001
@@ -67,10 +69,11 @@ ml_epochs: 40
 ml_max_steps: 100
 stat_lr: 0.0001
 smoothness_weight: 0.001
-mu_scale: 1.0
+mu_scale: 0.5
 chol_offdiag_scale: 0.15
 chol_diag_max: 1.5
 chol_eps: 0.0001
+init_global_sigma_diag: 0.15
 offline_rounds: 3
 stat_epochs_per_round: 5
 adv_epochs_per_round: 10

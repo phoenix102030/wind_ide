@@ -196,6 +196,9 @@ def reconstruct_models(ckpt, device):
             chol_offdiag_scale=cfg.get("chol_offdiag_scale", 0.15),
             chol_diag_max=cfg.get("chol_diag_max", 1.5),
             chol_eps=cfg.get("chol_eps", 1e-4),
+            mu_mode=cfg.get("mu_mode", "free"),
+            sigma_mode=cfg.get("sigma_mode", "network"),
+            init_global_sigma_diag=cfg.get("init_global_sigma_diag", 0.2),
         ).to(device)
         mean_model.load_state_dict(ckpt["mean_model_state"])
     else:

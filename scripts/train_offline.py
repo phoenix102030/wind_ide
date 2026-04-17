@@ -256,6 +256,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     cfg["train_ell_params"] = bool(cfg.get("train_ell_params", True))
     cfg["normalize_z"] = bool(cfg.get("normalize_z", True))
     cfg["normalize_nwp"] = bool(cfg.get("normalize_nwp", True))
+    cfg["mu_mode"] = str(cfg.get("mu_mode", "free")).lower()
+    cfg["sigma_mode"] = str(cfg.get("sigma_mode", "network")).lower()
     out_dir = Path(cfg.get("out_dir", "outputs/measurement_140m_two_stage"))
     if is_main_process():
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -271,6 +273,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"chunk_len={chunk_len}")
         print(f"normalize_z={cfg['normalize_z']}")
         print(f"normalize_nwp={cfg['normalize_nwp']}")
+        print(f"mu_mode={cfg['mu_mode']}")
+        print(f"sigma_mode={cfg['sigma_mode']}")
 
     raw_ide_base_ds = IDEBaselineDataset(raw_bundle, chunk_len=chunk_len)
     _, _, raw_ide_split_info = contiguous_time_split(raw_ide_base_ds, val_fraction=val_fraction)
@@ -464,6 +468,9 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         chol_offdiag_scale=cfg.get("chol_offdiag_scale", 0.15),
         chol_diag_max=cfg.get("chol_diag_max", 1.5),
         chol_eps=cfg.get("chol_eps", 1e-4),
+        mu_mode=cfg.get("mu_mode", "free"),
+        sigma_mode=cfg.get("sigma_mode", "network"),
+        init_global_sigma_diag=cfg.get("init_global_sigma_diag", 0.2),
     ).to(device)
     mean_model = maybe_wrap_ddp(mean_model, device, distributed)
 
