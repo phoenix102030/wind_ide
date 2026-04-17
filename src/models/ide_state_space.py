@@ -374,6 +374,15 @@ class IDEStateSpaceModel(nn.Module):
         Rm = r0[:, None, None].square() * eye
         return m, P, Rm, eye
 
+    def forward(self, z_seq, site_lon, site_lat, dynamics_seq=None, start_idx=None):
+        return self.sequence_nll(
+            z_seq=z_seq,
+            site_lon=site_lon,
+            site_lat=site_lat,
+            dynamics_seq=dynamics_seq,
+            start_idx=start_idx,
+        )
+
     def sequence_nll(self, z_seq, site_lon, site_lat, dynamics_seq=None, start_idx=None):
         z = self._flatten_state(z_seq)
         batch_size, steps, _ = z.shape
