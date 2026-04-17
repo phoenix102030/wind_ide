@@ -280,7 +280,6 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"normalize_nwp={cfg['normalize_nwp']}")
         print(f"mu_mode={cfg['mu_mode']}")
         print(f"sigma_mode={cfg['sigma_mode']}")
-        print(f"mix_scale={cfg.get('mix_scale', 0.35)}")
         print(f"nwp_input_mode={cfg['nwp_input_mode']}")
         if cfg["nwp_input_mode"] != "all12":
             print(
@@ -292,10 +291,12 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                 "[warning] train_ell_params is deprecated after the theorem-inspired kernel refactor; "
                 "legacy ell parameters stay frozen for checkpoint compatibility."
             )
+        if "mix_scale" in cfg:
+            print("[warning] mix_scale is deprecated after the theorem-based pair-kernel refactor and is ignored.")
         if cfg["sigma_mode"] == "global":
             print(
-                "[warning] sigma_mode=global keeps diffusion variance fixed over time, so NWP cannot "
-                "modulate kernel shape through Sigma_t."
+                "[warning] sigma_mode=global keeps the joint 4x4 advection covariance fixed over time, "
+                "so NWP cannot modulate pairwise kernel shape through Sigma_t."
             )
 
     raw_ide_base_ds = IDEBaselineDataset(raw_bundle, chunk_len=chunk_len)

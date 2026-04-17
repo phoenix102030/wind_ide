@@ -1,7 +1,20 @@
+import math
+
 import torch
 
 from src.models.advection_mean_net import AdvectionMeanNet
 from src.models.ide_state_space import IDEStateSpaceModel
+
+
+def _joint_sigma(diag_values, cross_block=None, dtype=torch.float32):
+    sigma = torch.zeros(4, 4, dtype=dtype)
+    sigma[:2, :2] = torch.diag(torch.tensor(diag_values[:2], dtype=dtype))
+    sigma[2:, 2:] = torch.diag(torch.tensor(diag_values[2:], dtype=dtype))
+    if cross_block is not None:
+        cross = torch.tensor(cross_block, dtype=dtype)
+        sigma[:2, 2:] = cross
+        sigma[2:, :2] = cross.transpose(0, 1)
+    return sigma.unsqueeze(0)
 
 
 def test_sequence_nll_accepts_tensor_and_flat_state():
@@ -19,20 +32,13 @@ def test_sequence_nll_accepts_tensor_and_flat_state():
     assert torch.allclose(nll_tensor, nll_flat, atol=1e-6)
 
 
-def test_transition_matrix_uses_component_pair_kernels():
+def test_transition_matrix_uses_pair_specific_kernels():
     model = IDEStateSpaceModel(num_sites=3, dt=0.5, total_steps=8, param_window=2)
     site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
-    sigma = torch.tensor(
-        [
-            [0.40, 0.05],
-            [0.05, 0.30],
-        ],
-        dtype=site_lon.dtype,
-    ).unsqueeze(0)
     dynamics_t = {
-        "mu": torch.tensor([[1.2, 0.4]], dtype=site_lon.dtype),
-        "sigma": sigma,
+        "mu": torch.tensor([[1.2, 0.4, -0.3, 0.8]], dtype=site_lon.dtype),
+        "sigma": _joint_sigma([0.40, 0.30, 0.25, 0.35], cross_block=[[0.05, 0.01], [0.02, 0.04]], dtype=site_lon.dtype),
     }
 
     kernels = model.build_component_kernels(
@@ -54,9 +60,30 @@ def test_transition_matrix_uses_component_pair_kernels():
     assert kernels.shape == (1, 2, 2, 3, 3)
     assert A.shape == (1, 6, 6)
     assert Q.shape == (1, 6, 6)
-    assert torch.allclose(kernels[:, 0, 0], kernels[:, 1, 1], atol=1e-6)
-    assert torch.allclose(kernels[:, 0, 1], torch.zeros_like(kernels[:, 0, 1]), atol=1e-6)
+    assert not torch.allclose(kernels[:, 0, 0], kernels[:, 1, 1])
+    assert not torch.allclose(kernels[:, 0, 1], kernels[:, 1, 0])
     assert torch.all(Q.diagonal(dim1=-2, dim2=-1) > 0)
+
+
+def test_cross_component_kernel_prefers_same_site_when_distance_is_zero():
+    model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+    dynamics_t = {
+        "mu": torch.zeros(1, 4, dtype=site_lon.dtype),
+        "sigma": torch.zeros(1, 4, 4, dtype=site_lon.dtype),
+    }
+
+    kernels = model.build_component_kernels(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t=dynamics_t,
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+    )
+
+    uv_kernel = kernels[0, 0, 1]
+    assert torch.all(torch.diagonal(uv_kernel) >= uv_kernel.max(dim=-1).values - 1e-6)
 
 
 def test_transition_matrix_respects_site_component_state_order():
@@ -79,7 +106,7 @@ def test_transition_matrix_respects_site_component_state_order():
     A, _ = model.build_transition_matrix(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t={"mu": torch.zeros(1, 2), "sigma": torch.zeros(1, 2, 2)},
+        dynamics_t={"mu": torch.zeros(1, 4), "sigma": torch.zeros(1, 4, 4)},
         transition_idx=torch.tensor([0]),
         device=site_lon.device,
         dtype=site_lon.dtype,
@@ -111,7 +138,7 @@ def test_transition_matrix_contracts_constant_mode_for_row_stochastic_operator()
     A, _ = model.build_transition_matrix(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t={"mu": torch.zeros(1, 2), "sigma": torch.zeros(1, 2, 2)},
+        dynamics_t={"mu": torch.zeros(1, 4), "sigma": torch.zeros(1, 4, 4)},
         transition_idx=torch.tensor([0]),
         device=site_lon.device,
         dtype=site_lon.dtype,
@@ -124,87 +151,59 @@ def test_transition_matrix_contracts_constant_mode_for_row_stochastic_operator()
     assert torch.allclose(propagated, expected, atol=1e-5)
 
 
-def test_component_kernels_remain_finite_for_ill_conditioned_sigma():
+def test_component_kernels_remain_finite_for_large_joint_sigma():
     model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
     site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
-    sigma = torch.tensor(
-        [
-            [1e6, -1e6],
-            [-1e6, 1e6],
-        ],
-        dtype=site_lon.dtype,
-    ).unsqueeze(0)
+    sigma = _joint_sigma([1e4, 2e4, 1.5e4, 2.5e4], cross_block=[[5e3, 1e3], [1e3, 4e3]], dtype=site_lon.dtype)
 
     kernels = model.build_component_kernels(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t={"mu": torch.zeros(1, 2), "sigma": sigma},
+        dynamics_t={"mu": torch.zeros(1, 4), "sigma": sigma},
         device=site_lon.device,
         dtype=site_lon.dtype,
     )
 
     assert torch.isfinite(kernels).all()
     assert torch.allclose(kernels[:, 0, 0].sum(dim=-1), torch.ones_like(kernels[:, 0, 0].sum(dim=-1)), atol=1e-5)
-    assert torch.allclose(kernels[:, 0, 1], torch.zeros_like(kernels[:, 0, 1]), atol=1e-6)
 
 
-def test_component_kernels_become_wider_when_sigma_increases():
+def test_legacy_two_dimensional_dynamics_are_still_accepted():
+    model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
     site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
-    narrow_dynamics = {
-        "mu": torch.tensor([[1.0, 0.0]], dtype=site_lon.dtype),
-        "sigma": torch.zeros(1, 2, 2, dtype=site_lon.dtype),
-    }
-    wide_dynamics = {
-        "mu": torch.tensor([[1.0, 0.0]], dtype=site_lon.dtype),
-        "sigma": torch.tensor(
-            [
-                [0.8, 0.0],
-                [0.0, 0.8],
-            ],
-            dtype=site_lon.dtype,
-        ).unsqueeze(0),
+    dynamics_t = {
+        "mu": torch.tensor([[1.0, -0.5]], dtype=site_lon.dtype),
+        "sigma": 0.05 * torch.eye(2, dtype=site_lon.dtype).unsqueeze(0),
     }
 
-    model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
-    narrow_kernels = model.build_component_kernels(
+    kernels = model.build_component_kernels(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t=narrow_dynamics,
-        device=site_lon.device,
-        dtype=site_lon.dtype,
-    )
-    wide_kernels = model.build_component_kernels(
-        site_lon=site_lon,
-        site_lat=site_lat,
-        dynamics_t=wide_dynamics,
+        dynamics_t=dynamics_t,
         device=site_lon.device,
         dtype=site_lon.dtype,
     )
 
-    assert wide_kernels[:, 0, 0].amax() < narrow_kernels[:, 0, 0].amax()
+    assert kernels.shape == (1, 2, 2, 3, 3)
+    assert torch.isfinite(kernels).all()
 
 
-def test_advection_mean_net_outputs_matrix_mean_and_spd_covariance():
+def test_advection_mean_net_outputs_four_dimensional_mean_and_spd_covariance():
     model = AdvectionMeanNet()
     x_seq = torch.randn(2, 4, 6, 8, 8)
     out = model(x_seq)
 
-    assert out["mu"].shape == (2, 2)
-    assert out["mu_coeff_matrix"].shape == (2, 2, 2)
-    assert out["sigma"].shape == (2, 2, 2)
-    assert out["chol_factor"].shape == (2, 2, 2)
-    assert out["component_mix"].shape == (2, 2, 2)
-
-    sigma = out["sigma"]
-    component_mix = out["component_mix"]
-    assert torch.allclose(sigma, sigma.transpose(-1, -2), atol=1e-6)
-    assert torch.all(torch.linalg.eigvalsh(sigma) > 0)
-    assert torch.allclose(component_mix, torch.eye(2).reshape(1, 2, 2).expand_as(component_mix), atol=1e-6)
+    assert out["mu"].shape == (2, 4)
+    assert out["mu_pairs"].shape == (2, 2, 2)
+    assert out["sigma"].shape == (2, 4, 4)
+    assert out["chol_factor"].shape == (2, 4, 4)
+    assert torch.allclose(out["sigma"], out["sigma"].transpose(-1, -2), atol=1e-6)
+    assert torch.all(torch.linalg.eigvalsh(out["sigma"]) > 0)
 
 
-def test_advection_mean_net_free_mode_outputs_direct_velocity():
+def test_advection_mean_net_free_mode_outputs_direct_pair_advections():
     model = AdvectionMeanNet(mu_mode="free")
     with torch.no_grad():
         model.mu_head.weight.zero_()
@@ -212,27 +211,29 @@ def test_advection_mean_net_free_mode_outputs_direct_velocity():
 
     x_seq = torch.randn(2, 4, 6, 8, 8)
     out = model(x_seq)
-    expected = model.mu_scale * torch.tanh(torch.tensor([1.0, -0.5]))
-    assert torch.allclose(out["mu"], expected.reshape(1, 2).expand_as(out["mu"]))
-    assert out["mu_coeff_matrix"].shape == (2, 2, 2)
-    assert torch.allclose(out["component_mix"], torch.eye(2).reshape(1, 2, 2).expand_as(out["component_mix"]), atol=1e-6)
+    expected = model.mu_scale * torch.tanh(torch.tensor([1.0, -0.5, 2.0, -3.0]))
+    assert torch.allclose(out["mu"], expected.reshape(1, 4).expand_as(out["mu"]))
 
 
 def test_advection_mean_net_can_anchor_mu_and_share_global_sigma():
     model = AdvectionMeanNet(mu_mode="anchored", sigma_mode="global", mu_scale=0.5, init_global_sigma_diag=0.15)
+    with torch.no_grad():
+        model.mu_head.weight.zero_()
+        model.mu_head.bias.zero_()
+
     x_seq = torch.randn(2, 4, 6, 8, 8)
-    x_seq[:, -1, 2:4] = 0.0
+    x_seq[:, -1, 2] = 3.0
+    x_seq[:, -1, 3] = -2.0
 
     out = model(x_seq)
 
-    assert out["mu"].shape == (2, 2)
-    assert out["mu_coeff_matrix"].shape == (2, 2, 2)
-    assert out["wind_anchor"].shape == (2, 2)
-    assert torch.allclose(out["wind_anchor"], torch.zeros_like(out["wind_anchor"]))
+    assert out["mu"].shape == (2, 4)
+    assert out["mu_pairs"].shape == (2, 2, 2)
+    assert out["mu_coeff_matrix"].shape == (2, 4, 2)
+    assert torch.allclose(out["wind_anchor"], torch.tensor([[3.0, -2.0], [3.0, -2.0]]), atol=1e-6)
     assert torch.allclose(out["mu"], torch.zeros_like(out["mu"]), atol=1e-6)
     assert torch.allclose(out["sigma"][0], out["sigma"][1], atol=1e-6)
     assert torch.all(torch.linalg.eigvalsh(out["sigma"]) > 0)
-    assert torch.allclose(out["component_mix"], torch.eye(2).reshape(1, 2, 2).expand_as(out["component_mix"]), atol=1e-6)
     assert not any(param.requires_grad for param in model.chol_head.parameters())
     assert model.global_chol_params.requires_grad
 
@@ -248,31 +249,6 @@ def test_advection_mean_net_all12_uses_140m_uv_anchor_indices():
     assert torch.allclose(out["wind_anchor"], torch.tensor([[3.0, -2.0]]), atol=1e-6)
 
 
-def test_component_mix_introduces_cross_component_transport():
-    model = IDEStateSpaceModel(num_sites=3, total_steps=4, param_window=1)
-    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
-    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
-    dynamics_t = {
-        "mu": torch.zeros(1, 2, dtype=site_lon.dtype),
-        "sigma": torch.zeros(1, 2, 2, dtype=site_lon.dtype),
-        "component_mix": torch.tensor(
-            [[[1.0, 0.25], [-0.10, 1.0]]],
-            dtype=site_lon.dtype,
-        ),
-    }
-
-    kernels = model.build_component_kernels(
-        site_lon=site_lon,
-        site_lat=site_lat,
-        dynamics_t=dynamics_t,
-        device=site_lon.device,
-        dtype=site_lon.dtype,
-    )
-
-    assert torch.any(kernels[:, 0, 1].abs() > 0)
-    assert torch.any(kernels[:, 1, 0].abs() > 0)
-
-
 def test_forecast_multistep_runs_with_dynamic_advection_only():
     model = IDEStateSpaceModel(num_sites=3, total_steps=16, param_window=2)
     z_hist = torch.randn(2, 6, 3, 2)
@@ -280,12 +256,12 @@ def test_forecast_multistep_runs_with_dynamic_advection_only():
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0).expand(2, -1)
 
     dynamics_hist = {
-        "mu": torch.randn(2, 5, 2),
-        "sigma": 0.05 * torch.eye(2).reshape(1, 1, 2, 2).expand(2, 5, -1, -1),
+        "mu": torch.randn(2, 5, 4),
+        "sigma": 0.05 * torch.eye(4).reshape(1, 1, 4, 4).expand(2, 5, -1, -1),
     }
     dynamics_future = {
-        "mu": torch.randn(2, 3, 2),
-        "sigma": 0.05 * torch.eye(2).reshape(1, 1, 2, 2).expand(2, 3, -1, -1),
+        "mu": torch.randn(2, 3, 4),
+        "sigma": 0.05 * torch.eye(4).reshape(1, 1, 4, 4).expand(2, 3, -1, -1),
     }
 
     pred = model.forecast_multistep(
@@ -332,7 +308,8 @@ def test_loading_absolute_knots_into_global_mode_reduces_to_shared_value():
     global_model.load_state_dict(state_dict, strict=True)
 
     assert global_model.log_q_proc_knots.shape == (1,)
-    assert torch.allclose(global_model.log_q_proc_knots, torch.tensor([-0.5]))
+    expected = torch.tensor([max(-0.5, math.log(global_model.q_proc_min))]).clamp_max(math.log(global_model.q_proc_max))
+    assert torch.allclose(global_model.log_q_proc_knots, expected)
 
 
 def test_damping_is_clamped_to_configured_range():

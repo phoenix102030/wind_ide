@@ -46,15 +46,17 @@ class TemporalEncoder(nn.Module):
 
 class AdvectionMeanNet(nn.Module):
     """
-    Learn time-varying advection velocity and spatial diffusion from NWP context.
+    Predict theorem-driven advection parameters for the two directional fields:
 
-    The network predicts
-        v_t in R^2
-        H_t in SPD(2)
-        C_t in R^(2x2)
+      [A_uu, A_vv] ~ N(mu_t, Sigma_t),
 
-    where v_t is a physical advection velocity and H_t is a diffusion tensor.
-    C_t mixes the transported (u, v) components after spatial propagation.
+    where
+      A_uu, A_vv in R^2,
+      mu_t in R^4,
+      Sigma_t in R^(4x4).
+
+    The flattened ordering is:
+      mu_t = [A_uu_x, A_uu_y, A_vv_x, A_vv_y].
     """
 
     def __init__(
@@ -77,18 +79,25 @@ class AdvectionMeanNet(nn.Module):
         wind_anchor_indices=None,
     ):
         super().__init__()
+        del mix_scale
+
         self.in_channels = int(in_channels)
-        self.mu_scale = mu_scale
-        self.chol_offdiag_scale = chol_offdiag_scale
-        self.chol_diag_max = chol_diag_max
-        self.chol_eps = chol_eps
-        self.mix_scale = float(mix_scale)
+        self.mu_scale = float(mu_scale)
+        self.chol_offdiag_scale = float(chol_offdiag_scale)
+        self.chol_diag_max = float(chol_diag_max)
+        self.chol_eps = float(chol_eps)
         self.mu_mode = str(mu_mode).lower()
         self.sigma_mode = str(sigma_mode).lower()
+        self.num_advections = 2
+        self.advection_dim = 2
+        self.mu_dim = self.num_advections * self.advection_dim
+        self.chol_param_dim = self.mu_dim * (self.mu_dim + 1) // 2
+
         if self.mu_mode not in {"free", "anchored"}:
             raise ValueError(f"Unsupported mu_mode={mu_mode!r}; expected 'free' or 'anchored'.")
         if self.sigma_mode not in {"network", "global"}:
             raise ValueError(f"Unsupported sigma_mode={sigma_mode!r}; expected 'network' or 'global'.")
+
         if wind_anchor_indices is None:
             wind_anchor_indices = (8, 9) if self.in_channels >= 10 else (2, 3)
         if len(wind_anchor_indices) != 2:
@@ -103,16 +112,25 @@ class AdvectionMeanNet(nn.Module):
             ff_dim=ff_dim,
             dropout=dropout,
         )
-        self.mu_head = nn.Linear(embed_dim, 4)
-        self.chol_head = nn.Linear(embed_dim, 3)
-        self.mix_head = nn.Linear(embed_dim, 4)
+
+        mu_head_dim = self.mu_dim if self.mu_mode == "free" else self.mu_dim * self.advection_dim
+        self.mu_head = nn.Linear(embed_dim, mu_head_dim)
+        self.chol_head = nn.Linear(embed_dim, self.chol_param_dim)
+
         init_diag_raw = inverse_softplus(max(float(init_global_sigma_diag) - self.chol_eps, 1e-4))
-        global_chol_init = torch.zeros(3)
-        global_chol_init[:2] = init_diag_raw
+        global_chol_init = torch.zeros(self.chol_param_dim)
+        diag_positions = self._diag_param_positions()
+        global_chol_init[diag_positions] = init_diag_raw
         self.global_chol_params = nn.Parameter(global_chol_init)
-        nn.init.zeros_(self.mix_head.weight)
-        nn.init.zeros_(self.mix_head.bias)
         self._configure_parameter_usage()
+
+    def _diag_param_positions(self):
+        positions = []
+        cursor = 0
+        for row in range(self.mu_dim):
+            positions.append(cursor + row)
+            cursor += row + 1
+        return positions
 
     def _configure_parameter_usage(self):
         chol_head_trainable = self.sigma_mode == "network"
@@ -120,26 +138,65 @@ class AdvectionMeanNet(nn.Module):
             param.requires_grad_(chol_head_trainable)
         self.global_chol_params.requires_grad_(self.sigma_mode == "global")
 
+    def _expand_legacy_mu_head(self, tensor, target_shape):
+        expanded = torch.zeros(target_shape, device=tensor.device, dtype=tensor.dtype)
+        rows = min(tensor.shape[0], target_shape[0])
+        expanded[:rows] = tensor[:rows]
+        return expanded
+
+    def _expand_legacy_chol(self, tensor):
+        if tensor.ndim == 1:
+            expanded = tensor.new_zeros(self.chol_param_dim)
+            if tensor.shape[0] == 3:
+                expanded[0] = tensor[0]
+                expanded[1] = tensor[1]
+                expanded[2] = tensor[2]
+                expanded[5] = tensor[0]
+                expanded[8] = tensor[1]
+                expanded[9] = tensor[2]
+                return expanded
+            expanded[: min(tensor.shape[0], self.chol_param_dim)] = tensor[: min(tensor.shape[0], self.chol_param_dim)]
+            return expanded
+
+        expanded = tensor.new_zeros(self.chol_param_dim, tensor.shape[1])
+        if tensor.shape[0] == 3:
+            expanded[0] = tensor[0]
+            expanded[1] = tensor[1]
+            expanded[2] = tensor[2]
+            expanded[5] = tensor[0]
+            expanded[8] = tensor[1]
+            expanded[9] = tensor[2]
+            return expanded
+        rows = min(tensor.shape[0], self.chol_param_dim)
+        expanded[:rows] = tensor[:rows]
+        return expanded
+
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        for legacy_key in ("mix_head.weight", "mix_head.bias"):
+            state_dict.pop(f"{prefix}{legacy_key}", None)
+
+        mu_weight_key = f"{prefix}mu_head.weight"
+        mu_bias_key = f"{prefix}mu_head.bias"
+        if mu_weight_key in state_dict and state_dict[mu_weight_key].shape != self.mu_head.weight.shape:
+            state_dict[mu_weight_key] = self._expand_legacy_mu_head(state_dict[mu_weight_key], self.mu_head.weight.shape)
+        if mu_bias_key in state_dict and state_dict[mu_bias_key].shape != self.mu_head.bias.shape:
+            state_dict[mu_bias_key] = self._expand_legacy_mu_head(
+                state_dict[mu_bias_key].reshape(-1, 1),
+                self.mu_head.bias.reshape(-1, 1).shape,
+            ).reshape(-1)
+
         for key in ("weight", "bias"):
             full_key = f"{prefix}chol_head.{key}"
-            if full_key in state_dict and state_dict[full_key].shape != getattr(self.chol_head, key).shape:
-                legacy_value = state_dict[full_key]
-                if key == "weight" and legacy_value.ndim == 2 and legacy_value.shape[0] == 10:
-                    state_dict[full_key] = legacy_value.index_select(0, torch.tensor([0, 1, 4], device=legacy_value.device))
-                elif key == "bias" and legacy_value.ndim == 1 and legacy_value.shape[0] == 10:
-                    state_dict[full_key] = legacy_value.index_select(0, torch.tensor([0, 1, 4], device=legacy_value.device))
+            expected = getattr(self.chol_head, key)
+            if full_key in state_dict and state_dict[full_key].shape != expected.shape:
+                state_dict[full_key] = self._expand_legacy_chol(state_dict[full_key])
+
         global_key = f"{prefix}global_chol_params"
         if global_key in state_dict and state_dict[global_key].shape != self.global_chol_params.shape:
-            legacy_value = state_dict[global_key]
-            if legacy_value.ndim == 1 and legacy_value.shape[0] == 10:
-                state_dict[global_key] = legacy_value.index_select(0, torch.tensor([0, 1, 4], device=legacy_value.device))
+            state_dict[global_key] = self._expand_legacy_chol(state_dict[global_key])
         if global_key not in state_dict:
             state_dict[global_key] = self.global_chol_params.detach().clone()
-        for key, param in (("weight", self.mix_head.weight), ("bias", self.mix_head.bias)):
-            full_key = f"{prefix}mix_head.{key}"
-            if full_key not in state_dict:
-                state_dict[full_key] = param.detach().clone()
+
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -153,17 +210,20 @@ class AdvectionMeanNet(nn.Module):
 
     def _build_cholesky(self, chol_raw):
         batch_size = chol_raw.shape[0]
-        chol = chol_raw.new_zeros(batch_size, 2, 2)
+        chol = chol_raw.new_zeros(batch_size, self.mu_dim, self.mu_dim)
 
-        diag_raw = chol_raw[:, :2]
-        offdiag_raw = chol_raw[:, 2:]
+        cursor = 0
+        for row in range(self.mu_dim):
+            row_width = row + 1
+            row_raw = chol_raw[:, cursor:cursor + row_width]
+            diag_raw = row_raw[:, -1]
+            offdiag_raw = row_raw[:, :-1]
 
-        diag = torch.nn.functional.softplus(diag_raw).clamp_max(self.chol_diag_max) + self.chol_eps
-        offdiag = self.chol_offdiag_scale * torch.tanh(offdiag_raw)
+            chol[:, row, row] = torch.nn.functional.softplus(diag_raw).clamp_max(self.chol_diag_max) + self.chol_eps
+            if row > 0:
+                chol[:, row, :row] = self.chol_offdiag_scale * torch.tanh(offdiag_raw)
+            cursor += row_width
 
-        chol[:, 0, 0] = diag[:, 0]
-        chol[:, 1, 0] = offdiag[:, 0]
-        chol[:, 1, 1] = diag[:, 1]
         return chol
 
     def _extract_wind_anchor(self, x_seq):
@@ -176,11 +236,18 @@ class AdvectionMeanNet(nn.Module):
         wind_uv = latest_frame[:, [u_idx, v_idx]]
         return wind_uv.mean(dim=(-1, -2))
 
-    def _build_component_mix(self, raw_mix):
-        batch_size = raw_mix.shape[0]
-        mix = raw_mix.reshape(batch_size, 2, 2)
-        eye = torch.eye(2, device=raw_mix.device, dtype=raw_mix.dtype).unsqueeze(0)
-        return eye + self.mix_scale * torch.tanh(mix)
+    def _predict_mu(self, h, x_seq):
+        mu_raw = self.mu_scale * torch.tanh(self.mu_head(h))
+        wind_anchor = self._extract_wind_anchor(x_seq)
+
+        if self.mu_mode == "anchored":
+            mu_coeff = mu_raw.reshape(-1, self.mu_dim, self.advection_dim)
+            mu = torch.einsum("bij,bj->bi", mu_coeff, wind_anchor)
+        else:
+            mu_coeff = None
+            mu = mu_raw
+
+        return mu, mu_coeff, wind_anchor
 
     def forward(self, x_seq):
         # x_seq: [B, L, C, Y, X]
@@ -191,30 +258,20 @@ class AdvectionMeanNet(nn.Module):
         feat = feat.reshape(batch_size, seq_len, embed_dim)
 
         h = self.temporal(feat)
-        mu_raw = self.mu_scale * torch.tanh(self.mu_head(h))
-        base_anchor = self._extract_wind_anchor(x_seq)
-        if self.mu_mode == "anchored":
-            mu_coeff_matrix = mu_raw.reshape(batch_size, 2, 2)
-            wind_anchor = base_anchor
-            velocity = torch.einsum("bij,bj->bi", mu_coeff_matrix, wind_anchor)
-        else:
-            velocity = mu_raw[:, :2]
-            mu_coeff_matrix = velocity.new_zeros(batch_size, 2, 2)
-            mu_coeff_matrix[:, 0, 0] = velocity[:, 0]
-            mu_coeff_matrix[:, 1, 1] = velocity[:, 1]
-            wind_anchor = torch.ones_like(base_anchor)
+        mu, mu_coeff_matrix, wind_anchor = self._predict_mu(h, x_seq)
 
         if self.sigma_mode == "global":
-            chol_factor = self._build_cholesky(self.global_chol_params.unsqueeze(0).expand(batch_size, -1))
+            chol_raw = self.global_chol_params.unsqueeze(0).expand(batch_size, -1)
         else:
-            chol_factor = self._build_cholesky(self.chol_head(h))
-        diffusion = chol_factor @ chol_factor.transpose(-1, -2)
-        component_mix = self._build_component_mix(self.mix_head(h))
+            chol_raw = self.chol_head(h)
+        chol_factor = self._build_cholesky(chol_raw)
+        sigma = chol_factor @ chol_factor.transpose(-1, -2)
+
         return {
-            "mu": velocity,
+            "mu": mu,
+            "mu_pairs": mu.reshape(batch_size, self.num_advections, self.advection_dim),
             "mu_coeff_matrix": mu_coeff_matrix,
-            "wind_anchor": base_anchor,
-            "sigma": diffusion,
+            "wind_anchor": wind_anchor,
+            "sigma": sigma,
             "chol_factor": chol_factor,
-            "component_mix": component_mix,
         }

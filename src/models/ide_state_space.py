@@ -33,9 +33,13 @@ class IDEStateSpaceModel(nn.Module):
     State Y_t is stored as [u(s1), v(s1), ..., u(sS), v(sS)].
 
     The ML model supplies time-varying advection parameters
-        V_t ~ N_2(mu_t, Sigma_t)
+        [A_uu,t, A_vv,t] ~ N_4(mu_t, Sigma_t)
 
-    and Sigma_t enters the theorem-inspired transport kernel directly.
+    where each directional advection A_uu,t and A_vv,t lives in R^2.
+    The flattened ordering is [A_uu,x, A_uu,y, A_vv,x, A_vv,y].
+
+    Pairwise transport kernels for uu, uv, vu, vv are then assembled from the
+    4D Gaussian using the corrected Lagrangian form in Theorem 2'.
 
     The IDE parameters are also time-varying, but are learned directly as
     piecewise-constant sequences over absolute time rather than being driven by
@@ -67,6 +71,9 @@ class IDEStateSpaceModel(nn.Module):
         self.dt = dt
         self.num_sites = num_sites
         self.vec_dim = 2
+        self.num_advections = self.vec_dim
+        self.advection_dim = 2
+        self.mu_dim = self.num_advections * self.advection_dim
         self.state_dim = num_sites * self.vec_dim
         self.total_steps = max(int(total_steps), 1)
         self.param_window = max(int(param_window), 1)
@@ -303,25 +310,52 @@ class IDEStateSpaceModel(nn.Module):
         raise ValueError(f"Expected z_seq to have 3 or 4 dims, got {tuple(z_seq.shape)}")
 
     def _default_dynamics(self, batch_size, device, dtype):
-        eye2 = torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
         return {
-            "mu": torch.zeros(batch_size, 2, device=device, dtype=dtype),
-            "sigma": torch.zeros(batch_size, 2, 2, device=device, dtype=dtype),
-            "component_mix": eye2,
+            "mu": torch.zeros(batch_size, self.mu_dim, device=device, dtype=dtype),
+            "sigma": torch.zeros(batch_size, self.mu_dim, self.mu_dim, device=device, dtype=dtype),
         }
+
+    def _legacy_mu_to_joint(self, mu):
+        mu = mu.reshape(mu.shape[0], self.advection_dim)
+        return mu.repeat(1, self.num_advections)
+
+    def _legacy_sigma_to_joint(self, sigma):
+        sigma = sigma.reshape(sigma.shape[0], self.advection_dim, self.advection_dim)
+        joint = sigma.new_zeros(sigma.shape[0], self.mu_dim, self.mu_dim)
+        joint[:, :self.advection_dim, :self.advection_dim] = sigma
+        joint[:, self.advection_dim:, self.advection_dim:] = sigma
+        return joint
 
     def _parse_dynamics(self, dynamics_t, batch_size, device, dtype):
         if dynamics_t is None:
             dynamics_t = self._default_dynamics(batch_size, device, dtype)
-        mu = dynamics_t["mu"].to(device=device, dtype=dtype).reshape(batch_size, 2)
-        sigma = dynamics_t["sigma"].to(device=device, dtype=dtype).reshape(batch_size, 2, 2)
-        sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
-        component_mix = dynamics_t.get("component_mix")
-        if component_mix is None:
-            component_mix = torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
+
+        mu = dynamics_t["mu"].to(device=device, dtype=dtype)
+        if mu.shape[-1] == self.advection_dim:
+            mu = self._legacy_mu_to_joint(mu.reshape(batch_size, self.advection_dim))
         else:
-            component_mix = component_mix.to(device=device, dtype=dtype).reshape(batch_size, 2, 2)
-        return mu, sigma, component_mix
+            mu = mu.reshape(batch_size, self.mu_dim)
+
+        sigma = dynamics_t["sigma"].to(device=device, dtype=dtype)
+        if sigma.shape[-2:] == (self.advection_dim, self.advection_dim):
+            sigma = self._legacy_sigma_to_joint(sigma.reshape(batch_size, self.advection_dim, self.advection_dim))
+        else:
+            sigma = sigma.reshape(batch_size, self.mu_dim, self.mu_dim)
+        sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
+        sigma = torch.nan_to_num(sigma, nan=0.0, posinf=1e6, neginf=-1e6)
+        return mu, sigma
+
+    def _split_mu_pairs(self, mu):
+        return mu.reshape(mu.shape[0], self.num_advections, self.advection_dim)
+
+    def _split_sigma_blocks(self, sigma):
+        return sigma.reshape(
+            sigma.shape[0],
+            self.num_advections,
+            self.advection_dim,
+            self.num_advections,
+            self.advection_dim,
+        ).permute(0, 1, 3, 2, 4)
 
     def _make_spd(self, matrix, min_eig=1e-4):
         matrix = 0.5 * (matrix + matrix.transpose(-1, -2))
@@ -398,43 +432,60 @@ class IDEStateSpaceModel(nn.Module):
             "init_mean": self._gather_vector(self.init_mean_series, idx),
         }
 
-    def build_site_kernel(self, site_lon, site_lat, dynamics_t, device, dtype):
-        batch_size = site_lon.shape[0] if site_lon.ndim > 1 else dynamics_t["mu"].shape[0]
-        site_lon, site_lat = self._expand_sites(site_lon, site_lat, batch_size)
-        coords = project_lon_lat(site_lon, site_lat)
-        h = coords[:, :, None, :] - coords[:, None, :, :]
+    def _pair_transport_params(self, mu_pairs, sigma_blocks, target_idx, source_idx):
+        if target_idx == source_idx:
+            drift = self.dt * mu_pairs[:, target_idx]
+            covariance = sigma_blocks[:, target_idx, target_idx]
+            return drift, covariance
 
-        mu_t, sigma_t, _ = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
-        eye2 = torch.eye(2, device=device, dtype=dtype).unsqueeze(0)
-        diffusion_t = self._make_spd(sigma_t + 1e-4 * eye2, min_eig=1e-4)
+        drift = self.dt * (mu_pairs[:, target_idx] - mu_pairs[:, source_idx])
+        covariance = (
+            sigma_blocks[:, target_idx, target_idx]
+            + sigma_blocks[:, source_idx, source_idx]
+            - sigma_blocks[:, target_idx, source_idx]
+            - sigma_blocks[:, source_idx, target_idx]
+        )
+        return drift, covariance
+
+    def build_pair_kernel(self, coords, mu_pairs, sigma_blocks, target_idx, source_idx):
+        batch_size = coords.shape[0]
+        h = coords[:, :, None, :] - coords[:, None, :, :]
+        drift, pair_cov = self._pair_transport_params(mu_pairs, sigma_blocks, target_idx, source_idx)
+
+        eye2 = torch.eye(self.advection_dim, device=coords.device, dtype=coords.dtype).unsqueeze(0)
         D = self._make_spd(
-            eye2.expand(batch_size, -1, -1) + 2.0 * (self.dt ** 2) * diffusion_t + 1e-4 * eye2,
+            eye2.expand(batch_size, -1, -1) + 2.0 * (self.dt ** 2) * pair_cov + 1e-4 * eye2,
             min_eig=1e-4,
         )
         D_inv, logdet = self._inv_and_logdet_2x2(D, min_det=1e-8)
-        drift = self.dt * mu_t[:, None, None, :]
-        diff = h - drift
-
+        diff = h - drift[:, None, None, :]
         q = torch.einsum("bijd,bdf,bijf->bij", diff, D_inv, diff)
-        transport_kernel = torch.exp(-0.5 * (q + logdet[:, None, None]))
-        return transport_kernel / transport_kernel.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        kernel = torch.exp(-(q + 0.5 * logdet[:, None, None]))
+        return kernel / kernel.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
     def build_component_kernels(self, site_lon, site_lat, dynamics_t, device, dtype, transition_idx=None):
         del transition_idx
         batch_size = site_lon.shape[0] if site_lon.ndim > 1 else dynamics_t["mu"].shape[0]
-        site_kernel = self.build_site_kernel(
-            site_lon=site_lon,
-            site_lat=site_lat,
-            dynamics_t=dynamics_t,
-            device=device,
-            dtype=dtype,
-        )
-        _, _, component_mix = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
+        site_lon, site_lat = self._expand_sites(site_lon, site_lat, batch_size)
+        coords = project_lon_lat(site_lon, site_lat)
+
+        mu_t, sigma_t = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
+        mu_pairs = self._split_mu_pairs(mu_t)
+        sigma_blocks = self._split_sigma_blocks(sigma_t)
+
         kernels = []
         for target_idx in range(self.vec_dim):
             row_kernels = []
             for source_idx in range(self.vec_dim):
-                row_kernels.append(site_kernel * component_mix[:, target_idx, source_idx][:, None, None])
+                row_kernels.append(
+                    self.build_pair_kernel(
+                        coords=coords,
+                        mu_pairs=mu_pairs,
+                        sigma_blocks=sigma_blocks,
+                        target_idx=target_idx,
+                        source_idx=source_idx,
+                    )
+                )
             kernels.append(torch.stack(row_kernels, dim=1))
         return torch.stack(kernels, dim=1)
 
@@ -473,8 +524,6 @@ class IDEStateSpaceModel(nn.Module):
         return {
             "mu": dynamics_seq["mu"][:, t],
             "sigma": dynamics_seq["sigma"][:, t],
-            "component_mix": dynamics_seq.get("component_mix", None)[:, t]
-            if dynamics_seq.get("component_mix", None) is not None else None,
         }
 
     def _init_filter_state(self, start_idx, device, dtype):
