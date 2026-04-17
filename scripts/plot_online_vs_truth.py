@@ -80,6 +80,7 @@ def reconstruct_models(ckpt, device):
         dt=cfg.get("dt", 1.0),
         total_steps=cfg.get("ide_total_steps", 1),
         param_window=cfg.get("ide_param_window", 4),
+        param_mode=cfg.get("ide_param_mode", "absolute"),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),

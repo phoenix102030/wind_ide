@@ -4,10 +4,28 @@ nwp_file: ~/wind_ide/data/nwp/data_grid_offline.mat
 device: cuda
 seed: 42
 dt: 1.0
-seq_len: 24
-ide_param_window: 1
-chunk_len: 1
+
+# seq_len:
+#   advection 网络每次看多少帧 NWP 历史来输出一个时刻的 mu_t / Sigma_t
+seq_len: 6
+
+# ide_param_window:
+#   连续多少个绝对时间步共用一组 IDE 参数
+#   取 1 会退化成每个时刻一套 IDE 参数，通常太自由
+ide_param_window: 12
+ide_param_mode: global
+
+# chunk_len:
+#   每个训练样本里用于 IDE likelihood 的转移步数
+#   stage 2 中每个样本会输出 chunk_len 个 advection 参数
+chunk_len: 24
+
+# forecast_horizon:
+#   多步验证时递推预测的未来步数
 forecast_horizon: 12
+val_fraction: 0.2
+num_workers: 0
+num_gpus: 2
 
 out_dir: outputs/offline_140m_01
 

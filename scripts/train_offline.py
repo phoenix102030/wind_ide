@@ -108,6 +108,34 @@ def dataset_sample_span(dataset):
     return int(dataset.chunk_len + 1)
 
 
+def subset_window_starts(subset):
+    if isinstance(subset, Subset):
+        return [subset.dataset.valid[i] for i in subset.indices]
+    return list(subset.valid)
+
+
+def summarize_knot_coverage(subset, sample_span, param_window):
+    starts = subset_window_starts(subset)
+    if not starts:
+        return {"windows": 0, "knot_count": 0, "knot_min": None, "knot_max": None}
+
+    knots = set()
+    for start in starts:
+        end = start + sample_span - 1
+        for t in range(start, end + 1):
+            knots.add(t // param_window)
+
+    return {
+        "windows": len(starts),
+        "start_min": int(min(starts)),
+        "start_max": int(max(starts)),
+        "knot_count": len(knots),
+        "knot_min": int(min(knots)),
+        "knot_max": int(max(knots)),
+        "knot_set": knots,
+    }
+
+
 def contiguous_time_split(dataset, val_fraction=0.2):
     starts = list(dataset.valid)
     if len(starts) < 2:
@@ -199,6 +227,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     bundle = build_aligned_bundle(meas_file, nwp_file)
     cfg = dict(cfg)
     cfg["ide_total_steps"] = int(bundle.z_meas.shape[0])
+    cfg["ide_param_mode"] = str(cfg.get("ide_param_mode", "absolute")).lower()
     out_dir = Path(cfg.get("out_dir", "outputs/measurement_140m_two_stage"))
     if is_main_process():
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -207,6 +236,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print("device:", device)
         print("distributed_world_size:", world_size)
         print(f"advection_seq_len={seq_len}")
+        print(f"ide_param_mode={cfg['ide_param_mode']}")
         print(f"ide_param_window={cfg.get('ide_param_window', 12)}")
         print(f"chunk_len={chunk_len}")
 
@@ -220,6 +250,32 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
             f"train={ide_split_info['train_windows']} "
             f"val={ide_split_info['val_windows']}"
         )
+        if cfg["ide_param_mode"] == "absolute":
+            ide_coverage_train = summarize_knot_coverage(
+                ide_train_ds,
+                sample_span=ide_split_info["sample_span"],
+                param_window=int(cfg.get("ide_param_window", 12)),
+            )
+            ide_coverage_val = summarize_knot_coverage(
+                ide_val_ds,
+                sample_span=ide_split_info["sample_span"],
+                param_window=int(cfg.get("ide_param_window", 12)),
+            )
+            overlap = len(ide_coverage_train["knot_set"] & ide_coverage_val["knot_set"])
+            print(
+                "[IDE knot coverage] "
+                f"train={ide_coverage_train['knot_min']}..{ide_coverage_train['knot_max']} "
+                f"({ide_coverage_train['knot_count']} knots) "
+                f"val={ide_coverage_val['knot_min']}..{ide_coverage_val['knot_max']} "
+                f"({ide_coverage_val['knot_count']} knots) "
+                f"overlap={overlap}"
+            )
+            if overlap == 0:
+                print(
+                    "[warning] ide_param_mode=absolute with a contiguous time split means the validation "
+                    "windows use a disjoint set of learned IDE time knots; val loss can stay flat even "
+                    "while train loss drops."
+                )
 
     ide_train_loader, ide_train_sampler = build_loader(
         ide_train_ds,
@@ -240,6 +296,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         dt=cfg.get("dt", 1.0),
         total_steps=cfg.get("ide_total_steps", 1),
         param_window=cfg.get("ide_param_window", 12),
+        param_mode=cfg.get("ide_param_mode", "absolute"),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),

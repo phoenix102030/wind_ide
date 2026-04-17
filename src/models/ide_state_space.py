@@ -48,6 +48,7 @@ class IDEStateSpaceModel(nn.Module):
         num_sites=3,
         total_steps=1,
         param_window=1,
+        param_mode="absolute",
         init_log_ell_par=0.5,
         init_log_ell_perp=0.0,
         init_log_q_proc=-2.0,
@@ -65,7 +66,10 @@ class IDEStateSpaceModel(nn.Module):
         self.state_dim = num_sites * self.vec_dim
         self.total_steps = max(int(total_steps), 1)
         self.param_window = max(int(param_window), 1)
-        self.num_knots = math.ceil(self.total_steps / self.param_window)
+        self.param_mode = str(param_mode).lower()
+        if self.param_mode not in {"absolute", "global"}:
+            raise ValueError(f"Unsupported param_mode={param_mode!r}; expected 'absolute' or 'global'.")
+        self.num_knots = 1 if self.param_mode == "global" else math.ceil(self.total_steps / self.param_window)
 
         self.log_q_proc_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_q_proc)))
         self.log_r_obs_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_r_obs)))
@@ -87,9 +91,13 @@ class IDEStateSpaceModel(nn.Module):
         return self.log_q_proc_knots.new_tensor(1.0)
 
     def _expand_scalar_series(self, knots):
+        if knots.shape[0] == 1:
+            return knots.expand(self.total_steps)
         return knots.repeat_interleave(self.param_window, dim=0)[:self.total_steps]
 
     def _expand_vector_series(self, knots):
+        if knots.shape[0] == 1:
+            return knots.expand(self.total_steps, -1)
         return knots.repeat_interleave(self.param_window, dim=0)[:self.total_steps]
 
     @property
@@ -138,6 +146,40 @@ class IDEStateSpaceModel(nn.Module):
         self.log_p0_knots.clamp_(log_min, log_max)
         self.log_damping_knots.clamp_(log_min, log_max)
 
+    def _resize_loaded_knots(self, value, target_shape):
+        target_num_knots = target_shape[0]
+        if value.shape == target_shape:
+            return value
+
+        if value.ndim == 0:
+            value = value.reshape(1)
+
+        if value.ndim == 1:
+            if target_num_knots == 1:
+                return value.reshape(-1).mean().reshape(1)
+            if value.numel() == 1:
+                return value.reshape(1).repeat(target_num_knots)
+            positions = torch.linspace(0, value.numel() - 1, steps=target_num_knots, device=value.device)
+            left = positions.floor().long()
+            right = positions.ceil().long()
+            weight = (positions - left).to(dtype=value.dtype)
+            resized = (1.0 - weight) * value.index_select(0, left) + weight * value.index_select(0, right)
+            return resized.reshape(target_shape)
+
+        if value.ndim == 2:
+            if target_num_knots == 1:
+                return value.mean(dim=0, keepdim=True)
+            if value.shape[0] == 1:
+                return value.repeat(target_num_knots, 1)
+            positions = torch.linspace(0, value.shape[0] - 1, steps=target_num_knots, device=value.device)
+            left = positions.floor().long()
+            right = positions.ceil().long()
+            weight = (positions - left).to(dtype=value.dtype).unsqueeze(-1)
+            resized = (1.0 - weight) * value.index_select(0, left) + weight * value.index_select(0, right)
+            return resized.reshape(target_shape)
+
+        return value
+
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         legacy_to_new = {
             "log_q_proc": "log_q_proc_knots",
@@ -158,6 +200,18 @@ class IDEStateSpaceModel(nn.Module):
         if legacy_init_mean in state_dict and new_init_mean not in state_dict:
             legacy_value = state_dict[legacy_init_mean].reshape(1, self.state_dim)
             state_dict[new_init_mean] = legacy_value.repeat(self.num_knots, 1)
+
+        resize_targets = {
+            "log_q_proc_knots": self.log_q_proc_knots.shape,
+            "log_r_obs_knots": self.log_r_obs_knots.shape,
+            "log_p0_knots": self.log_p0_knots.shape,
+            "log_damping_knots": self.log_damping_knots.shape,
+            "init_mean_knots": self.init_mean_knots.shape,
+        }
+        for key, target_shape in resize_targets.items():
+            full_key = f"{prefix}{key}"
+            if full_key in state_dict:
+                state_dict[full_key] = self._resize_loaded_knots(state_dict[full_key], target_shape)
 
         for legacy_key in (
             "log_ell_par",

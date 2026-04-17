@@ -140,6 +140,30 @@ def test_time_varying_ide_params_follow_absolute_index():
     assert torch.allclose(gathered, expected)
 
 
+def test_global_ide_params_are_shared_across_absolute_time():
+    model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2, param_mode="global")
+    with torch.no_grad():
+        model.log_q_proc_knots.copy_(torch.tensor([-1.25]))
+
+    gathered = model._get_time_params(torch.tensor([[0], [7]]))["q_proc"][:, 0]
+    expected = torch.full((2,), torch.exp(torch.tensor(-1.25)))
+    assert model.num_knots == 1
+    assert torch.allclose(gathered, expected)
+
+
+def test_loading_absolute_knots_into_global_mode_reduces_to_shared_value():
+    absolute_model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2)
+    with torch.no_grad():
+        absolute_model.log_q_proc_knots.copy_(torch.tensor([-2.0, -1.0, 0.0, 1.0]))
+
+    global_model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2, param_mode="global")
+    state_dict = absolute_model.state_dict()
+    global_model.load_state_dict(state_dict, strict=True)
+
+    assert global_model.log_q_proc_knots.shape == (1,)
+    assert torch.allclose(global_model.log_q_proc_knots, torch.tensor([-0.5]))
+
+
 def test_legacy_coupling_key_is_ignored_on_load():
     model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2)
     state_dict = model.state_dict()
