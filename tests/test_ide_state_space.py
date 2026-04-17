@@ -208,6 +208,24 @@ def test_damping_is_clamped_to_configured_range():
     assert torch.allclose(model.damping, torch.tensor(1.0), atol=1e-6)
 
 
+def test_q_and_r_are_clamped_to_configured_ranges():
+    model = IDEStateSpaceModel(
+        num_sites=3,
+        total_steps=8,
+        param_window=2,
+        q_proc_min=0.05,
+        q_proc_max=0.4,
+        r_obs_min=0.06,
+        r_obs_max=0.7,
+    )
+    with torch.no_grad():
+        model.log_q_proc_knots.fill_(5.0)
+        model.log_r_obs_knots.fill_(5.0)
+        model.clamp_parameters_()
+    assert torch.allclose(model.q_proc, torch.tensor(0.4), atol=1e-6)
+    assert torch.allclose(model.r_obs, torch.tensor(0.7), atol=1e-6)
+
+
 def test_legacy_coupling_key_is_ignored_on_load():
     model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2)
     state_dict = model.state_dict()

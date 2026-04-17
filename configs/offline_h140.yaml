@@ -34,6 +34,8 @@ ide_batch_size: 32
 ide_lr: 0.001
 ide_epochs: 30
 ide_max_steps: 100
+skip_ide_warmup: true
+train_ell_params: true
 
 init_log_q_proc: -2
 init_log_r_obs: -2
@@ -41,8 +43,12 @@ init_log_p0: 0.0
 init_log_damping: 0.0
 init_log_ell_par: 0.5
 init_log_ell_perp: 0.0
+q_proc_min: 0.02
+q_proc_max: 0.5
+r_obs_min: 0.02
+r_obs_max: 0.75
 damping_min: 0.02
-damping_max: 0.5
+damping_max: 1.0
 noise_reg_weight: 0.0001
 
 # ML stage

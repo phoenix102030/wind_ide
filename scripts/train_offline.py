@@ -115,6 +115,11 @@ def save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg):
     save_pair_checkpoint(out_dir / "mu_best.pt", mean_model, ide_model, cfg)
 
 
+def configure_ide_trainability(model, train_ell_params=True):
+    model.log_ell_par_knots.requires_grad_(bool(train_ell_params))
+    model.log_ell_perp_knots.requires_grad_(bool(train_ell_params))
+
+
 def dataset_sample_span(dataset):
     if hasattr(dataset, "seq_len"):
         return int(dataset.seq_len + dataset.chunk_len)
@@ -241,6 +246,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     cfg = dict(cfg)
     cfg["ide_total_steps"] = int(bundle.z_meas.shape[0])
     cfg["ide_param_mode"] = str(cfg.get("ide_param_mode", "absolute")).lower()
+    cfg["skip_ide_warmup"] = bool(cfg.get("skip_ide_warmup", False))
+    cfg["train_ell_params"] = bool(cfg.get("train_ell_params", True))
     out_dir = Path(cfg.get("out_dir", "outputs/measurement_140m_two_stage"))
     if is_main_process():
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -250,6 +257,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print("distributed_world_size:", world_size)
         print(f"advection_seq_len={seq_len}")
         print(f"ide_param_mode={cfg['ide_param_mode']}")
+        print(f"skip_ide_warmup={cfg['skip_ide_warmup']}")
+        print(f"train_ell_params={cfg['train_ell_params']}")
         print(f"ide_param_window={cfg.get('ide_param_window', 12)}")
         print(f"chunk_len={chunk_len}")
 
@@ -316,52 +325,71 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
         init_log_damping=cfg.get("init_log_damping", 0.0),
+        q_proc_min=cfg.get("q_proc_min", math.exp(-4.0)),
+        q_proc_max=cfg.get("q_proc_max", 0.5),
+        r_obs_min=cfg.get("r_obs_min", math.exp(-4.0)),
+        r_obs_max=cfg.get("r_obs_max", 0.75),
         damping_min=cfg.get("damping_min", math.exp(-4.0)),
         damping_max=cfg.get("damping_max", 1.0),
     ).to(device)
+    configure_ide_trainability(ide_model, train_ell_params=cfg["train_ell_params"])
     ide_model = maybe_wrap_ddp(ide_model, device, distributed)
-    ide_opt = torch.optim.Adam(unwrap_model(ide_model).parameters(), lr=cfg.get("ide_lr", 1e-3))
+    ide_opt = torch.optim.Adam(
+        [p for p in unwrap_model(ide_model).parameters() if p.requires_grad],
+        lr=cfg.get("ide_lr", 1e-3),
+    )
 
     if is_main_process():
         print("ide_model params:", count_parameters(unwrap_model(ide_model)))
+        print("ide_model trainable params:", sum(p.numel() for p in unwrap_model(ide_model).parameters() if p.requires_grad))
 
-    best_ide_val = float("inf")
-    for epoch in range(cfg.get("ide_epochs", 20)):
-        if ide_train_sampler is not None:
-            ide_train_sampler.set_epoch(epoch)
-
-        tr = train_ide_baseline_one_epoch(
-            ide_model=ide_model,
-            loader=ide_train_loader,
-            optimizer=ide_opt,
-            device=device,
-            max_steps=cfg.get("ide_max_steps", None),
-            noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
-        )
-        va = eval_ide_baseline(
-            ide_model=ide_model,
-            loader=ide_val_loader,
-            device=device,
-            max_steps=cfg.get("ide_max_steps", None),
-            noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
-        )
-
+    warmup_epochs = int(cfg.get("ide_epochs", 20))
+    skip_ide_warmup = cfg["skip_ide_warmup"] or warmup_epochs <= 0
+    best_ide_val = float("nan") if skip_ide_warmup else float("inf")
+    if skip_ide_warmup:
         raw_ide = unwrap_model(ide_model)
         if is_main_process():
-            print(
-                f"[OFFLINE-STAT-ZERO][epoch {epoch}] "
-                f"train={tr:.6f} val={va:.6f} "
-                f"ell_par={float(raw_ide.ell_par.detach().cpu()):.4f} "
-                f"ell_perp={float(raw_ide.ell_perp.detach().cpu()):.4f} "
-                f"damping={float(raw_ide.damping.detach().cpu()):.4f} "
-                f"q_proc={float(raw_ide.q_proc.detach().cpu()):.4f} "
-                f"r_obs={float(raw_ide.r_obs.detach().cpu()):.4f}"
-            )
+            print("[IDE warmup] skipped; starting directly from alternating optimization.")
             torch.save({"model_state": raw_ide.state_dict(), "config": cfg}, out_dir / "ide_last.pt")
-            if va < best_ide_val:
-                best_ide_val = va
-                torch.save({"model_state": raw_ide.state_dict(), "config": cfg}, out_dir / "ide_best.pt")
+            torch.save({"model_state": raw_ide.state_dict(), "config": cfg}, out_dir / "ide_best.pt")
         maybe_barrier()
+    else:
+        for epoch in range(warmup_epochs):
+            if ide_train_sampler is not None:
+                ide_train_sampler.set_epoch(epoch)
+
+            tr = train_ide_baseline_one_epoch(
+                ide_model=ide_model,
+                loader=ide_train_loader,
+                optimizer=ide_opt,
+                device=device,
+                max_steps=cfg.get("ide_max_steps", None),
+                noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
+            )
+            va = eval_ide_baseline(
+                ide_model=ide_model,
+                loader=ide_val_loader,
+                device=device,
+                max_steps=cfg.get("ide_max_steps", None),
+                noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
+            )
+
+            raw_ide = unwrap_model(ide_model)
+            if is_main_process():
+                print(
+                    f"[OFFLINE-STAT-ZERO][epoch {epoch}] "
+                    f"train={tr:.6f} val={va:.6f} "
+                    f"ell_par={float(raw_ide.ell_par.detach().cpu()):.4f} "
+                    f"ell_perp={float(raw_ide.ell_perp.detach().cpu()):.4f} "
+                    f"damping={float(raw_ide.damping.detach().cpu()):.4f} "
+                    f"q_proc={float(raw_ide.q_proc.detach().cpu()):.4f} "
+                    f"r_obs={float(raw_ide.r_obs.detach().cpu()):.4f}"
+                )
+                torch.save({"model_state": raw_ide.state_dict(), "config": cfg}, out_dir / "ide_last.pt")
+                if va < best_ide_val:
+                    best_ide_val = va
+                    torch.save({"model_state": raw_ide.state_dict(), "config": cfg}, out_dir / "ide_best.pt")
+            maybe_barrier()
 
     ml_ds = MLMuDataset(bundle, seq_len=seq_len, chunk_len=chunk_len)
     ml_train_ds, ml_val_ds, ml_split_info = contiguous_time_split(ml_ds, val_fraction=val_fraction)
@@ -403,7 +431,10 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     ).to(device)
     mean_model = maybe_wrap_ddp(mean_model, device, distributed)
 
-    stat_opt = torch.optim.Adam(unwrap_model(ide_model).parameters(), lr=cfg.get("stat_lr", 1e-4))
+    stat_opt = torch.optim.Adam(
+        [p for p in unwrap_model(ide_model).parameters() if p.requires_grad],
+        lr=cfg.get("stat_lr", 1e-4),
+    )
     adv_opt = torch.optim.Adam(unwrap_model(mean_model).parameters(), lr=cfg.get("ml_lr", 1e-3))
 
     if is_main_process():

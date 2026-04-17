@@ -88,6 +88,10 @@ def reconstruct_models(ckpt, device):
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
         init_log_damping=cfg.get("init_log_damping", 0.0),
+        q_proc_min=cfg.get("q_proc_min", math.exp(-4.0)),
+        q_proc_max=cfg.get("q_proc_max", 0.5),
+        r_obs_min=cfg.get("r_obs_min", math.exp(-4.0)),
+        r_obs_max=cfg.get("r_obs_max", 0.75),
         damping_min=cfg.get("damping_min", math.exp(-4.0)),
         damping_max=cfg.get("damping_max", 1.0),
     ).to(device)
@@ -126,6 +130,10 @@ def clone_ide_model(source_model, cfg, device):
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
         init_log_damping=cfg.get("init_log_damping", 0.0),
+        q_proc_min=cfg.get("q_proc_min", math.exp(-4.0)),
+        q_proc_max=cfg.get("q_proc_max", 0.5),
+        r_obs_min=cfg.get("r_obs_min", math.exp(-4.0)),
+        r_obs_max=cfg.get("r_obs_max", 0.75),
         damping_min=cfg.get("damping_min", math.exp(-4.0)),
         damping_max=cfg.get("damping_max", 1.0),
     ).to(device)

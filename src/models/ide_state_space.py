@@ -55,6 +55,10 @@ class IDEStateSpaceModel(nn.Module):
         init_log_r_obs=-2.0,
         init_log_p0=0.0,
         init_log_damping=0.0,
+        q_proc_min=math.exp(-4.0),
+        q_proc_max=0.5,
+        r_obs_min=math.exp(-4.0),
+        r_obs_max=0.75,
         damping_min=math.exp(-4.0),
         damping_max=1.0,
     ):
@@ -70,6 +74,10 @@ class IDEStateSpaceModel(nn.Module):
         if self.param_mode not in {"absolute", "global"}:
             raise ValueError(f"Unsupported param_mode={param_mode!r}; expected 'absolute' or 'global'.")
         self.num_knots = 1 if self.param_mode == "global" else math.ceil(self.total_steps / self.param_window)
+        self.q_proc_min = max(float(q_proc_min), 1e-6)
+        self.q_proc_max = max(float(q_proc_max), self.q_proc_min)
+        self.r_obs_min = max(float(r_obs_min), 1e-6)
+        self.r_obs_max = max(float(r_obs_max), self.r_obs_min)
         self.damping_min = max(float(damping_min), 1e-6)
         self.damping_max = max(float(damping_max), self.damping_min)
 
@@ -155,9 +163,13 @@ class IDEStateSpaceModel(nn.Module):
     def clamp_parameters_(self, log_min=-4.0, log_max=2.0):
         self.log_ell_par_knots.clamp_(log_min, log_max)
         self.log_ell_perp_knots.clamp_(log_min, log_max)
-        self.log_q_proc_knots.clamp_(log_min, log_max)
-        self.log_r_obs_knots.clamp_(log_min, log_max)
         self.log_p0_knots.clamp_(log_min, log_max)
+        q_proc_log_min = math.log(self.q_proc_min)
+        q_proc_log_max = math.log(self.q_proc_max)
+        self.log_q_proc_knots.clamp_(q_proc_log_min, q_proc_log_max)
+        r_obs_log_min = math.log(self.r_obs_min)
+        r_obs_log_max = math.log(self.r_obs_max)
+        self.log_r_obs_knots.clamp_(r_obs_log_min, r_obs_log_max)
         damping_log_min = math.log(self.damping_min)
         damping_log_max = math.log(self.damping_max)
         self.log_damping_knots.clamp_(damping_log_min, damping_log_max)
