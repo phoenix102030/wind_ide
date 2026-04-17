@@ -77,6 +77,7 @@ def local_adapt_step(ide_model, batch, dynamics_seq, lr, local_steps, noise_reg_
     z_full = batch["z_seq_full"]
     chunk_len = dynamics_seq["mu"].shape[1]
     z_aligned = z_full[:, -(chunk_len + 1):]
+    start_idx = batch["time_idx_start"] + batch["nwp_seq_full"].shape[1] - chunk_len
 
     optimizer = torch.optim.Adam(ide_model.parameters(), lr=lr)
     last_loss = None
@@ -88,11 +89,12 @@ def local_adapt_step(ide_model, batch, dynamics_seq, lr, local_steps, noise_reg_
             site_lon=batch["site_lon"],
             site_lat=batch["site_lat"],
             dynamics_seq=dynamics_seq,
+            start_idx=start_idx,
         )
         loss = nll + noise_reg_weight * ide_model.noise_regularization()
         if not torch.isfinite(loss):
             ide_model.load_state_dict(snapshot)
-            return float("nan")
+            return z_aligned, start_idx, float("nan")
         loss.backward()
         torch.nn.utils.clip_grad_norm_(ide_model.parameters(), 1.0)
         optimizer.step()
@@ -100,34 +102,28 @@ def local_adapt_step(ide_model, batch, dynamics_seq, lr, local_steps, noise_reg_
         last_loss = float(loss.detach().cpu())
         if not np.isfinite(last_loss):
             ide_model.load_state_dict(snapshot)
-            return float("nan")
-    return z_aligned, last_loss
+            return z_aligned, start_idx, float("nan")
+    return z_aligned, start_idx, last_loss
 
 
 def plot_param_trajectory(history, save_path):
-    steps = np.arange(len(history["ell_par"]))
-    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True, constrained_layout=True)
+    steps = np.arange(len(history["damping"]))
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True, constrained_layout=True)
 
-    axes[0].plot(steps, history["ell_par"], label="ell_par")
-    axes[0].plot(steps, history["ell_perp"], label="ell_perp")
     axes[0].plot(steps, history["damping"], label="damping")
+    axes[0].plot(steps, history["q_proc"], label="q_proc")
+    axes[0].plot(steps, history["r_obs"], label="r_obs")
     axes[0].legend()
-    axes[0].set_ylabel("Kernel Params")
+    axes[0].set_ylabel("IDE Params")
     axes[0].grid(alpha=0.2)
 
-    axes[1].plot(steps, history["q_proc"], label="q_proc")
-    axes[1].plot(steps, history["r_obs"], label="r_obs")
+    axes[1].plot(steps, history["mu_norm"], label="mu_norm")
+    axes[1].plot(steps, history["sigma_mean"], label="sigma_mean")
+    axes[1].plot(steps, history["loss"], label="local_loss")
     axes[1].legend()
-    axes[1].set_ylabel("Noise Params")
+    axes[1].set_ylabel("Advection / Loss")
+    axes[1].set_xlabel("Online Window Index")
     axes[1].grid(alpha=0.2)
-
-    axes[2].plot(steps, history["mu_norm"], label="mu_norm")
-    axes[2].plot(steps, history["sigma_mean"], label="sigma_mean")
-    axes[2].plot(steps, history["loss"], label="local_loss")
-    axes[2].legend()
-    axes[2].set_ylabel("Advection / Loss")
-    axes[2].set_xlabel("Online Window Index")
-    axes[2].grid(alpha=0.2)
 
     plt.savefig(save_path, dpi=200)
     plt.close(fig)
@@ -142,8 +138,8 @@ def main():
 
     ide_model = IDEStateSpaceModel(
         dt=cfg.get("dt", 1.0),
-        init_log_ell_par=cfg.get("init_log_ell_par", 0.5),
-        init_log_ell_perp=cfg.get("init_log_ell_perp", 0.0),
+        total_steps=cfg.get("ide_total_steps", 1),
+        param_window=cfg.get("ide_param_window", 4),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
@@ -185,8 +181,6 @@ def main():
     truth_list = []
     pred_list = []
     history = {
-        "ell_par": [],
-        "ell_perp": [],
         "damping": [],
         "q_proc": [],
         "r_obs": [],
@@ -203,7 +197,7 @@ def main():
         with torch.no_grad():
             dynamics_seq = build_dynamics_sequence(mean_model, batch["nwp_seq_full"], seq_len=cfg.get("seq_len", 4))
 
-        z_aligned, last_loss = local_adapt_step(
+        z_aligned, aligned_start_idx, last_loss = local_adapt_step(
             ide_model=ide_model,
             batch=batch,
             dynamics_seq=dynamics_seq,
@@ -218,6 +212,7 @@ def main():
                 site_lon=batch["site_lon"],
                 site_lat=batch["site_lat"],
                 dynamics_seq=dynamics_seq,
+                start_idx=aligned_start_idx,
             )
 
         truth = to_numpy(z_aligned[:, -1]).reshape(1, 3, 2)
@@ -227,8 +222,6 @@ def main():
 
         mu_norm = float(dynamics_seq["mu"].norm(dim=-1).mean().detach().cpu())
         sigma_mean = float(dynamics_seq["sigma"].diagonal(dim1=-2, dim2=-1).mean().detach().cpu())
-        history["ell_par"].append(float(ide_model.ell_par.detach().cpu()))
-        history["ell_perp"].append(float(ide_model.ell_perp.detach().cpu()))
         history["damping"].append(float(ide_model.damping.detach().cpu()))
         history["q_proc"].append(float(ide_model.q_proc.detach().cpu()))
         history["r_obs"].append(float(ide_model.r_obs.detach().cpu()))
@@ -240,8 +233,6 @@ def main():
             print(
                 f"[ONLINE-ROLL][window {window_idx}] "
                 f"loss={last_loss:.6f} "
-                f"ell_par={history['ell_par'][-1]:.4f} "
-                f"ell_perp={history['ell_perp'][-1]:.4f} "
                 f"damping={history['damping'][-1]:.4f} "
                 f"q_proc={history['q_proc'][-1]:.4f} "
                 f"r_obs={history['r_obs'][-1]:.4f} "

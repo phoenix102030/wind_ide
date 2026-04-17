@@ -157,8 +157,8 @@ def reconstruct_models(ckpt, device):
     cfg = ckpt["config"]
     ide_model = IDEStateSpaceModel(
         dt=cfg.get("dt", 1.0),
-        init_log_ell_par=cfg.get("init_log_ell_par", 0.5),
-        init_log_ell_perp=cfg.get("init_log_ell_perp", 0.0),
+        total_steps=cfg.get("ide_total_steps", 1),
+        param_window=cfg.get("ide_param_window", 4),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
@@ -221,6 +221,7 @@ def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_gri
 
         chunk_len = nwp_full.shape[1] - seq_len + 1
         z_aligned = z_full[:, -(chunk_len + 1):]
+        start_idx = batch["time_idx_start"] + seq_len - 1
         y_true = z_aligned[:, 1:]
 
         static_pred = ide_model.predict_sequence(
@@ -228,6 +229,7 @@ def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_gri
             site_lon=batch["site_lon"],
             site_lat=batch["site_lat"],
             dynamics_seq=None,
+            start_idx=start_idx,
         )
         nll_stats["static_ide"].append(
             float(
@@ -236,6 +238,7 @@ def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_gri
                     site_lon=batch["site_lon"],
                     site_lat=batch["site_lat"],
                     dynamics_seq=None,
+                    start_idx=start_idx,
                 ).cpu()
             )
         )
@@ -260,6 +263,7 @@ def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_gri
                 site_lon=batch["site_lon"],
                 site_lat=batch["site_lat"],
                 dynamics_seq=dynamics_seq,
+                start_idx=start_idx,
             )
             nll_stats["joint_dstm"].append(
                 float(
@@ -268,6 +272,7 @@ def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_gri
                         site_lon=batch["site_lon"],
                         site_lat=batch["site_lat"],
                         dynamics_seq=dynamics_seq,
+                        start_idx=start_idx,
                     ).cpu()
                 )
             )

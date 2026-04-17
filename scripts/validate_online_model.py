@@ -78,8 +78,8 @@ def reconstruct_models(ckpt, device):
     cfg = ckpt["config"]
     ide_model = IDEStateSpaceModel(
         dt=cfg.get("dt", 1.0),
-        init_log_ell_par=cfg.get("init_log_ell_par", 0.5),
-        init_log_ell_perp=cfg.get("init_log_ell_perp", 0.0),
+        total_steps=cfg.get("ide_total_steps", 1),
+        param_window=cfg.get("ide_param_window", 4),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
@@ -111,8 +111,8 @@ def reconstruct_models(ckpt, device):
 def clone_ide_model(source_model, cfg, device):
     model = IDEStateSpaceModel(
         dt=cfg.get("dt", 1.0),
-        init_log_ell_par=cfg.get("init_log_ell_par", 0.5),
-        init_log_ell_perp=cfg.get("init_log_ell_perp", 0.0),
+        total_steps=cfg.get("ide_total_steps", 1),
+        param_window=cfg.get("ide_param_window", 4),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
@@ -122,7 +122,7 @@ def clone_ide_model(source_model, cfg, device):
     return model
 
 
-def local_adapt(ide_model, z_hist, site_lon, site_lat, dynamics_adapt, lr, local_steps, noise_reg_weight):
+def local_adapt(ide_model, z_hist, site_lon, site_lat, dynamics_adapt, start_idx, lr, local_steps, noise_reg_weight):
     opt = torch.optim.Adam(ide_model.parameters(), lr=lr)
     last_loss = None
     snapshot = {k: v.detach().cpu().clone() for k, v in ide_model.state_dict().items()}
@@ -133,6 +133,7 @@ def local_adapt(ide_model, z_hist, site_lon, site_lat, dynamics_adapt, lr, local
             site_lon=site_lon,
             site_lat=site_lat,
             dynamics_seq=dynamics_adapt,
+            start_idx=start_idx,
         )
         loss = nll + noise_reg_weight * ide_model.noise_regularization()
         if not torch.isfinite(loss):
@@ -169,25 +170,20 @@ def plot_rmse(results, save_path):
 
 def plot_online_param_path(history, save_path):
     steps = np.arange(len(history["loss"]))
-    fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True, constrained_layout=True)
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True, constrained_layout=True)
 
-    axes[0].plot(steps, history["ell_par"], label="ell_par")
-    axes[0].plot(steps, history["ell_perp"], label="ell_perp")
     axes[0].plot(steps, history["damping"], label="damping")
+    axes[0].plot(steps, history["q_proc"], label="q_proc")
+    axes[0].plot(steps, history["r_obs"], label="r_obs")
     axes[0].legend()
     axes[0].grid(alpha=0.2)
 
-    axes[1].plot(steps, history["q_proc"], label="q_proc")
-    axes[1].plot(steps, history["r_obs"], label="r_obs")
+    axes[1].plot(steps, history["loss"], label="local_loss")
+    axes[1].plot(steps, history["mu_norm"], label="mu_norm")
+    axes[1].plot(steps, history["sigma_mean"], label="sigma_mean")
     axes[1].legend()
     axes[1].grid(alpha=0.2)
-
-    axes[2].plot(steps, history["loss"], label="local_loss")
-    axes[2].plot(steps, history["mu_norm"], label="mu_norm")
-    axes[2].plot(steps, history["sigma_mean"], label="sigma_mean")
-    axes[2].legend()
-    axes[2].grid(alpha=0.2)
-    axes[2].set_xlabel("Rolling Window Index")
+    axes[1].set_xlabel("Rolling Window Index")
 
     plt.savefig(save_path, dpi=200)
     plt.close(fig)
@@ -259,8 +255,6 @@ def main():
     }
     truths = []
     history = {
-        "ell_par": [],
-        "ell_perp": [],
         "damping": [],
         "q_proc": [],
         "r_obs": [],
@@ -285,12 +279,15 @@ def main():
                 "sigma": dynamics_full["sigma"][:, :-1],
             }
 
+        hist_start_idx = torch.tensor([start + seq_len - 1], device=device)
+
         last_loss = local_adapt(
             ide_model=online_model,
             z_hist=z_hist,
             site_lon=site_lon,
             site_lat=site_lat,
             dynamics_adapt=dynamics_adapt,
+            start_idx=hist_start_idx,
             lr=lr,
             local_steps=args.local_steps,
             noise_reg_weight=noise_reg_weight,
@@ -302,12 +299,14 @@ def main():
                 site_lon=site_lon,
                 site_lat=site_lat,
                 dynamics_seq=dynamics_full,
+                start_idx=hist_start_idx,
             )
             pred_offline = offline_model.forecast_next(
                 z_hist=z_hist,
                 site_lon=site_lon,
                 site_lat=site_lat,
                 dynamics_seq=dynamics_full,
+                start_idx=hist_start_idx,
             )
             pred_persistence = z_hist[:, -1]
 
@@ -316,8 +315,6 @@ def main():
         outputs["offline_fixed"].append(pred_offline.cpu().numpy())
         outputs["persistence"].append(pred_persistence.cpu().numpy())
 
-        history["ell_par"].append(float(online_model.ell_par.detach().cpu()))
-        history["ell_perp"].append(float(online_model.ell_perp.detach().cpu()))
         history["damping"].append(float(online_model.damping.detach().cpu()))
         history["q_proc"].append(float(online_model.q_proc.detach().cpu()))
         history["r_obs"].append(float(online_model.r_obs.detach().cpu()))
@@ -329,8 +326,6 @@ def main():
             print(
                 f"[VAL-ONLINE][window {start}] "
                 f"loss={last_loss:.6f} "
-                f"ell_par={history['ell_par'][-1]:.4f} "
-                f"ell_perp={history['ell_perp'][-1]:.4f} "
                 f"damping={history['damping'][-1]:.4f}"
             )
 

@@ -139,6 +139,26 @@ class IDEStateSpaceModel(nn.Module):
         self.log_damping_knots.clamp_(log_min, log_max)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        legacy_to_new = {
+            "log_q_proc": "log_q_proc_knots",
+            "log_r_obs": "log_r_obs_knots",
+            "log_p0": "log_p0_knots",
+            "log_damping": "log_damping_knots",
+        }
+        for legacy_key, new_key in legacy_to_new.items():
+            legacy_full = f"{prefix}{legacy_key}"
+            new_full = f"{prefix}{new_key}"
+            if legacy_full in state_dict and new_full not in state_dict:
+                legacy_value = state_dict[legacy_full]
+                expanded = legacy_value.reshape(1).repeat(self.num_knots)
+                state_dict[new_full] = expanded
+
+        legacy_init_mean = f"{prefix}init_mean"
+        new_init_mean = f"{prefix}init_mean_knots"
+        if legacy_init_mean in state_dict and new_init_mean not in state_dict:
+            legacy_value = state_dict[legacy_init_mean].reshape(1, self.state_dim)
+            state_dict[new_init_mean] = legacy_value.repeat(self.num_knots, 1)
+
         for legacy_key in (
             "log_ell_par",
             "log_ell_perp",
@@ -199,6 +219,14 @@ class IDEStateSpaceModel(nn.Module):
         sigma = dynamics_t["sigma"].to(device=device, dtype=dtype).reshape(batch_size, 4, 4)
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
         return mu, sigma
+
+    def _make_spd(self, matrix, min_eig=1e-4):
+        matrix = 0.5 * (matrix + matrix.transpose(-1, -2))
+        evals, evecs = torch.linalg.eigh(matrix)
+        evals = evals.clamp_min(min_eig)
+        spd = evecs @ torch.diag_embed(evals) @ evecs.transpose(-1, -2)
+        spd = 0.5 * (spd + spd.transpose(-1, -2))
+        return spd
 
     def _selector(self, idx, device, dtype):
         return self.row_selector[idx].to(device=device, dtype=dtype)
@@ -262,6 +290,7 @@ class IDEStateSpaceModel(nn.Module):
                 drift_cov = 0.5 * (drift_cov + drift_cov.transpose(-1, -2))
 
                 D = base_D + 2.0 * (self.dt ** 2) * drift_cov + 1e-4 * eye2
+                D = self._make_spd(D, min_eig=1e-4)
                 D_inv = torch.linalg.inv(D)
                 drift = self.dt * drift_mean[:, None, None, :]
                 diff = h - drift

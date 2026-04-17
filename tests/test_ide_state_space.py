@@ -123,6 +123,28 @@ def test_legacy_coupling_key_is_ignored_on_load():
     assert not hasattr(model, "coupling_raw")
 
 
+def test_legacy_global_ide_params_expand_to_knots():
+    model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2)
+    state_dict = model.state_dict()
+    state_dict.pop("log_q_proc_knots")
+    state_dict.pop("log_r_obs_knots")
+    state_dict.pop("log_p0_knots")
+    state_dict.pop("log_damping_knots")
+    state_dict.pop("init_mean_knots")
+    state_dict["log_q_proc"] = torch.tensor(-1.5)
+    state_dict["log_r_obs"] = torch.tensor(-0.5)
+    state_dict["log_p0"] = torch.tensor(0.25)
+    state_dict["log_damping"] = torch.tensor(-0.75)
+    state_dict["init_mean"] = torch.arange(6, dtype=torch.float32)
+
+    model.load_state_dict(state_dict, strict=True)
+    assert torch.allclose(model.log_q_proc_knots, torch.full((4,), -1.5))
+    assert torch.allclose(model.log_r_obs_knots, torch.full((4,), -0.5))
+    assert torch.allclose(model.log_p0_knots, torch.full((4,), 0.25))
+    assert torch.allclose(model.log_damping_knots, torch.full((4,), -0.75))
+    assert torch.allclose(model.init_mean_knots[0], torch.arange(6, dtype=torch.float32))
+
+
 def test_legacy_length_scale_keys_are_ignored_on_load():
     model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2)
     state_dict = model.state_dict()
