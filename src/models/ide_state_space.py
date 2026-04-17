@@ -297,9 +297,11 @@ class IDEStateSpaceModel(nn.Module):
         raise ValueError(f"Expected z_seq to have 3 or 4 dims, got {tuple(z_seq.shape)}")
 
     def _default_dynamics(self, batch_size, device, dtype):
+        eye2 = torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
         return {
             "mu": torch.zeros(batch_size, 2, device=device, dtype=dtype),
             "sigma": torch.zeros(batch_size, 2, 2, device=device, dtype=dtype),
+            "component_mix": eye2,
         }
 
     def _parse_dynamics(self, dynamics_t, batch_size, device, dtype):
@@ -308,7 +310,12 @@ class IDEStateSpaceModel(nn.Module):
         mu = dynamics_t["mu"].to(device=device, dtype=dtype).reshape(batch_size, 2)
         sigma = dynamics_t["sigma"].to(device=device, dtype=dtype).reshape(batch_size, 2, 2)
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
-        return mu, sigma
+        component_mix = dynamics_t.get("component_mix")
+        if component_mix is None:
+            component_mix = torch.eye(2, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
+        else:
+            component_mix = component_mix.to(device=device, dtype=dtype).reshape(batch_size, 2, 2)
+        return mu, sigma, component_mix
 
     def _make_spd(self, matrix, min_eig=1e-4):
         matrix = 0.5 * (matrix + matrix.transpose(-1, -2))
@@ -385,59 +392,43 @@ class IDEStateSpaceModel(nn.Module):
             "init_mean": self._gather_vector(self.init_mean_series, idx),
         }
 
-    def _oriented_base_covariance(self, drift_mean, ell_par, ell_perp, eye2):
-        drift_norm = drift_mean.norm(dim=-1, keepdim=True)
-        default_dir = drift_mean.new_zeros(drift_mean.shape)
-        default_dir[:, 0] = 1.0
-        parallel = torch.where(drift_norm > 1e-6, drift_mean / drift_norm.clamp_min(1e-6), default_dir)
-        perp = torch.stack([-parallel[:, 1], parallel[:, 0]], dim=-1)
-        basis = torch.stack([parallel, perp], dim=-1)
-
-        base_diag = eye2.clone()
-        base_diag[:, 0, 0] = ell_par.square()
-        base_diag[:, 1, 1] = ell_perp.square()
-        base_cov = basis @ base_diag @ basis.transpose(-1, -2)
-        return 0.5 * (base_cov + base_cov.transpose(-1, -2))
-
-    def build_component_kernels(self, site_lon, site_lat, dynamics_t, device, dtype, transition_idx=None):
+    def build_site_kernel(self, site_lon, site_lat, dynamics_t, device, dtype):
         batch_size = site_lon.shape[0] if site_lon.ndim > 1 else dynamics_t["mu"].shape[0]
         site_lon, site_lat = self._expand_sites(site_lon, site_lat, batch_size)
         coords = project_lon_lat(site_lon, site_lat)
         h = coords[:, :, None, :] - coords[:, None, :, :]
 
-        mu_t, sigma_t = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
+        mu_t, sigma_t, _ = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
         eye2 = torch.eye(2, device=device, dtype=dtype).unsqueeze(0)
-        if transition_idx is None:
-            ell_par_t = self.ell_par.to(device=device, dtype=dtype).expand(batch_size)
-            ell_perp_t = self.ell_perp.to(device=device, dtype=dtype).expand(batch_size)
-        else:
-            transition_idx = transition_idx.to(device=device, dtype=torch.long).reshape(batch_size)
-            time_params = self._get_time_params(transition_idx[:, None])
-            ell_par_t = time_params["ell_par"][:, 0].to(dtype=dtype)
-            ell_perp_t = time_params["ell_perp"][:, 0].to(dtype=dtype)
-
-        base_cov = self._oriented_base_covariance(
-            drift_mean=mu_t,
-            ell_par=ell_par_t,
-            ell_perp=ell_perp_t,
-            eye2=eye2.expand(batch_size, -1, -1),
-        )
         diffusion_t = self._make_spd(sigma_t + 1e-4 * eye2, min_eig=1e-4)
-        D = self._make_spd(base_cov + 2.0 * (self.dt ** 2) * diffusion_t + 1e-4 * eye2, min_eig=1e-4)
+        D = self._make_spd(
+            eye2.expand(batch_size, -1, -1) + 2.0 * (self.dt ** 2) * diffusion_t + 1e-4 * eye2,
+            min_eig=1e-4,
+        )
         D_inv, logdet = self._inv_and_logdet_2x2(D, min_det=1e-8)
         drift = self.dt * mu_t[:, None, None, :]
         diff = h - drift
 
         q = torch.einsum("bijd,bdf,bijf->bij", diff, D_inv, diff)
         transport_kernel = torch.exp(-0.5 * (q + logdet[:, None, None]))
-        transport_kernel = transport_kernel / transport_kernel.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        zero_kernel = torch.zeros_like(transport_kernel)
+        return transport_kernel / transport_kernel.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
+    def build_component_kernels(self, site_lon, site_lat, dynamics_t, device, dtype, transition_idx=None):
+        del transition_idx
+        batch_size = site_lon.shape[0] if site_lon.ndim > 1 else dynamics_t["mu"].shape[0]
+        site_kernel = self.build_site_kernel(
+            site_lon=site_lon,
+            site_lat=site_lat,
+            dynamics_t=dynamics_t,
+            device=device,
+            dtype=dtype,
+        )
+        _, _, component_mix = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
         kernels = []
         for target_idx in range(self.vec_dim):
             row_kernels = []
             for source_idx in range(self.vec_dim):
-                row_kernels.append(transport_kernel if target_idx == source_idx else zero_kernel)
+                row_kernels.append(site_kernel * component_mix[:, target_idx, source_idx][:, None, None])
             kernels.append(torch.stack(row_kernels, dim=1))
         return torch.stack(kernels, dim=1)
 
@@ -455,6 +446,8 @@ class IDEStateSpaceModel(nn.Module):
 
         # Match the [site, component] flattening used by _flatten_state().
         operator = kernels.permute(0, 3, 1, 4, 2).reshape(batch_size, self.state_dim, self.state_dim)
+        row_mass = operator.abs().sum(dim=-1, keepdim=True).clamp_min(1.0)
+        operator = operator / row_mass
         eye = torch.eye(self.state_dim, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
 
         time_params = self._get_time_params(transition_idx[:, None])
@@ -474,6 +467,8 @@ class IDEStateSpaceModel(nn.Module):
         return {
             "mu": dynamics_seq["mu"][:, t],
             "sigma": dynamics_seq["sigma"][:, t],
+            "component_mix": dynamics_seq.get("component_mix", None)[:, t]
+            if dynamics_seq.get("component_mix", None) is not None else None,
         }
 
     def _init_filter_state(self, start_idx, device, dtype):

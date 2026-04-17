@@ -87,6 +87,7 @@ def test_transition_matrix_respects_site_component_state_order():
 
     damping = model._get_time_params(torch.tensor([[0]]))["damping"][:, 0].to(dtype=site_lon.dtype)
     operator = kernels.permute(0, 3, 1, 4, 2).reshape(1, model.state_dim, model.state_dim)
+    operator = operator / operator.abs().sum(dim=-1, keepdim=True).clamp_min(1.0)
     expected = (1.0 - model.dt * damping)[:, None, None] * operator
 
     assert torch.allclose(A, expected)
@@ -148,37 +149,38 @@ def test_component_kernels_remain_finite_for_ill_conditioned_sigma():
     assert torch.allclose(kernels[:, 0, 1], torch.zeros_like(kernels[:, 0, 1]), atol=1e-6)
 
 
-def test_component_kernels_respond_to_learned_base_length_scales():
+def test_component_kernels_become_wider_when_sigma_increases():
     site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
-    dynamics_t = {
+    narrow_dynamics = {
         "mu": torch.tensor([[1.0, 0.0]], dtype=site_lon.dtype),
         "sigma": torch.zeros(1, 2, 2, dtype=site_lon.dtype),
     }
+    wide_dynamics = {
+        "mu": torch.tensor([[1.0, 0.0]], dtype=site_lon.dtype),
+        "sigma": torch.tensor(
+            [
+                [0.8, 0.0],
+                [0.0, 0.8],
+            ],
+            dtype=site_lon.dtype,
+        ).unsqueeze(0),
+    }
 
-    narrow = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
-    wide = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
-    with torch.no_grad():
-        narrow.log_ell_par_knots.fill_(-1.5)
-        narrow.log_ell_perp_knots.fill_(-1.5)
-        wide.log_ell_par_knots.fill_(1.0)
-        wide.log_ell_perp_knots.fill_(1.0)
-
-    narrow_kernels = narrow.build_component_kernels(
+    model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
+    narrow_kernels = model.build_component_kernels(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t=dynamics_t,
+        dynamics_t=narrow_dynamics,
         device=site_lon.device,
         dtype=site_lon.dtype,
-        transition_idx=torch.tensor([0]),
     )
-    wide_kernels = wide.build_component_kernels(
+    wide_kernels = model.build_component_kernels(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t=dynamics_t,
+        dynamics_t=wide_dynamics,
         device=site_lon.device,
         dtype=site_lon.dtype,
-        transition_idx=torch.tensor([0]),
     )
 
     assert wide_kernels[:, 0, 0].amax() < narrow_kernels[:, 0, 0].amax()
@@ -193,10 +195,13 @@ def test_advection_mean_net_outputs_matrix_mean_and_spd_covariance():
     assert out["mu_coeff_matrix"].shape == (2, 2, 2)
     assert out["sigma"].shape == (2, 2, 2)
     assert out["chol_factor"].shape == (2, 2, 2)
+    assert out["component_mix"].shape == (2, 2, 2)
 
     sigma = out["sigma"]
+    component_mix = out["component_mix"]
     assert torch.allclose(sigma, sigma.transpose(-1, -2), atol=1e-6)
     assert torch.all(torch.linalg.eigvalsh(sigma) > 0)
+    assert torch.allclose(component_mix, torch.eye(2).reshape(1, 2, 2).expand_as(component_mix), atol=1e-6)
 
 
 def test_advection_mean_net_free_mode_outputs_direct_velocity():
@@ -210,6 +215,7 @@ def test_advection_mean_net_free_mode_outputs_direct_velocity():
     expected = model.mu_scale * torch.tanh(torch.tensor([1.0, -0.5]))
     assert torch.allclose(out["mu"], expected.reshape(1, 2).expand_as(out["mu"]))
     assert out["mu_coeff_matrix"].shape == (2, 2, 2)
+    assert torch.allclose(out["component_mix"], torch.eye(2).reshape(1, 2, 2).expand_as(out["component_mix"]), atol=1e-6)
 
 
 def test_advection_mean_net_can_anchor_mu_and_share_global_sigma():
@@ -226,6 +232,7 @@ def test_advection_mean_net_can_anchor_mu_and_share_global_sigma():
     assert torch.allclose(out["mu"], torch.zeros_like(out["mu"]), atol=1e-6)
     assert torch.allclose(out["sigma"][0], out["sigma"][1], atol=1e-6)
     assert torch.all(torch.linalg.eigvalsh(out["sigma"]) > 0)
+    assert torch.allclose(out["component_mix"], torch.eye(2).reshape(1, 2, 2).expand_as(out["component_mix"]), atol=1e-6)
     assert not any(param.requires_grad for param in model.chol_head.parameters())
     assert model.global_chol_params.requires_grad
 
@@ -239,6 +246,31 @@ def test_advection_mean_net_all12_uses_140m_uv_anchor_indices():
     out = model(x_seq)
 
     assert torch.allclose(out["wind_anchor"], torch.tensor([[3.0, -2.0]]), atol=1e-6)
+
+
+def test_component_mix_introduces_cross_component_transport():
+    model = IDEStateSpaceModel(num_sites=3, total_steps=4, param_window=1)
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+    dynamics_t = {
+        "mu": torch.zeros(1, 2, dtype=site_lon.dtype),
+        "sigma": torch.zeros(1, 2, 2, dtype=site_lon.dtype),
+        "component_mix": torch.tensor(
+            [[[1.0, 0.25], [-0.10, 1.0]]],
+            dtype=site_lon.dtype,
+        ),
+    }
+
+    kernels = model.build_component_kernels(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t=dynamics_t,
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+    )
+
+    assert torch.any(kernels[:, 0, 1].abs() > 0)
+    assert torch.any(kernels[:, 1, 0].abs() > 0)
 
 
 def test_forecast_multistep_runs_with_dynamic_advection_only():

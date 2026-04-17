@@ -67,86 +67,86 @@ R = r_{\mathrm{obs}}^2 \Id_6.
 \end{equation}
 Thus, the observation equation is a linear Gaussian model where the observation matrix is the identity matrix.
 
-\section{Random Advection Matrix}
+\section{NWP-driven Advection Distribution}
 
 \subsection{Definition of Random Advection}
-Instead of treating advection as two separate 2D vectors, we represent it as a single random $2\times 2$ matrix:
+The NWP encoder consumes the recent $L$ frames of gridded NWP inputs
 \begin{equation}
-M_t \in \R^{2\times 2}.
+X_{t-L+1:t} \in \R^{L \times C \times Y \times X},
 \end{equation}
-Let $\vect(M_t) \in \R^4$ be the flattened vector. The model assumes:
+applies a frame-wise CNN, and then aggregates the temporal embeddings with a Transformer encoder.
+
+Instead of outputting a free transition matrix directly, the network outputs the parameters of a physical advection distribution:
 \begin{equation}
-\vect(M_t) \sim \Normal(\mu_t, \Sigma_t),
+\mathcal{V}_t \sim \Normal(\mu_t, \Sigma_t),
 \qquad
-\mu_t \in \R^4,\ \Sigma_t \in \R^{4\times 4}.
+\mu_t \in \R^2,\ \Sigma_t \in \R^{2\times 2}.
 \end{equation}
 
 \subsection{Network Output Parameterization}
-The advection network extracts features from an NWP time window of length $L$ and outputs two sets of parameters:
+The advection network outputs three objects:
 \begin{enumerate}[label=\arabic*.]
-  \item \textbf{Mean parameters} $\mu_t$: 4 values;
-  \item \textbf{Cholesky parameters} for covariance: 10 values.
+  \item \textbf{Mean advection} $\mu_t \in \R^2$;
+  \item \textbf{Diffusion covariance} $\Sigma_t \in \R^{2\times 2}$;
+  \item \textbf{Component mixing matrix} $C_t \in \R^{2\times 2}$.
 \end{enumerate}
-Specifically, the network outputs:
+
+The covariance matrix is constructed through a Cholesky factor:
 \begin{equation}
-o_t = (\mu_1, \dots, \mu_4, a_1, \dots, a_4, b_{21}, b_{31}, b_{32}, b_{41}, b_{42}, b_{43}).
-\end{equation}
-The lower triangular matrix is constructed as:
-\begin{equation}
-d_i = \mathrm{softplus}(a_i) + \varepsilon,
-\quad
 L_t=
 \begin{pmatrix}
-d_1 & 0 & 0 & 0\\
-b_{21} & d_2 & 0 & 0\\
-b_{31} & b_{32} & d_3 & 0\\
-b_{41} & b_{42} & b_{43} & d_4
+\mathrm{softplus}(a_1)+\varepsilon & 0\\
+b_{21} & \mathrm{softplus}(a_2)+\varepsilon
 \end{pmatrix},
-\quad
+\qquad
 \Sigma_t = L_t L_t^\top.
 \end{equation}
 
-\section{Spatial Propagation Kernel}
+The matrix $C_t$ is not used to define spatial diffusion. Instead, it governs how the transported $(u,v)$ components interact after spatial propagation.
 
-\subsection{Propagation Shape derived from $\Sigma_t$}
-The previous trainable length-scale parameters $\text{diag}(\ell_\parallel^2, \ell_\perp^2)$ have been removed. The propagation shape is now governed solely by the advection covariance $\Sigma_t$. For each block $(i, j)$ corresponding to target/source components:
-\begin{equation}
-m_{ij}(t) = d_{ij}\mu_t \in \R^2, \quad S_{ij}(t) = d_{ij}\Sigma_t d_{ij}^\top \in \R^{2\times 2},
-\end{equation}
-\begin{equation}
-D_{ij}(t) = \Id_2 + 2\Delta t^2 S_{ij}(t) + \epsilon \Id_2.
-\end{equation}
-Here, $\Id_2$ is the fixed identity basis, $2\Delta t^2 S_{ij}(t)$ represents uncertainty propagation, and $\epsilon \Id_2$ is for numerical stability.
+\section{Spatial Transport Kernel}
+\subsection{Theorem-inspired spatial propagation}
 
-\subsection{Gaussian Propagation Kernel}
-For each block $(i, j)$, define the modified displacement:
+The physical transport part is defined only on the station locations. Let $h_{ij} \in \R^2$ be the displacement from site $s_j$ to site $s_i$. Following the corrected Lagrangian form in Theorem 2', we use a Gaussian kernel whose center is shifted by the advection mean and whose shape is controlled solely by $\Sigma_t$:
 \begin{equation}
-h'_{ij}(h,t) = h - \Delta t\, m_{ij}(t),
+K_t(i,j)
+\propto
+\exp\left(
+-\frac{1}{2}
+\left[
+(h_{ij}-\Delta t\,\mu_t)^\top D_t^{-1}(h_{ij}-\Delta t\,\mu_t)
++ \log |D_t|
+\right]
+\right),
 \end{equation}
-The Gaussian kernel is defined as:
 \begin{equation}
-K_{ij}(h,t) \propto |D_{ij}(t)|^{-1/2} \exp\left( -\frac{1}{2} h'_{ij}(h,t)^\top D_{ij}(t)^{-1} h'_{ij}(h,t) \right).
+D_t = \Id_2 + 2\Delta t^2 \Sigma_t + \epsilon \Id_2.
 \end{equation}
-
 
 \section{State Transition Equation}
 
-The full spatial propagation operator $G_t$ is constructed by assembling the block kernels:
+To avoid assigning an artificial ``distance'' between a $u$ component and a $v$ component, the full transition is factorized into
+\begin{enumerate}[label=\arabic*.]
+  \item a \textbf{site-to-site transport kernel} $K_t(i,j)$ defined in physical space, and
+  \item a \textbf{component mixing matrix} $C_t$ defined in variable space.
+\end{enumerate}
+
+Each block from source site $s_j$ to target site $s_i$ is
 \begin{equation}
-G_t =
-\begin{bmatrix}
-K_{11}(t) & K_{12}(t)\\
-K_{21}(t) & K_{22}(t)
-\end{bmatrix}.
+A_t^{(i,j)} = K_t(i,j)\, C_t \in \R^{2\times 2}.
 \end{equation}
-There is no separate static coupling matrix $B$ in the current implementation. The state transition is:
+Thus, cross-component effects such as $u \leftarrow v$ and $v \leftarrow u$ are modeled by $C_t$, while spatial transport remains tied to the physical station geometry.
+
+The state transition is
 \begin{equation}
 Y_{t+1} = A_t Y_t + \eta_t, \quad \eta_t \sim \Normal(0, Q_t),
 \end{equation}
 \begin{equation}
-A_t = \Id_6 + \Delta t (G_t - \lambda(t) \Id_6), \quad Q_t = q_{\mathrm{proc}}(t)^2 \Id_6.
+A_t = \rho_t \, \widetilde{A}_t, \qquad \rho_t = 1 - \Delta t\, \lambda(t),
+\qquad
+Q_t = q_{\mathrm{proc}}(t)^2 \Id_6,
 \end{equation}
-where $\lambda(t)$ is the time-varying damping parameter.
+where $\widetilde{A}_t$ is the block matrix assembled from $\{A_t^{(i,j)}\}$ and $\lambda(t)$ is a time-varying damping parameter.
 
 \section{Time-varying IDE Parameters}
 

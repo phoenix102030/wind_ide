@@ -51,8 +51,10 @@ class AdvectionMeanNet(nn.Module):
     The network predicts
         v_t in R^2
         H_t in SPD(2)
+        C_t in R^(2x2)
 
     where v_t is a physical advection velocity and H_t is a diffusion tensor.
+    C_t mixes the transported (u, v) components after spatial propagation.
     """
 
     def __init__(
@@ -68,6 +70,7 @@ class AdvectionMeanNet(nn.Module):
         chol_offdiag_scale=0.15,
         chol_diag_max=1.5,
         chol_eps=1e-4,
+        mix_scale=0.35,
         mu_mode="free",
         sigma_mode="network",
         init_global_sigma_diag=0.2,
@@ -79,6 +82,7 @@ class AdvectionMeanNet(nn.Module):
         self.chol_offdiag_scale = chol_offdiag_scale
         self.chol_diag_max = chol_diag_max
         self.chol_eps = chol_eps
+        self.mix_scale = float(mix_scale)
         self.mu_mode = str(mu_mode).lower()
         self.sigma_mode = str(sigma_mode).lower()
         if self.mu_mode not in {"free", "anchored"}:
@@ -101,10 +105,13 @@ class AdvectionMeanNet(nn.Module):
         )
         self.mu_head = nn.Linear(embed_dim, 4)
         self.chol_head = nn.Linear(embed_dim, 3)
+        self.mix_head = nn.Linear(embed_dim, 4)
         init_diag_raw = inverse_softplus(max(float(init_global_sigma_diag) - self.chol_eps, 1e-4))
         global_chol_init = torch.zeros(3)
         global_chol_init[:2] = init_diag_raw
         self.global_chol_params = nn.Parameter(global_chol_init)
+        nn.init.zeros_(self.mix_head.weight)
+        nn.init.zeros_(self.mix_head.bias)
         self._configure_parameter_usage()
 
     def _configure_parameter_usage(self):
@@ -129,6 +136,10 @@ class AdvectionMeanNet(nn.Module):
                 state_dict[global_key] = legacy_value.index_select(0, torch.tensor([0, 1, 4], device=legacy_value.device))
         if global_key not in state_dict:
             state_dict[global_key] = self.global_chol_params.detach().clone()
+        for key, param in (("weight", self.mix_head.weight), ("bias", self.mix_head.bias)):
+            full_key = f"{prefix}mix_head.{key}"
+            if full_key not in state_dict:
+                state_dict[full_key] = param.detach().clone()
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -165,6 +176,12 @@ class AdvectionMeanNet(nn.Module):
         wind_uv = latest_frame[:, [u_idx, v_idx]]
         return wind_uv.mean(dim=(-1, -2))
 
+    def _build_component_mix(self, raw_mix):
+        batch_size = raw_mix.shape[0]
+        mix = raw_mix.reshape(batch_size, 2, 2)
+        eye = torch.eye(2, device=raw_mix.device, dtype=raw_mix.dtype).unsqueeze(0)
+        return eye + self.mix_scale * torch.tanh(mix)
+
     def forward(self, x_seq):
         # x_seq: [B, L, C, Y, X]
         batch_size, seq_len, channels, height, width = x_seq.shape
@@ -192,10 +209,12 @@ class AdvectionMeanNet(nn.Module):
         else:
             chol_factor = self._build_cholesky(self.chol_head(h))
         diffusion = chol_factor @ chol_factor.transpose(-1, -2)
+        component_mix = self._build_component_mix(self.mix_head(h))
         return {
             "mu": velocity,
             "mu_coeff_matrix": mu_coeff_matrix,
             "wind_anchor": base_anchor,
             "sigma": diffusion,
             "chol_factor": chol_factor,
+            "component_mix": component_mix,
         }

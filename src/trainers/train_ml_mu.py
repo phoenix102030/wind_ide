@@ -26,8 +26,9 @@ def build_dynamics_sequence(mean_model, nwp_seq_full, seq_len, start_at=None):
     """
     nwp_seq_full: [B, seq_len+chunk_len-1, 6, Y, X]
     returns:
-        mu:    [B, chunk_len, 2]
-        sigma: [B, chunk_len, 2, 2]
+        mu:            [B, chunk_len, 2]
+        sigma:         [B, chunk_len, 2, 2]
+        component_mix: [B, chunk_len, 2, 2]
     """
     if start_at is None:
         start_at = seq_len - 1
@@ -40,19 +41,22 @@ def build_dynamics_sequence(mean_model, nwp_seq_full, seq_len, start_at=None):
     return {
         "mu": torch.stack([out["mu"] for out in outputs], dim=1),
         "sigma": torch.stack([out["sigma"] for out in outputs], dim=1),
+        "component_mix": torch.stack([out["component_mix"] for out in outputs], dim=1),
     }
 
 
 def zero_dynamics_sequence(batch_size, chunk_len, device, dtype):
+    eye2 = torch.eye(2, device=device, dtype=dtype).reshape(1, 1, 2, 2).expand(batch_size, chunk_len, -1, -1)
     return {
         "mu": torch.zeros(batch_size, chunk_len, 2, device=device, dtype=dtype),
         "sigma": torch.zeros(batch_size, chunk_len, 2, 2, device=device, dtype=dtype),
+        "component_mix": eye2,
     }
 
 
 def dynamics_smoothness_penalty(dynamics_seq):
     penalty = 0.0
-    for name in ("mu", "sigma"):
+    for name in ("mu", "sigma", "component_mix"):
         tensor = dynamics_seq[name]
         if tensor.shape[1] <= 1:
             continue
@@ -84,6 +88,17 @@ def mu_norm_summary(dynamics_seq):
 def mu_abs_summary(dynamics_seq):
     mu = dynamics_seq["mu"]
     return float(mu.abs().mean().detach().cpu())
+
+
+def mix_offdiag_summary(dynamics_seq):
+    mix = dynamics_seq["component_mix"]
+    offdiag = mix[..., 0, 1].abs() + mix[..., 1, 0].abs()
+    return float((0.5 * offdiag).mean().detach().cpu())
+
+
+def mix_diag_summary(dynamics_seq):
+    mix = dynamics_seq["component_mix"]
+    return float(mix.diagonal(dim1=-2, dim2=-1).mean().detach().cpu())
 
 
 def _aligned_inputs(batch, seq_len, mean_model=None):
@@ -145,6 +160,8 @@ def _advection_loss(ide_model, z_seq, site_lon, site_lat, dynamics_seq, start_id
         "sigma_diag_min": sigma_diag_min_summary(dynamics_seq),
         "mu_norm": mu_norm_summary(dynamics_seq),
         "mu_abs_mean": mu_abs_summary(dynamics_seq),
+        "mix_diag_mean": mix_diag_summary(dynamics_seq),
+        "mix_offdiag_mean": mix_offdiag_summary(dynamics_seq),
     }
 
 
@@ -267,6 +284,8 @@ def train_advection_one_epoch(
         "sigma_diag_min": [],
         "mu_norm": [],
         "mu_abs_mean": [],
+        "mix_diag_mean": [],
+        "mix_offdiag_mean": [],
     }
 
     for step, batch in enumerate(loader):
@@ -320,6 +339,8 @@ def eval_advection(
         "sigma_diag_min": [],
         "mu_norm": [],
         "mu_abs_mean": [],
+        "mix_diag_mean": [],
+        "mix_offdiag_mean": [],
     }
 
     for step, batch in enumerate(loader):

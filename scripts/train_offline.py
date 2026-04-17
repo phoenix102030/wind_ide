@@ -279,6 +279,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"normalize_nwp={cfg['normalize_nwp']}")
         print(f"mu_mode={cfg['mu_mode']}")
         print(f"sigma_mode={cfg['sigma_mode']}")
+        print(f"mix_scale={cfg.get('mix_scale', 0.35)}")
         print(f"nwp_input_mode={cfg['nwp_input_mode']}")
         if cfg["nwp_input_mode"] != "all12":
             print(
@@ -484,6 +485,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         chol_offdiag_scale=cfg.get("chol_offdiag_scale", 0.15),
         chol_diag_max=cfg.get("chol_diag_max", 1.5),
         chol_eps=cfg.get("chol_eps", 1e-4),
+        mix_scale=cfg.get("mix_scale", 0.35),
         mu_mode=cfg.get("mu_mode", "free"),
         sigma_mode=cfg.get("sigma_mode", "network"),
         init_global_sigma_diag=cfg.get("init_global_sigma_diag", 0.2),
