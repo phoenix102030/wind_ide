@@ -33,9 +33,9 @@ class IDEStateSpaceModel(nn.Module):
     State Y_t is stored as [u(s1), v(s1), ..., u(sS), v(sS)].
 
     The ML model supplies time-varying advection parameters
-        vec(M_t) ~ N_4(mu_t, Sigma_t)
+        V_t ~ N_2(mu_t, Sigma_t)
 
-    and Sigma_t enters the propagation shape directly through D_ij.
+    and Sigma_t enters the theorem-inspired transport kernel directly.
 
     The IDE parameters are also time-varying, but are learned directly as
     piecewise-constant sequences over absolute time rather than being driven by
@@ -83,11 +83,16 @@ class IDEStateSpaceModel(nn.Module):
 
         self.log_ell_par_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_ell_par)))
         self.log_ell_perp_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_ell_perp)))
+        # Legacy compatibility only: the transport kernel no longer uses these
+        # length-scale parameters after the theorem-inspired refactor.
+        self.log_ell_par_knots.requires_grad_(False)
+        self.log_ell_perp_knots.requires_grad_(False)
         self.log_q_proc_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_q_proc)))
         self.log_r_obs_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_r_obs)))
         self.log_p0_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_p0)))
         self.log_damping_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_damping)))
         self.init_mean_knots = nn.Parameter(torch.zeros(self.num_knots, self.state_dim))
+        self.clamp_parameters_()
 
     @property
     def ell_par(self):
@@ -271,6 +276,7 @@ class IDEStateSpaceModel(nn.Module):
             unexpected_keys,
             error_msgs,
         )
+        self.clamp_parameters_()
 
     def _expand_sites(self, site_lon, site_lat, batch_size):
         if site_lon.ndim == 1:

@@ -123,8 +123,9 @@ def save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg):
 
 
 def configure_ide_trainability(model, train_ell_params=True):
-    model.log_ell_par_knots.requires_grad_(bool(train_ell_params))
-    model.log_ell_perp_knots.requires_grad_(bool(train_ell_params))
+    del train_ell_params
+    model.log_ell_par_knots.requires_grad_(False)
+    model.log_ell_perp_knots.requires_grad_(False)
 
 
 def dataset_sample_span(dataset):
@@ -286,6 +287,11 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                 "[warning] nwp_input_mode!=all12 means the advection net only sees wind U/V channels "
                 "instead of the full environmental NWP context."
             )
+        if cfg["train_ell_params"]:
+            print(
+                "[warning] train_ell_params is deprecated after the theorem-inspired kernel refactor; "
+                "legacy ell parameters stay frozen for checkpoint compatibility."
+            )
         if cfg["sigma_mode"] == "global":
             print(
                 "[warning] sigma_mode=global keeps diffusion variance fixed over time, so NWP cannot "
@@ -398,6 +404,13 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     if is_main_process():
         print("ide_model params:", count_parameters(unwrap_model(ide_model)))
         print("ide_model trainable params:", sum(p.numel() for p in unwrap_model(ide_model).parameters() if p.requires_grad))
+        raw_ide = unwrap_model(ide_model)
+        print(
+            "[IDE init] "
+            f"damping={float(raw_ide.damping.detach().cpu()):.4f} "
+            f"q_proc={float(raw_ide.q_proc.detach().cpu()):.4f} "
+            f"r_obs={float(raw_ide.r_obs.detach().cpu()):.4f}"
+        )
 
     warmup_epochs = int(cfg.get("ide_epochs", 20))
     skip_ide_warmup = cfg["skip_ide_warmup"] or warmup_epochs <= 0
