@@ -186,6 +186,8 @@ def test_advection_mean_net_can_anchor_mu_and_share_global_sigma():
     assert torch.allclose(out["mu_matrix"], torch.zeros_like(out["mu_matrix"]), atol=1e-6)
     assert torch.allclose(out["sigma"][0], out["sigma"][1], atol=1e-6)
     assert torch.all(torch.linalg.eigvalsh(out["sigma"]) > 0)
+    assert not any(param.requires_grad for param in model.chol_head.parameters())
+    assert model.global_chol_params.requires_grad
 
 
 def test_forecast_multistep_runs_with_dynamic_advection_only():

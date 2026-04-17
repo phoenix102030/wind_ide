@@ -97,6 +97,13 @@ class AdvectionMeanNet(nn.Module):
         global_chol_init = torch.zeros(10)
         global_chol_init[:4] = init_diag_raw
         self.global_chol_params = nn.Parameter(global_chol_init)
+        self._configure_parameter_usage()
+
+    def _configure_parameter_usage(self):
+        chol_head_trainable = self.sigma_mode == "network"
+        for param in self.chol_head.parameters():
+            param.requires_grad_(chol_head_trainable)
+        self.global_chol_params.requires_grad_(self.sigma_mode == "global")
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         global_key = f"{prefix}global_chol_params"
@@ -111,6 +118,7 @@ class AdvectionMeanNet(nn.Module):
             unexpected_keys,
             error_msgs,
         )
+        self._configure_parameter_usage()
 
     def _build_cholesky(self, chol_raw):
         batch_size = chol_raw.shape[0]
