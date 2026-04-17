@@ -13,7 +13,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.aligned_measurement_nwp import build_aligned_bundle, MLMuDataset
+from src.data.aligned_measurement_nwp import (
+    apply_bundle_normalization,
+    build_aligned_bundle,
+    denormalize_nwp_uv_pairs,
+    denormalize_z,
+    MLMuDataset,
+    normalization_stats_from_config,
+)
 from src.models.advection_mean_net import AdvectionMeanNet
 from src.models.ide_state_space import IDEStateSpaceModel
 from src.trainers.train_ml_mu import build_dynamics_sequence
@@ -201,7 +208,7 @@ def reconstruct_models(ckpt, device):
 
 
 @torch.no_grad()
-def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_grid, max_batches=None):
+def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_grid, max_batches=None, norm_stats=None):
     preds_by_name = {
         "static_ide": [],
         "persistence": [],
@@ -257,6 +264,11 @@ def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_gri
         pers_np = to_numpy(z_aligned[:, :-1].reshape(-1, 3, 2))
         nwp_np = to_numpy(extract_nwp_baseline(nwp_full, seq_len, nearest_grid).reshape(-1, 3, 2))
         truth_np = to_numpy(y_true.reshape(-1, 3, 2))
+        if norm_stats is not None:
+            static_np = denormalize_z(static_np, norm_stats)
+            pers_np = denormalize_z(pers_np, norm_stats)
+            truth_np = denormalize_z(truth_np, norm_stats)
+            nwp_np = denormalize_nwp_uv_pairs(nwp_np, norm_stats, channel_indices=[2, 3])
 
         preds_by_name["static_ide"].append(static_np)
         preds_by_name["persistence"].append(pers_np)
@@ -287,18 +299,20 @@ def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_gri
                 )
             )
             joint_np = to_numpy(joint_pred.reshape(-1, 3, 2))
+            if norm_stats is not None:
+                joint_np = denormalize_z(joint_np, norm_stats)
             preds_by_name["joint_dstm"].append(joint_np)
             flat_preds_cache["joint_dstm"].append(joint_np)
 
         if sample_plot is None:
             sample_plot = {
-                "truth": to_numpy(y_true[0]),
-                "static_ide": to_numpy(static_pred[0]),
-                "persistence": to_numpy(z_aligned[0, :-1]),
-                "nwp_current": to_numpy(extract_nwp_baseline(nwp_full[:1], seq_len, nearest_grid)[0]),
+                "truth": truth_np[: y_true.shape[1]],
+                "static_ide": static_np[: static_pred.shape[1]],
+                "persistence": pers_np[: z_aligned.shape[1] - 1],
+                "nwp_current": nwp_np[: y_true.shape[1]],
             }
             if mean_model is not None:
-                sample_plot["joint_dstm"] = to_numpy(joint_pred[0])
+                sample_plot["joint_dstm"] = joint_np[: joint_pred.shape[1]]
 
     truth = np.concatenate(truths, axis=0)
     results = {}
@@ -457,6 +471,7 @@ def main():
     ckpt = torch.load(ckpt_path, map_location="cpu")
     cfg, ide_model, mean_model = reconstruct_models(ckpt, auto_device(args.device))
     device = next(ide_model.parameters()).device
+    norm_stats = normalization_stats_from_config(cfg)
 
     set_seed(cfg.get("seed", 42))
 
@@ -470,6 +485,8 @@ def main():
     dataset_label = args.dataset_label or Path(meas_file).stem
 
     bundle = build_aligned_bundle(meas_file, nwp_file)
+    if norm_stats is not None:
+        bundle = apply_bundle_normalization(bundle, norm_stats)
     seq_len = cfg.get("seq_len", 4)
     chunk_len = cfg.get("chunk_len", 16)
     dataset = MLMuDataset(bundle, seq_len=seq_len, chunk_len=chunk_len)
@@ -484,6 +501,7 @@ def main():
         device=device,
         nearest_grid=nearest_grid,
         max_batches=args.max_batches,
+        norm_stats=norm_stats,
     )
 
     out_dir = Path(args.out_dir).expanduser().resolve()

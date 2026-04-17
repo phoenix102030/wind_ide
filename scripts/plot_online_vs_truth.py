@@ -12,7 +12,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.aligned_measurement_nwp import build_aligned_bundle
+from src.data.aligned_measurement_nwp import (
+    apply_bundle_normalization,
+    build_aligned_bundle,
+    denormalize_z,
+    normalization_stats_from_config,
+)
 from src.models.advection_mean_net import AdvectionMeanNet
 from src.models.ide_state_space import IDEStateSpaceModel
 from src.trainers.train_ml_mu import build_dynamics_sequence
@@ -171,11 +176,14 @@ def main():
     device = auto_device(args.device)
     cfg, ide_model, mean_model = reconstruct_models(ckpt, device)
     set_seed(cfg.get("seed", 42))
+    norm_stats = normalization_stats_from_config(cfg)
 
     bundle = build_aligned_bundle(
         str(Path(args.measurement_file).expanduser().resolve()),
         str(Path(args.nwp_file).expanduser().resolve()),
     )
+    if norm_stats is not None:
+        bundle = apply_bundle_normalization(bundle, norm_stats)
 
     site_lon = torch.from_numpy(bundle.meas_lon).float().unsqueeze(0).to(device)
     site_lat = torch.from_numpy(bundle.meas_lat).float().unsqueeze(0).to(device)
@@ -236,6 +244,10 @@ def main():
     y_true = np.concatenate(true_list, axis=0)
     y_model = np.concatenate(model_list, axis=0)
     y_persistence = np.concatenate(persistence_list, axis=0)
+    if norm_stats is not None:
+        y_true = denormalize_z(y_true, norm_stats)
+        y_model = denormalize_z(y_model, norm_stats)
+        y_persistence = denormalize_z(y_persistence, norm_stats)
 
     model_metrics = compute_metrics(y_true, y_model)
     persistence_metrics = compute_metrics(y_true, y_persistence)

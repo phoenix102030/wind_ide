@@ -12,7 +12,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.aligned_measurement_nwp import build_aligned_bundle
+from src.data.aligned_measurement_nwp import (
+    apply_bundle_normalization,
+    build_aligned_bundle,
+    denormalize_z,
+    normalization_stats_from_config,
+)
 from src.models.advection_mean_net import AdvectionMeanNet
 from src.models.ide_state_space import IDEStateSpaceModel
 from src.trainers.train_ml_mu import build_dynamics_sequence
@@ -244,11 +249,14 @@ def main():
     device = auto_device(args.device)
     cfg, base_ide_model, mean_model = reconstruct_models(ckpt, device)
     set_seed(cfg.get("seed", 42))
+    norm_stats = normalization_stats_from_config(cfg)
 
     bundle = build_aligned_bundle(
         str(Path(args.measurement_file).expanduser().resolve()),
         str(Path(args.nwp_file).expanduser().resolve()),
     )
+    if norm_stats is not None:
+        bundle = apply_bundle_normalization(bundle, norm_stats)
 
     seq_len = cfg.get("seq_len", 4)
     history_len = args.history_len
@@ -350,6 +358,9 @@ def main():
 
     y_true = np.concatenate(truths, axis=0)
     pred_arrays = {name: np.concatenate(preds, axis=0) for name, preds in outputs.items()}
+    if norm_stats is not None:
+        y_true = denormalize_z(y_true, norm_stats)
+        pred_arrays = {name: denormalize_z(pred, norm_stats) for name, pred in pred_arrays.items()}
     results = {name: compute_metrics(y_true, pred) for name, pred in pred_arrays.items()}
 
     out_dir = Path(args.out_dir).expanduser().resolve()

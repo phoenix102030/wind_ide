@@ -16,7 +16,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.aligned_measurement_nwp import build_aligned_bundle, IDEBaselineDataset, MLMuDataset
+from src.data.aligned_measurement_nwp import (
+    apply_bundle_normalization,
+    build_aligned_bundle,
+    fit_bundle_normalization,
+    IDEBaselineDataset,
+    MLMuDataset,
+)
 from src.models.advection_mean_net import AdvectionMeanNet
 from src.models.ide_state_space import IDEStateSpaceModel
 from src.trainers.train_ide_baseline import train_ide_baseline_one_epoch, eval_ide_baseline
@@ -242,12 +248,14 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     chunk_len = int(cfg.get("chunk_len", 16))
     val_fraction = float(cfg.get("val_fraction", 0.2))
 
-    bundle = build_aligned_bundle(meas_file, nwp_file)
+    raw_bundle = build_aligned_bundle(meas_file, nwp_file)
     cfg = dict(cfg)
-    cfg["ide_total_steps"] = int(bundle.z_meas.shape[0])
+    cfg["ide_total_steps"] = int(raw_bundle.z_meas.shape[0])
     cfg["ide_param_mode"] = str(cfg.get("ide_param_mode", "absolute")).lower()
     cfg["skip_ide_warmup"] = bool(cfg.get("skip_ide_warmup", False))
     cfg["train_ell_params"] = bool(cfg.get("train_ell_params", True))
+    cfg["normalize_z"] = bool(cfg.get("normalize_z", True))
+    cfg["normalize_nwp"] = bool(cfg.get("normalize_nwp", True))
     out_dir = Path(cfg.get("out_dir", "outputs/measurement_140m_two_stage"))
     if is_main_process():
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -261,6 +269,34 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"train_ell_params={cfg['train_ell_params']}")
         print(f"ide_param_window={cfg.get('ide_param_window', 12)}")
         print(f"chunk_len={chunk_len}")
+        print(f"normalize_z={cfg['normalize_z']}")
+        print(f"normalize_nwp={cfg['normalize_nwp']}")
+
+    raw_ide_base_ds = IDEBaselineDataset(raw_bundle, chunk_len=chunk_len)
+    _, _, raw_ide_split_info = contiguous_time_split(raw_ide_base_ds, val_fraction=val_fraction)
+    raw_ml_ds = MLMuDataset(raw_bundle, seq_len=seq_len, chunk_len=chunk_len)
+    _, _, raw_ml_split_info = contiguous_time_split(raw_ml_ds, val_fraction=val_fraction)
+
+    bundle = raw_bundle
+    if cfg["normalize_z"] or cfg["normalize_nwp"]:
+        norm_train_stop = min(raw_ide_split_info["split_time"], raw_ml_split_info["split_time"])
+        norm_stats = fit_bundle_normalization(raw_bundle, end_time=norm_train_stop)
+        cfg["normalization"] = norm_stats.to_config_dict()
+        bundle = apply_bundle_normalization(
+            raw_bundle,
+            norm_stats,
+            normalize_z_values=cfg["normalize_z"],
+            normalize_nwp_values=cfg["normalize_nwp"],
+        )
+        if is_main_process():
+            print(
+                "[normalization] "
+                f"fit_until_t={norm_train_stop} "
+                f"z_std_mean={float(norm_stats.z_std.mean()):.4f} "
+                f"nwp_std_mean={float(norm_stats.nwp_std.mean()):.4f}"
+            )
+    else:
+        cfg["normalization"] = None
 
     ide_base_ds = IDEBaselineDataset(bundle, chunk_len=chunk_len)
     ide_train_ds, ide_val_ds, ide_split_info = contiguous_time_split(ide_base_ds, val_fraction=val_fraction)

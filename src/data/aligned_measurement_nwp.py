@@ -32,6 +32,106 @@ class AlignedDataBundle:
     nwp_lon: np.ndarray     # [Y, X]
 
 
+@dataclass
+class NormalizationStats:
+    z_mean: np.ndarray      # [3, 2]
+    z_std: np.ndarray       # [3, 2]
+    nwp_mean: np.ndarray    # [6]
+    nwp_std: np.ndarray     # [6]
+
+    def to_config_dict(self):
+        return {
+            "z_mean": self.z_mean.tolist(),
+            "z_std": self.z_std.tolist(),
+            "nwp_mean": self.nwp_mean.tolist(),
+            "nwp_std": self.nwp_std.tolist(),
+        }
+
+
+def _safe_std(std, min_std=1e-6):
+    std = np.asarray(std, dtype=np.float32)
+    return np.where(np.isfinite(std) & (std >= min_std), std, 1.0).astype(np.float32)
+
+
+def fit_bundle_normalization(bundle: AlignedDataBundle, end_time=None):
+    if end_time is None:
+        end_time = bundle.z_meas.shape[0]
+    end_time = int(max(1, min(end_time, bundle.z_meas.shape[0], bundle.nwp_uv.shape[0])))
+
+    z_ref = bundle.z_meas[:end_time]
+    nwp_ref = bundle.nwp_uv[:end_time]
+    return NormalizationStats(
+        z_mean=np.nanmean(z_ref, axis=0).astype(np.float32),
+        z_std=_safe_std(np.nanstd(z_ref, axis=0)),
+        nwp_mean=np.nanmean(nwp_ref, axis=(0, 2, 3)).astype(np.float32),
+        nwp_std=_safe_std(np.nanstd(nwp_ref, axis=(0, 2, 3))),
+    )
+
+
+def normalization_stats_from_config(cfg):
+    payload = cfg.get("normalization")
+    if not payload:
+        return None
+    return NormalizationStats(
+        z_mean=np.asarray(payload["z_mean"], dtype=np.float32),
+        z_std=_safe_std(payload["z_std"]),
+        nwp_mean=np.asarray(payload["nwp_mean"], dtype=np.float32),
+        nwp_std=_safe_std(payload["nwp_std"]),
+    )
+
+
+def _as_like(array, like):
+    if torch.is_tensor(like):
+        return torch.as_tensor(array, dtype=like.dtype, device=like.device)
+    return np.asarray(array, dtype=like.dtype if hasattr(like, "dtype") else np.float32)
+
+
+def normalize_z(z, stats: NormalizationStats):
+    mean = _as_like(stats.z_mean, z)
+    std = _as_like(stats.z_std, z)
+    return (z - mean) / std
+
+
+def denormalize_z(z, stats: NormalizationStats):
+    mean = _as_like(stats.z_mean, z)
+    std = _as_like(stats.z_std, z)
+    return z * std + mean
+
+
+def normalize_nwp(nwp, stats: NormalizationStats):
+    shape = [1] * nwp.ndim
+    shape[-3] = stats.nwp_mean.shape[0]
+    mean = _as_like(stats.nwp_mean.reshape(shape), nwp)
+    std = _as_like(stats.nwp_std.reshape(shape), nwp)
+    return (nwp - mean) / std
+
+
+def denormalize_nwp(nwp, stats: NormalizationStats):
+    shape = [1] * nwp.ndim
+    shape[-3] = stats.nwp_mean.shape[0]
+    mean = _as_like(stats.nwp_mean.reshape(shape), nwp)
+    std = _as_like(stats.nwp_std.reshape(shape), nwp)
+    return nwp * std + mean
+
+
+def denormalize_nwp_uv_pairs(uv_pairs, stats: NormalizationStats, channel_indices):
+    channel_indices = list(channel_indices)
+    mean = _as_like(stats.nwp_mean[channel_indices].reshape(*([1] * (uv_pairs.ndim - 1)), len(channel_indices)), uv_pairs)
+    std = _as_like(stats.nwp_std[channel_indices].reshape(*([1] * (uv_pairs.ndim - 1)), len(channel_indices)), uv_pairs)
+    return uv_pairs * std + mean
+
+
+def apply_bundle_normalization(bundle: AlignedDataBundle, stats: NormalizationStats, normalize_z_values=True, normalize_nwp_values=True):
+    return AlignedDataBundle(
+        z_meas=(normalize_z(bundle.z_meas, stats) if normalize_z_values else bundle.z_meas).astype(np.float32),
+        meas_lat=bundle.meas_lat.copy(),
+        meas_lon=bundle.meas_lon.copy(),
+        nwp_uv=(normalize_nwp(bundle.nwp_uv, stats) if normalize_nwp_values else bundle.nwp_uv).astype(np.float32),
+        nwp_lat=bundle.nwp_lat.copy(),
+        nwp_lon=bundle.nwp_lon.copy(),
+    )
+
+
 def load_measurement_140m(meas_file):
     data = load_mat_auto(meas_file)
     ws_uv = np.asarray(data["Ws_uv"]).astype(np.float32)

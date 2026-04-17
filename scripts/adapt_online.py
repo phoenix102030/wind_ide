@@ -13,7 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.aligned_measurement_nwp import build_aligned_bundle, MLMuDataset
+from src.data.aligned_measurement_nwp import (
+    apply_bundle_normalization,
+    build_aligned_bundle,
+    denormalize_z,
+    MLMuDataset,
+    normalization_stats_from_config,
+)
 from src.models.advection_mean_net import AdvectionMeanNet
 from src.models.ide_state_space import IDEStateSpaceModel
 from src.trainers.train_ml_mu import build_dynamics_sequence
@@ -136,6 +142,7 @@ def main():
     cfg = ckpt["config"]
     set_seed(cfg.get("seed", 42))
     device = auto_device(args.device)
+    norm_stats = normalization_stats_from_config(cfg)
 
     ide_model = IDEStateSpaceModel(
         dt=cfg.get("dt", 1.0),
@@ -179,6 +186,8 @@ def main():
         str(Path(args.measurement_file).expanduser().resolve()),
         str(Path(args.nwp_file).expanduser().resolve()),
     )
+    if norm_stats is not None:
+        bundle = apply_bundle_normalization(bundle, norm_stats)
     dataset = MLMuDataset(bundle, seq_len=cfg.get("seq_len", 4), chunk_len=cfg.get("chunk_len", 16))
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
 
@@ -251,6 +260,9 @@ def main():
 
     truth = np.concatenate(truth_list, axis=0)
     pred = np.concatenate(pred_list, axis=0)
+    if norm_stats is not None:
+        truth = denormalize_z(truth, norm_stats)
+        pred = denormalize_z(pred, norm_stats)
     metrics = overall_metrics(truth, pred)
 
     payload = {

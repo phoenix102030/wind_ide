@@ -4,6 +4,8 @@ nwp_file: ~/wind_ide/data/nwp/data_grid_offline.mat
 device: cuda
 seed: 42
 dt: 1.0
+normalize_z: true
+normalize_nwp: true
 
 # seq_len:
 #   advection 网络每次看多少帧 NWP 历史来输出一个时刻的 mu_t / Sigma_t

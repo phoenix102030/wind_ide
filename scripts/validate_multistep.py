@@ -12,7 +12,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.aligned_measurement_nwp import build_aligned_bundle
+from src.data.aligned_measurement_nwp import (
+    apply_bundle_normalization,
+    build_aligned_bundle,
+    denormalize_z,
+    normalization_stats_from_config,
+)
 from src.models.advection_mean_net import AdvectionMeanNet
 from src.models.ide_state_space import IDEStateSpaceModel
 from src.trainers.train_ml_mu import build_dynamics_sequence, zero_dynamics_sequence
@@ -181,6 +186,7 @@ def main():
     device = auto_device(args.device)
     cfg, ide_model, mean_model = reconstruct_models(ckpt, device)
     set_seed(cfg.get("seed", 42))
+    norm_stats = normalization_stats_from_config(cfg)
 
     seq_len = cfg.get("seq_len", 4)
     context_len = seq_len
@@ -190,6 +196,8 @@ def main():
         str(Path(args.measurement_file).expanduser().resolve()),
         str(Path(args.nwp_file).expanduser().resolve()),
     )
+    if norm_stats is not None:
+        bundle = apply_bundle_normalization(bundle, norm_stats)
 
     total_windows = bundle.z_meas.shape[0] - (context_len + args.history_len + horizon - 1)
     if total_windows <= 0:
@@ -235,6 +243,10 @@ def main():
         )[0].cpu().numpy()
         truth = y_future_np
         persistence = np.repeat(z_hist_np[-1:], horizon, axis=0)
+        if norm_stats is not None:
+            pred = denormalize_z(pred, norm_stats)
+            truth = denormalize_z(truth, norm_stats)
+            persistence = denormalize_z(persistence, norm_stats)
 
         for h in range(horizon):
             model_truths[h].append(truth[h:h + 1])
