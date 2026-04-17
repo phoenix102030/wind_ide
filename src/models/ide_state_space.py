@@ -222,11 +222,42 @@ class IDEStateSpaceModel(nn.Module):
 
     def _make_spd(self, matrix, min_eig=1e-4):
         matrix = 0.5 * (matrix + matrix.transpose(-1, -2))
-        evals, evecs = torch.linalg.eigh(matrix)
-        evals = evals.clamp_min(min_eig)
-        spd = evecs @ torch.diag_embed(evals) @ evecs.transpose(-1, -2)
-        spd = 0.5 * (spd + spd.transpose(-1, -2))
-        return spd
+        matrix = torch.nan_to_num(matrix, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        a = matrix[..., 0, 0]
+        b = matrix[..., 0, 1]
+        c = matrix[..., 1, 1]
+
+        trace = a + c
+        disc = torch.sqrt(((a - c) * 0.5) ** 2 + b.square() + 1e-12)
+        eig1 = (trace * 0.5 - disc).clamp_min(min_eig)
+        eig2 = (trace * 0.5 + disc).clamp_min(min_eig)
+
+        theta = 0.5 * torch.atan2(2.0 * b, a - c + 1e-12)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        spd = matrix.new_empty(matrix.shape)
+        spd[..., 0, 0] = cos_t.square() * eig1 + sin_t.square() * eig2
+        spd[..., 1, 1] = sin_t.square() * eig1 + cos_t.square() * eig2
+        offdiag = cos_t * sin_t * (eig1 - eig2)
+        spd[..., 0, 1] = offdiag
+        spd[..., 1, 0] = offdiag
+        return 0.5 * (spd + spd.transpose(-1, -2))
+
+    def _inv_and_logdet_2x2(self, matrix, min_det=1e-8):
+        a = matrix[..., 0, 0]
+        b = matrix[..., 0, 1]
+        c = matrix[..., 1, 1]
+        det = (a * c - b.square()).clamp_min(min_det)
+
+        inv = matrix.new_empty(matrix.shape)
+        inv[..., 0, 0] = c / det
+        inv[..., 1, 1] = a / det
+        inv[..., 0, 1] = -b / det
+        inv[..., 1, 0] = -b / det
+        logdet = torch.log(det)
+        return inv, logdet
 
     def _selector(self, idx, device, dtype):
         return self.row_selector[idx].to(device=device, dtype=dtype)
@@ -291,12 +322,11 @@ class IDEStateSpaceModel(nn.Module):
 
                 D = base_D + 2.0 * (self.dt ** 2) * drift_cov + 1e-4 * eye2
                 D = self._make_spd(D, min_eig=1e-4)
-                D_inv = torch.linalg.inv(D)
+                D_inv, logdet = self._inv_and_logdet_2x2(D, min_det=1e-8)
                 drift = self.dt * drift_mean[:, None, None, :]
                 diff = h - drift
 
                 q = torch.einsum("bijd,bdf,bijf->bij", diff, D_inv, diff)
-                _, logdet = torch.linalg.slogdet(D)
                 kernel = torch.exp(-0.5 * (q + logdet[:, None, None]))
                 kernel = kernel / kernel.sum(dim=-1, keepdim=True).clamp_min(1e-6)
                 row_kernels.append(kernel)

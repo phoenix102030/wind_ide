@@ -60,6 +60,32 @@ def test_transition_matrix_uses_component_pair_kernels():
     assert torch.all(Q.diagonal(dim1=-2, dim2=-1) > 0)
 
 
+def test_component_kernels_remain_finite_for_ill_conditioned_sigma():
+    model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+    sigma = torch.tensor(
+        [
+            [1e6, -1e6, 5e5, -5e5],
+            [-1e6, 1e6, -5e5, 5e5],
+            [5e5, -5e5, 2.5e5, -2.5e5],
+            [-5e5, 5e5, -2.5e5, 2.5e5],
+        ],
+        dtype=site_lon.dtype,
+    ).unsqueeze(0)
+
+    kernels = model.build_component_kernels(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t={"mu": torch.zeros(1, 4), "sigma": sigma},
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+    )
+
+    assert torch.isfinite(kernels).all()
+    assert torch.allclose(kernels.sum(dim=-1), torch.ones_like(kernels.sum(dim=-1)), atol=1e-5)
+
+
 def test_advection_mean_net_outputs_matrix_mean_and_spd_covariance():
     model = AdvectionMeanNet()
     x_seq = torch.randn(2, 4, 6, 8, 8)
