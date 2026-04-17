@@ -46,13 +46,13 @@ class TemporalEncoder(nn.Module):
 
 class AdvectionMeanNet(nn.Module):
     """
-    Learn time-varying advection matrix parameters from NWP context.
+    Learn time-varying advection velocity and spatial diffusion from NWP context.
 
-    The network predicts a random 2x2 advection/mixing matrix M_t:
-        vec(M_t) ~ N(mu_t, Sigma_t)
+    The network predicts
+        v_t in R^2
+        H_t in SPD(2)
 
-    where mu_t has 4 entries and Sigma_t is constructed from a 4x4 Cholesky
-    factor to guarantee positive definiteness.
+    where v_t is a physical advection velocity and H_t is a diffusion tensor.
     """
 
     def __init__(
@@ -92,10 +92,10 @@ class AdvectionMeanNet(nn.Module):
             dropout=dropout,
         )
         self.mu_head = nn.Linear(embed_dim, 4)
-        self.chol_head = nn.Linear(embed_dim, 10)
+        self.chol_head = nn.Linear(embed_dim, 3)
         init_diag_raw = inverse_softplus(max(float(init_global_sigma_diag) - self.chol_eps, 1e-4))
-        global_chol_init = torch.zeros(10)
-        global_chol_init[:4] = init_diag_raw
+        global_chol_init = torch.zeros(3)
+        global_chol_init[:2] = init_diag_raw
         self.global_chol_params = nn.Parameter(global_chol_init)
         self._configure_parameter_usage()
 
@@ -106,7 +106,19 @@ class AdvectionMeanNet(nn.Module):
         self.global_chol_params.requires_grad_(self.sigma_mode == "global")
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        for key in ("weight", "bias"):
+            full_key = f"{prefix}chol_head.{key}"
+            if full_key in state_dict and state_dict[full_key].shape != getattr(self.chol_head, key).shape:
+                legacy_value = state_dict[full_key]
+                if key == "weight" and legacy_value.ndim == 2 and legacy_value.shape[0] == 10:
+                    state_dict[full_key] = legacy_value.index_select(0, torch.tensor([0, 1, 4], device=legacy_value.device))
+                elif key == "bias" and legacy_value.ndim == 1 and legacy_value.shape[0] == 10:
+                    state_dict[full_key] = legacy_value.index_select(0, torch.tensor([0, 1, 4], device=legacy_value.device))
         global_key = f"{prefix}global_chol_params"
+        if global_key in state_dict and state_dict[global_key].shape != self.global_chol_params.shape:
+            legacy_value = state_dict[global_key]
+            if legacy_value.ndim == 1 and legacy_value.shape[0] == 10:
+                state_dict[global_key] = legacy_value.index_select(0, torch.tensor([0, 1, 4], device=legacy_value.device))
         if global_key not in state_dict:
             state_dict[global_key] = self.global_chol_params.detach().clone()
         super()._load_from_state_dict(
@@ -122,10 +134,10 @@ class AdvectionMeanNet(nn.Module):
 
     def _build_cholesky(self, chol_raw):
         batch_size = chol_raw.shape[0]
-        chol = chol_raw.new_zeros(batch_size, 4, 4)
+        chol = chol_raw.new_zeros(batch_size, 2, 2)
 
-        diag_raw = chol_raw[:, :4]
-        offdiag_raw = chol_raw[:, 4:]
+        diag_raw = chol_raw[:, :2]
+        offdiag_raw = chol_raw[:, 2:]
 
         diag = torch.nn.functional.softplus(diag_raw).clamp_max(self.chol_diag_max) + self.chol_eps
         offdiag = self.chol_offdiag_scale * torch.tanh(offdiag_raw)
@@ -133,13 +145,6 @@ class AdvectionMeanNet(nn.Module):
         chol[:, 0, 0] = diag[:, 0]
         chol[:, 1, 0] = offdiag[:, 0]
         chol[:, 1, 1] = diag[:, 1]
-        chol[:, 2, 0] = offdiag[:, 1]
-        chol[:, 2, 1] = offdiag[:, 2]
-        chol[:, 2, 2] = diag[:, 2]
-        chol[:, 3, 0] = offdiag[:, 3]
-        chol[:, 3, 1] = offdiag[:, 4]
-        chol[:, 3, 2] = offdiag[:, 5]
-        chol[:, 3, 3] = diag[:, 3]
         return chol
 
     def _extract_wind_anchor(self, x_seq):
@@ -157,23 +162,22 @@ class AdvectionMeanNet(nn.Module):
 
         h = self.temporal(feat)
         mu_coeff_matrix = self.mu_scale * torch.tanh(self.mu_head(h)).reshape(batch_size, 2, 2)
+        base_anchor = self._extract_wind_anchor(x_seq)
         if self.mu_mode == "anchored":
-            wind_anchor = self._extract_wind_anchor(x_seq)
-            mu_matrix = mu_coeff_matrix * wind_anchor.unsqueeze(1)
+            wind_anchor = base_anchor
         else:
-            wind_anchor = self._extract_wind_anchor(x_seq)
-            mu_matrix = mu_coeff_matrix
+            wind_anchor = torch.ones_like(base_anchor)
+        velocity = torch.einsum("bij,bj->bi", mu_coeff_matrix, wind_anchor)
 
         if self.sigma_mode == "global":
             chol_factor = self._build_cholesky(self.global_chol_params.unsqueeze(0).expand(batch_size, -1))
         else:
             chol_factor = self._build_cholesky(self.chol_head(h))
-        sigma = chol_factor @ chol_factor.transpose(-1, -2)
+        diffusion = chol_factor @ chol_factor.transpose(-1, -2)
         return {
-            "mu": mu_matrix.reshape(batch_size, 4),
-            "mu_matrix": mu_matrix,
+            "mu": velocity,
             "mu_coeff_matrix": mu_coeff_matrix,
-            "wind_anchor": wind_anchor,
-            "sigma": sigma,
+            "wind_anchor": base_anchor,
+            "sigma": diffusion,
             "chol_factor": chol_factor,
         }

@@ -26,8 +26,8 @@ def build_dynamics_sequence(mean_model, nwp_seq_full, seq_len, start_at=None):
     """
     nwp_seq_full: [B, seq_len+chunk_len-1, 6, Y, X]
     returns:
-        mu:    [B, chunk_len, 4]
-        sigma: [B, chunk_len, 4, 4]
+        mu:    [B, chunk_len, 2]
+        sigma: [B, chunk_len, 2, 2]
     """
     if start_at is None:
         start_at = seq_len - 1
@@ -45,8 +45,8 @@ def build_dynamics_sequence(mean_model, nwp_seq_full, seq_len, start_at=None):
 
 def zero_dynamics_sequence(batch_size, chunk_len, device, dtype):
     return {
-        "mu": torch.zeros(batch_size, chunk_len, 4, device=device, dtype=dtype),
-        "sigma": torch.zeros(batch_size, chunk_len, 4, 4, device=device, dtype=dtype),
+        "mu": torch.zeros(batch_size, chunk_len, 2, device=device, dtype=dtype),
+        "sigma": torch.zeros(batch_size, chunk_len, 2, 2, device=device, dtype=dtype),
     }
 
 

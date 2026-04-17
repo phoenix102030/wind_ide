@@ -89,11 +89,6 @@ class IDEStateSpaceModel(nn.Module):
         self.log_damping_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_damping)))
         self.init_mean_knots = nn.Parameter(torch.zeros(self.num_knots, self.state_dim))
 
-        selector = torch.zeros(self.vec_dim, self.vec_dim, self.vec_dim * self.vec_dim)
-        selector[0, :, 0:2] = torch.eye(self.vec_dim)
-        selector[1, :, 2:4] = torch.eye(self.vec_dim)
-        self.register_buffer("row_selector", selector)
-
     @property
     def ell_par(self):
         return self.ell_par_series.mean()
@@ -302,15 +297,15 @@ class IDEStateSpaceModel(nn.Module):
 
     def _default_dynamics(self, batch_size, device, dtype):
         return {
-            "mu": torch.zeros(batch_size, 4, device=device, dtype=dtype),
-            "sigma": torch.zeros(batch_size, 4, 4, device=device, dtype=dtype),
+            "mu": torch.zeros(batch_size, 2, device=device, dtype=dtype),
+            "sigma": torch.zeros(batch_size, 2, 2, device=device, dtype=dtype),
         }
 
     def _parse_dynamics(self, dynamics_t, batch_size, device, dtype):
         if dynamics_t is None:
             dynamics_t = self._default_dynamics(batch_size, device, dtype)
-        mu = dynamics_t["mu"].to(device=device, dtype=dtype).reshape(batch_size, 4)
-        sigma = dynamics_t["sigma"].to(device=device, dtype=dtype).reshape(batch_size, 4, 4)
+        mu = dynamics_t["mu"].to(device=device, dtype=dtype).reshape(batch_size, 2)
+        sigma = dynamics_t["sigma"].to(device=device, dtype=dtype).reshape(batch_size, 2, 2)
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
         return mu, sigma
 
@@ -352,14 +347,6 @@ class IDEStateSpaceModel(nn.Module):
         inv[..., 1, 0] = -b / det
         logdet = torch.log(det)
         return inv, logdet
-
-    def _selector(self, idx, device, dtype):
-        return self.row_selector[idx].to(device=device, dtype=dtype)
-
-    def _pair_selector(self, i, j, device, dtype):
-        if i == j:
-            return self._selector(i, device, dtype)
-        return 0.5 * (self._selector(i, device, dtype) + self._selector(j, device, dtype))
 
     def _prepare_start_idx(self, start_idx, batch_size, device):
         if start_idx is None:
@@ -428,31 +415,28 @@ class IDEStateSpaceModel(nn.Module):
             ell_par_t = time_params["ell_par"][:, 0].to(dtype=dtype)
             ell_perp_t = time_params["ell_perp"][:, 0].to(dtype=dtype)
 
+        base_cov = self._oriented_base_covariance(
+            drift_mean=mu_t,
+            ell_par=ell_par_t,
+            ell_perp=ell_perp_t,
+            eye2=eye2.expand(batch_size, -1, -1),
+        )
+        diffusion_t = self._make_spd(sigma_t + 1e-4 * eye2, min_eig=1e-4)
+        D = self._make_spd(base_cov + 2.0 * (self.dt ** 2) * diffusion_t + 1e-4 * eye2, min_eig=1e-4)
+        D_inv, logdet = self._inv_and_logdet_2x2(D, min_det=1e-8)
+        drift = self.dt * mu_t[:, None, None, :]
+        diff = h - drift
+
+        q = torch.einsum("bijd,bdf,bijf->bij", diff, D_inv, diff)
+        transport_kernel = torch.exp(-0.5 * (q + logdet[:, None, None]))
+        transport_kernel = transport_kernel / transport_kernel.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        zero_kernel = torch.zeros_like(transport_kernel)
+
         kernels = []
         for target_idx in range(self.vec_dim):
             row_kernels = []
             for source_idx in range(self.vec_dim):
-                selector = self._pair_selector(target_idx, source_idx, device, dtype)
-                drift_mean = torch.einsum("ab,nb->na", selector, mu_t)
-                drift_cov = torch.einsum("ab,nbc,dc->nad", selector, sigma_t, selector)
-                drift_cov = 0.5 * (drift_cov + drift_cov.transpose(-1, -2))
-
-                base_cov = self._oriented_base_covariance(
-                    drift_mean=drift_mean,
-                    ell_par=ell_par_t,
-                    ell_perp=ell_perp_t,
-                    eye2=eye2.expand(batch_size, -1, -1),
-                )
-                D = base_cov + 2.0 * (self.dt ** 2) * drift_cov + 1e-4 * eye2
-                D = self._make_spd(D, min_eig=1e-4)
-                D_inv, logdet = self._inv_and_logdet_2x2(D, min_det=1e-8)
-                drift = self.dt * drift_mean[:, None, None, :]
-                diff = h - drift
-
-                q = torch.einsum("bijd,bdf,bijf->bij", diff, D_inv, diff)
-                kernel = torch.exp(-0.5 * (q + logdet[:, None, None]))
-                kernel = kernel / kernel.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-                row_kernels.append(kernel)
+                row_kernels.append(transport_kernel if target_idx == source_idx else zero_kernel)
             kernels.append(torch.stack(row_kernels, dim=1))
         return torch.stack(kernels, dim=1)
 

@@ -25,15 +25,13 @@ def test_transition_matrix_uses_component_pair_kernels():
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
     sigma = torch.tensor(
         [
-            [0.40, 0.05, 0.18, -0.04],
-            [0.05, 0.30, 0.02, 0.08],
-            [0.18, 0.02, 0.35, 0.06],
-            [-0.04, 0.08, 0.06, 0.28],
+            [0.40, 0.05],
+            [0.05, 0.30],
         ],
         dtype=site_lon.dtype,
     ).unsqueeze(0)
     dynamics_t = {
-        "mu": torch.tensor([[1.2, 0.4, -0.3, 0.8]], dtype=site_lon.dtype),
+        "mu": torch.tensor([[1.2, 0.4]], dtype=site_lon.dtype),
         "sigma": sigma,
     }
 
@@ -56,7 +54,8 @@ def test_transition_matrix_uses_component_pair_kernels():
     assert kernels.shape == (1, 2, 2, 3, 3)
     assert A.shape == (1, 6, 6)
     assert Q.shape == (1, 6, 6)
-    assert not torch.allclose(kernels[:, 0, 0], kernels[:, 0, 1])
+    assert torch.allclose(kernels[:, 0, 0], kernels[:, 1, 1], atol=1e-6)
+    assert torch.allclose(kernels[:, 0, 1], torch.zeros_like(kernels[:, 0, 1]), atol=1e-6)
     assert torch.all(Q.diagonal(dim1=-2, dim2=-1) > 0)
 
 
@@ -80,7 +79,7 @@ def test_transition_matrix_respects_site_component_state_order():
     A, _ = model.build_transition_matrix(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t={"mu": torch.zeros(1, 4), "sigma": torch.zeros(1, 4, 4)},
+        dynamics_t={"mu": torch.zeros(1, 2), "sigma": torch.zeros(1, 2, 2)},
         transition_idx=torch.tensor([0]),
         device=site_lon.device,
         dtype=site_lon.dtype,
@@ -100,10 +99,8 @@ def test_component_kernels_remain_finite_for_ill_conditioned_sigma():
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
     sigma = torch.tensor(
         [
-            [1e6, -1e6, 5e5, -5e5],
-            [-1e6, 1e6, -5e5, 5e5],
-            [5e5, -5e5, 2.5e5, -2.5e5],
-            [-5e5, 5e5, -2.5e5, 2.5e5],
+            [1e6, -1e6],
+            [-1e6, 1e6],
         ],
         dtype=site_lon.dtype,
     ).unsqueeze(0)
@@ -111,21 +108,22 @@ def test_component_kernels_remain_finite_for_ill_conditioned_sigma():
     kernels = model.build_component_kernels(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t={"mu": torch.zeros(1, 4), "sigma": sigma},
+        dynamics_t={"mu": torch.zeros(1, 2), "sigma": sigma},
         device=site_lon.device,
         dtype=site_lon.dtype,
     )
 
     assert torch.isfinite(kernels).all()
-    assert torch.allclose(kernels.sum(dim=-1), torch.ones_like(kernels.sum(dim=-1)), atol=1e-5)
+    assert torch.allclose(kernels[:, 0, 0].sum(dim=-1), torch.ones_like(kernels[:, 0, 0].sum(dim=-1)), atol=1e-5)
+    assert torch.allclose(kernels[:, 0, 1], torch.zeros_like(kernels[:, 0, 1]), atol=1e-6)
 
 
 def test_component_kernels_respond_to_learned_base_length_scales():
     site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
     dynamics_t = {
-        "mu": torch.tensor([[1.0, 0.0, 1.0, 0.0]], dtype=site_lon.dtype),
-        "sigma": torch.zeros(1, 4, 4, dtype=site_lon.dtype),
+        "mu": torch.tensor([[1.0, 0.0]], dtype=site_lon.dtype),
+        "sigma": torch.zeros(1, 2, 2, dtype=site_lon.dtype),
     }
 
     narrow = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
@@ -161,11 +159,10 @@ def test_advection_mean_net_outputs_matrix_mean_and_spd_covariance():
     x_seq = torch.randn(2, 4, 6, 8, 8)
     out = model(x_seq)
 
-    assert out["mu"].shape == (2, 4)
-    assert out["mu_matrix"].shape == (2, 2, 2)
-    assert out["sigma"].shape == (2, 4, 4)
-    assert out["chol_factor"].shape == (2, 4, 4)
-    assert torch.allclose(out["mu"], out["mu_matrix"].reshape(2, 4), atol=1e-6)
+    assert out["mu"].shape == (2, 2)
+    assert out["mu_coeff_matrix"].shape == (2, 2, 2)
+    assert out["sigma"].shape == (2, 2, 2)
+    assert out["chol_factor"].shape == (2, 2, 2)
 
     sigma = out["sigma"]
     assert torch.allclose(sigma, sigma.transpose(-1, -2), atol=1e-6)
@@ -179,11 +176,11 @@ def test_advection_mean_net_can_anchor_mu_and_share_global_sigma():
 
     out = model(x_seq)
 
-    assert out["mu"].shape == (2, 4)
+    assert out["mu"].shape == (2, 2)
     assert out["mu_coeff_matrix"].shape == (2, 2, 2)
     assert out["wind_anchor"].shape == (2, 2)
     assert torch.allclose(out["wind_anchor"], torch.zeros_like(out["wind_anchor"]))
-    assert torch.allclose(out["mu_matrix"], torch.zeros_like(out["mu_matrix"]), atol=1e-6)
+    assert torch.allclose(out["mu"], torch.zeros_like(out["mu"]), atol=1e-6)
     assert torch.allclose(out["sigma"][0], out["sigma"][1], atol=1e-6)
     assert torch.all(torch.linalg.eigvalsh(out["sigma"]) > 0)
     assert not any(param.requires_grad for param in model.chol_head.parameters())
@@ -197,12 +194,12 @@ def test_forecast_multistep_runs_with_dynamic_advection_only():
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0).expand(2, -1)
 
     dynamics_hist = {
-        "mu": torch.randn(2, 5, 4),
-        "sigma": 0.05 * torch.eye(4).reshape(1, 1, 4, 4).expand(2, 5, -1, -1),
+        "mu": torch.randn(2, 5, 2),
+        "sigma": 0.05 * torch.eye(2).reshape(1, 1, 2, 2).expand(2, 5, -1, -1),
     }
     dynamics_future = {
-        "mu": torch.randn(2, 3, 4),
-        "sigma": 0.05 * torch.eye(4).reshape(1, 1, 4, 4).expand(2, 3, -1, -1),
+        "mu": torch.randn(2, 3, 2),
+        "sigma": 0.05 * torch.eye(2).reshape(1, 1, 2, 2).expand(2, 3, -1, -1),
     }
 
     pred = model.forecast_multistep(
