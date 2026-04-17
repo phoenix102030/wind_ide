@@ -4,9 +4,9 @@ nwp_file: ~/wind_ide/data/nwp/data_grid_offline.mat
 device: cuda
 seed: 42
 dt: 1.0
-seq_len: 4
-ide_param_window: 4
-chunk_len: 16
+seq_len: 24
+ide_param_window: 1
+chunk_len: 1
 forecast_horizon: 12
 
 out_dir: outputs/offline_140m_01
