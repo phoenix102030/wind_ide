@@ -1,7 +1,7 @@
-measurement_file: ~/Projects/wind_ide/data/measurement/wv_h100_180_offline_imputed.mat
-nwp_file: ~/Projects/wind_ide/data/nwp/data_grid_offline.mat
+measurement_file: ~/wind_ide/data/measurement/wv_h100_180_offline_imputed.mat
+nwp_file: ~/wind_ide/data/nwp/data_grid_offline.mat
 
-device: mps
+device: cuda
 seed: 42
 dt: 1.0
 seq_len: 4
@@ -17,8 +17,8 @@ ide_lr: 0.001
 ide_epochs: 30
 ide_max_steps: 100
 
-init_log_q_proc: -2.0
-init_log_r_obs: -2.0
+init_log_q_proc: -2
+init_log_r_obs: -2
 init_log_p0: 0.0
 init_log_damping: 0.0
 noise_reg_weight: 0.0001

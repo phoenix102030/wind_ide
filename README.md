@@ -24,7 +24,7 @@ python -m scripts.validate_online_model \
   --local-steps 3 \
   --out-dir outputs/validation_offline_01
 
-
+# mac
 python -m scripts.validate_multistep \
   --ckpt /Users/felix/Projects/wind_ide/outputs/offline_140m_01/offline_best.pt \
   --measurement-file /Users/felix/Projects/wind_ide/data/measurement/wv_h100_180_online_imputed.mat \
@@ -32,3 +32,11 @@ python -m scripts.validate_multistep \
   --history-len 24 \
   --horizon 12 \
   --out-dir /Users/felix/Projects/wind_ide/outputs/validation_multistep_12
+# palmetto
+python -m scripts.validate_multistep \
+  --ckpt ~/wind_ide/outputs/offline_140m_01/offline_best.pt \
+  --measurement-file ~/wind_ide/data/measurement/wv_h100_180_online_imputed.mat \
+  --nwp-file ~/wind_ide/data/nwp/data_grid_online.mat \
+  --history-len 24 \
+  --horizon 12 \
+  --out-dir ~/wind_ide/outputs/validation_multistep_12
