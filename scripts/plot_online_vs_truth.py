@@ -103,6 +103,7 @@ def reconstruct_models(ckpt, device):
     ide_model.load_state_dict(ckpt["ide_model_state"] if "ide_model_state" in ckpt else ckpt["model_state"])
 
     mean_model = AdvectionMeanNet(
+        in_channels=cfg.get("nwp_in_channels", 6),
         hidden_dim=cfg.get("hidden_dim", 32),
         embed_dim=cfg.get("embed_dim", 32),
         num_heads=cfg.get("num_heads", 4),
@@ -116,6 +117,7 @@ def reconstruct_models(ckpt, device):
         mu_mode=cfg.get("mu_mode", "free"),
         sigma_mode=cfg.get("sigma_mode", "network"),
         init_global_sigma_diag=cfg.get("init_global_sigma_diag", 0.2),
+        wind_anchor_indices=cfg.get("nwp_anchor_channel_indices", None),
     ).to(device)
     if "mean_model_state" in ckpt:
         mean_model.load_state_dict(ckpt["mean_model_state"])
@@ -184,6 +186,7 @@ def main():
     bundle = build_aligned_bundle(
         str(Path(args.measurement_file).expanduser().resolve()),
         str(Path(args.nwp_file).expanduser().resolve()),
+        nwp_channel_mode=cfg.get("nwp_input_mode", "uv6"),
     )
     if norm_stats is not None:
         bundle = apply_bundle_normalization(bundle, norm_stats)

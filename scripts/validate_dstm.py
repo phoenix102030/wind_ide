@@ -18,6 +18,7 @@ from src.data.aligned_measurement_nwp import (
     build_aligned_bundle,
     denormalize_nwp_uv_pairs,
     denormalize_z,
+    get_nwp_uv_channel_indices,
     MLMuDataset,
     normalization_stats_from_config,
 )
@@ -150,13 +151,14 @@ def find_nearest_grid(bundle):
     return indices, mapping
 
 
-def extract_nwp_baseline(nwp_seq_full, seq_len, nearest_grid):
-    # nwp_seq_full: [B, seq_len+chunk_len-1, 6, Y, X]
-    current = nwp_seq_full[:, seq_len - 1:]  # [B, chunk_len, 6, Y, X]
+def extract_nwp_baseline(nwp_seq_full, seq_len, nearest_grid, uv_channel_indices):
+    # nwp_seq_full: [B, seq_len+chunk_len-1, C, Y, X]
+    current = nwp_seq_full[:, seq_len - 1:]
+    u_idx, v_idx = uv_channel_indices
     preds = []
     for station_idx, (gy, gx) in enumerate(nearest_grid):
-        u = current[:, :, 2, gy, gx]
-        v = current[:, :, 3, gy, gx]
+        u = current[:, :, u_idx, gy, gx]
+        v = current[:, :, v_idx, gy, gx]
         preds.append(torch.stack([u, v], dim=-1))
     return torch.stack(preds, dim=2)  # [B, chunk_len, 3, 2]
 
@@ -186,6 +188,7 @@ def reconstruct_models(ckpt, device):
     if "ide_model_state" in ckpt:
         ide_model.load_state_dict(ckpt["ide_model_state"])
         mean_model = AdvectionMeanNet(
+            in_channels=cfg.get("nwp_in_channels", 6),
             hidden_dim=cfg.get("hidden_dim", 32),
             embed_dim=cfg.get("embed_dim", 32),
             num_heads=cfg.get("num_heads", 4),
@@ -199,6 +202,7 @@ def reconstruct_models(ckpt, device):
             mu_mode=cfg.get("mu_mode", "free"),
             sigma_mode=cfg.get("sigma_mode", "network"),
             init_global_sigma_diag=cfg.get("init_global_sigma_diag", 0.2),
+            wind_anchor_indices=cfg.get("nwp_anchor_channel_indices", None),
         ).to(device)
         mean_model.load_state_dict(ckpt["mean_model_state"])
     else:
@@ -211,7 +215,17 @@ def reconstruct_models(ckpt, device):
 
 
 @torch.no_grad()
-def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_grid, max_batches=None, norm_stats=None):
+def evaluate_dataset(
+    loader,
+    ide_model,
+    mean_model,
+    seq_len,
+    device,
+    nearest_grid,
+    uv_channel_indices,
+    max_batches=None,
+    norm_stats=None,
+):
     preds_by_name = {
         "static_ide": [],
         "persistence": [],
@@ -265,13 +279,15 @@ def evaluate_dataset(loader, ide_model, mean_model, seq_len, device, nearest_gri
 
         static_np = to_numpy(static_pred.reshape(-1, 3, 2))
         pers_np = to_numpy(z_aligned[:, :-1].reshape(-1, 3, 2))
-        nwp_np = to_numpy(extract_nwp_baseline(nwp_full, seq_len, nearest_grid).reshape(-1, 3, 2))
+        nwp_np = to_numpy(
+            extract_nwp_baseline(nwp_full, seq_len, nearest_grid, uv_channel_indices).reshape(-1, 3, 2)
+        )
         truth_np = to_numpy(y_true.reshape(-1, 3, 2))
         if norm_stats is not None:
             static_np = denormalize_z(static_np, norm_stats)
             pers_np = denormalize_z(pers_np, norm_stats)
             truth_np = denormalize_z(truth_np, norm_stats)
-            nwp_np = denormalize_nwp_uv_pairs(nwp_np, norm_stats, channel_indices=[2, 3])
+            nwp_np = denormalize_nwp_uv_pairs(nwp_np, norm_stats, channel_indices=uv_channel_indices)
 
         preds_by_name["static_ide"].append(static_np)
         preds_by_name["persistence"].append(pers_np)
@@ -487,7 +503,9 @@ def main():
     nwp_file = str(Path(nwp_file).expanduser().resolve())
     dataset_label = args.dataset_label or Path(meas_file).stem
 
-    bundle = build_aligned_bundle(meas_file, nwp_file)
+    nwp_input_mode = cfg.get("nwp_input_mode", "uv6")
+    uv_channel_indices = get_nwp_uv_channel_indices(nwp_input_mode, height="140")
+    bundle = build_aligned_bundle(meas_file, nwp_file, nwp_channel_mode=nwp_input_mode)
     if norm_stats is not None:
         bundle = apply_bundle_normalization(bundle, norm_stats)
     seq_len = cfg.get("seq_len", 4)
@@ -503,6 +521,7 @@ def main():
         seq_len=seq_len,
         device=device,
         nearest_grid=nearest_grid,
+        uv_channel_indices=uv_channel_indices,
         max_batches=args.max_batches,
         norm_stats=norm_stats,
     )

@@ -169,6 +169,19 @@ def test_advection_mean_net_outputs_matrix_mean_and_spd_covariance():
     assert torch.all(torch.linalg.eigvalsh(sigma) > 0)
 
 
+def test_advection_mean_net_free_mode_outputs_direct_velocity():
+    model = AdvectionMeanNet(mu_mode="free")
+    with torch.no_grad():
+        model.mu_head.weight.zero_()
+        model.mu_head.bias.copy_(torch.tensor([1.0, -0.5, 2.0, -3.0]))
+
+    x_seq = torch.randn(2, 4, 6, 8, 8)
+    out = model(x_seq)
+    expected = model.mu_scale * torch.tanh(torch.tensor([1.0, -0.5]))
+    assert torch.allclose(out["mu"], expected.reshape(1, 2).expand_as(out["mu"]))
+    assert out["mu_coeff_matrix"].shape == (2, 2, 2)
+
+
 def test_advection_mean_net_can_anchor_mu_and_share_global_sigma():
     model = AdvectionMeanNet(mu_mode="anchored", sigma_mode="global", mu_scale=0.5, init_global_sigma_diag=0.15)
     x_seq = torch.randn(2, 4, 6, 8, 8)
@@ -185,6 +198,17 @@ def test_advection_mean_net_can_anchor_mu_and_share_global_sigma():
     assert torch.all(torch.linalg.eigvalsh(out["sigma"]) > 0)
     assert not any(param.requires_grad for param in model.chol_head.parameters())
     assert model.global_chol_params.requires_grad
+
+
+def test_advection_mean_net_all12_uses_140m_uv_anchor_indices():
+    model = AdvectionMeanNet(in_channels=12, mu_mode="anchored")
+    x_seq = torch.zeros(1, 4, 12, 6, 6)
+    x_seq[:, -1, 8] = 3.0
+    x_seq[:, -1, 9] = -2.0
+
+    out = model(x_seq)
+
+    assert torch.allclose(out["wind_anchor"], torch.tensor([[3.0, -2.0]]), atol=1e-6)
 
 
 def test_forecast_multistep_runs_with_dynamic_advection_only():
@@ -282,6 +306,14 @@ def test_legacy_coupling_key_is_ignored_on_load():
 
     model.load_state_dict(state_dict, strict=True)
     assert not hasattr(model, "coupling_raw")
+
+
+def test_legacy_row_selector_key_is_ignored_on_load():
+    model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2)
+    state_dict = model.state_dict()
+    state_dict["row_selector"] = torch.eye(2)
+
+    model.load_state_dict(state_dict, strict=True)
 
 
 def test_legacy_global_ide_params_expand_to_knots():

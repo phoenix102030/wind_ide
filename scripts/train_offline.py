@@ -20,6 +20,7 @@ from src.data.aligned_measurement_nwp import (
     apply_bundle_normalization,
     build_aligned_bundle,
     fit_bundle_normalization,
+    get_nwp_uv_channel_indices,
     IDEBaselineDataset,
     MLMuDataset,
 )
@@ -248,9 +249,12 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     chunk_len = int(cfg.get("chunk_len", 16))
     val_fraction = float(cfg.get("val_fraction", 0.2))
 
-    raw_bundle = build_aligned_bundle(meas_file, nwp_file)
+    cfg["nwp_input_mode"] = str(cfg.get("nwp_input_mode", "uv6")).lower()
+    raw_bundle = build_aligned_bundle(meas_file, nwp_file, nwp_channel_mode=cfg["nwp_input_mode"])
     cfg = dict(cfg)
     cfg["ide_total_steps"] = int(raw_bundle.z_meas.shape[0])
+    cfg["nwp_in_channels"] = int(raw_bundle.nwp_uv.shape[1])
+    cfg["nwp_anchor_channel_indices"] = list(get_nwp_uv_channel_indices(cfg["nwp_input_mode"], height="140"))
     cfg["ide_param_mode"] = str(cfg.get("ide_param_mode", "absolute")).lower()
     cfg["skip_ide_warmup"] = bool(cfg.get("skip_ide_warmup", False))
     cfg["train_ell_params"] = bool(cfg.get("train_ell_params", True))
@@ -275,6 +279,17 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"normalize_nwp={cfg['normalize_nwp']}")
         print(f"mu_mode={cfg['mu_mode']}")
         print(f"sigma_mode={cfg['sigma_mode']}")
+        print(f"nwp_input_mode={cfg['nwp_input_mode']}")
+        if cfg["nwp_input_mode"] != "all12":
+            print(
+                "[warning] nwp_input_mode!=all12 means the advection net only sees wind U/V channels "
+                "instead of the full environmental NWP context."
+            )
+        if cfg["sigma_mode"] == "global":
+            print(
+                "[warning] sigma_mode=global keeps diffusion variance fixed over time, so NWP cannot "
+                "modulate kernel shape through Sigma_t."
+            )
 
     raw_ide_base_ds = IDEBaselineDataset(raw_bundle, chunk_len=chunk_len)
     _, _, raw_ide_split_info = contiguous_time_split(raw_ide_base_ds, val_fraction=val_fraction)
@@ -458,6 +473,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     )
 
     mean_model = AdvectionMeanNet(
+        in_channels=cfg.get("nwp_in_channels", raw_bundle.nwp_uv.shape[1]),
         hidden_dim=cfg.get("hidden_dim", 32),
         embed_dim=cfg.get("embed_dim", 32),
         num_heads=cfg.get("num_heads", 4),
@@ -471,6 +487,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         mu_mode=cfg.get("mu_mode", "free"),
         sigma_mode=cfg.get("sigma_mode", "network"),
         init_global_sigma_diag=cfg.get("init_global_sigma_diag", 0.2),
+        wind_anchor_indices=cfg.get("nwp_anchor_channel_indices", None),
     ).to(device)
     mean_model = maybe_wrap_ddp(mean_model, device, distributed)
 

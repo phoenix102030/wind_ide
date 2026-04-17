@@ -21,13 +21,38 @@ NWP_VAR_MAP = {
     "U_180m": 10, "V_180m": 11,
 }
 
+NWP_CHANNELS_BY_MODE = {
+    "uv6": [
+        "U_100m",
+        "V_100m",
+        "U_140m",
+        "V_140m",
+        "U_180m",
+        "V_180m",
+    ],
+    "all12": [
+        "WS_100m",
+        "WS_140m",
+        "WS_180m",
+        "T2",
+        "RH2",
+        "SLP",
+        "U_100m",
+        "V_100m",
+        "U_140m",
+        "V_140m",
+        "U_180m",
+        "V_180m",
+    ],
+}
+
 
 @dataclass
 class AlignedDataBundle:
     z_meas: np.ndarray      # [T, 3, 2]
     meas_lat: np.ndarray    # [3]
     meas_lon: np.ndarray    # [3]
-    nwp_uv: np.ndarray      # [T, 6, Y, X]
+    nwp_uv: np.ndarray      # [T, C, Y, X]
     nwp_lat: np.ndarray     # [Y, X]
     nwp_lon: np.ndarray     # [Y, X]
 
@@ -36,8 +61,8 @@ class AlignedDataBundle:
 class NormalizationStats:
     z_mean: np.ndarray      # [3, 2]
     z_std: np.ndarray       # [3, 2]
-    nwp_mean: np.ndarray    # [6]
-    nwp_std: np.ndarray     # [6]
+    nwp_mean: np.ndarray    # [C]
+    nwp_std: np.ndarray     # [C]
 
     def to_config_dict(self):
         return {
@@ -51,6 +76,28 @@ class NormalizationStats:
 def _safe_std(std, min_std=1e-6):
     std = np.asarray(std, dtype=np.float32)
     return np.where(np.isfinite(std) & (std >= min_std), std, 1.0).astype(np.float32)
+
+
+def normalize_nwp_channel_mode(channel_mode):
+    channel_mode = str(channel_mode).lower()
+    if channel_mode not in NWP_CHANNELS_BY_MODE:
+        supported = ", ".join(sorted(NWP_CHANNELS_BY_MODE))
+        raise ValueError(f"Unsupported nwp channel mode {channel_mode!r}. Expected one of: {supported}.")
+    return channel_mode
+
+
+def get_nwp_channel_names(channel_mode="uv6"):
+    channel_mode = normalize_nwp_channel_mode(channel_mode)
+    return list(NWP_CHANNELS_BY_MODE[channel_mode])
+
+
+def get_nwp_uv_channel_indices(channel_mode="uv6", height="140"):
+    channel_names = get_nwp_channel_names(channel_mode)
+    height = str(height)
+    return (
+        channel_names.index(f"U_{height}m"),
+        channel_names.index(f"V_{height}m"),
+    )
 
 
 def fit_bundle_normalization(bundle: AlignedDataBundle, end_time=None):
@@ -166,28 +213,22 @@ def load_measurement_140m(meas_file):
     return z, lat, lon
 
 
-def load_nwp_uv_3heights(nwp_file):
+def load_nwp_uv_3heights(nwp_file, channel_mode="uv6"):
+    channel_mode = normalize_nwp_channel_mode(channel_mode)
     data = load_mat_auto(nwp_file)
     grid = normalize_nwp_grid_shape(np.asarray(data["allVariMin_Grid"]))
     lat = np.asarray(data["LatValue"]).astype(np.float32)
     lon = np.asarray(data["LonValue"]).astype(np.float32)
 
-    channels = [
-        grid[:, :, :, NWP_VAR_MAP["U_100m"]],
-        grid[:, :, :, NWP_VAR_MAP["V_100m"]],
-        grid[:, :, :, NWP_VAR_MAP["U_140m"]],
-        grid[:, :, :, NWP_VAR_MAP["V_140m"]],
-        grid[:, :, :, NWP_VAR_MAP["U_180m"]],
-        grid[:, :, :, NWP_VAR_MAP["V_180m"]],
-    ]
+    channels = [grid[:, :, :, NWP_VAR_MAP[name]] for name in get_nwp_channel_names(channel_mode)]
     channels = [c.transpose(2, 0, 1).astype(np.float32) for c in channels]
-    x = np.stack(channels, axis=1)  # [T, 6, Y, X]
+    x = np.stack(channels, axis=1)  # [T, C, Y, X]
     return x, lat, lon
 
 
-def build_aligned_bundle(meas_file, nwp_file):
+def build_aligned_bundle(meas_file, nwp_file, nwp_channel_mode="uv6"):
     z_meas, meas_lat, meas_lon = load_measurement_140m(meas_file)
-    nwp_uv, nwp_lat, nwp_lon = load_nwp_uv_3heights(nwp_file)
+    nwp_uv, nwp_lat, nwp_lon = load_nwp_uv_3heights(nwp_file, channel_mode=nwp_channel_mode)
 
     T = min(z_meas.shape[0], nwp_uv.shape[0])
     return AlignedDataBundle(

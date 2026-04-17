@@ -252,6 +252,7 @@ class IDEStateSpaceModel(nn.Module):
             "log_ell_par",
             "log_ell_perp",
             "coupling_raw",
+            "row_selector",
             "init_mean",
             "log_q_proc",
             "log_r_obs",

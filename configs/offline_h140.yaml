@@ -6,6 +6,7 @@ seed: 42
 dt: 1.0
 normalize_z: true
 normalize_nwp: true
+nwp_input_mode: uv6
 
 # seq_len:
 #   advection 网络每次看多少帧 NWP 历史来输出一个时刻的 mu_t / Sigma_t
@@ -60,8 +61,8 @@ num_heads: 4
 num_layers: 2
 ff_dim: 64
 dropout: 0.1
-mu_mode: anchored
-sigma_mode: global
+mu_mode: free
+sigma_mode: network
 
 ml_batch_size: 128
 ml_lr: 0.001

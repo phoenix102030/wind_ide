@@ -57,6 +57,7 @@ class AdvectionMeanNet(nn.Module):
 
     def __init__(
         self,
+        in_channels=6,
         hidden_dim=32,
         embed_dim=32,
         num_heads=4,
@@ -70,8 +71,10 @@ class AdvectionMeanNet(nn.Module):
         mu_mode="free",
         sigma_mode="network",
         init_global_sigma_diag=0.2,
+        wind_anchor_indices=None,
     ):
         super().__init__()
+        self.in_channels = int(in_channels)
         self.mu_scale = mu_scale
         self.chol_offdiag_scale = chol_offdiag_scale
         self.chol_diag_max = chol_diag_max
@@ -82,8 +85,13 @@ class AdvectionMeanNet(nn.Module):
             raise ValueError(f"Unsupported mu_mode={mu_mode!r}; expected 'free' or 'anchored'.")
         if self.sigma_mode not in {"network", "global"}:
             raise ValueError(f"Unsupported sigma_mode={sigma_mode!r}; expected 'network' or 'global'.")
+        if wind_anchor_indices is None:
+            wind_anchor_indices = (8, 9) if self.in_channels >= 10 else (2, 3)
+        if len(wind_anchor_indices) != 2:
+            raise ValueError("wind_anchor_indices must contain exactly two channel indices.")
+        self.wind_anchor_indices = tuple(int(idx) for idx in wind_anchor_indices)
 
-        self.spatial = SpatialEncoder(in_channels=6, hidden_dim=hidden_dim, out_dim=embed_dim)
+        self.spatial = SpatialEncoder(in_channels=self.in_channels, hidden_dim=hidden_dim, out_dim=embed_dim)
         self.temporal = TemporalEncoder(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -149,11 +157,16 @@ class AdvectionMeanNet(nn.Module):
 
     def _extract_wind_anchor(self, x_seq):
         latest_frame = x_seq[:, -1]
-        wind_uv = latest_frame[:, 2:4]
+        u_idx, v_idx = self.wind_anchor_indices
+        if latest_frame.shape[1] <= max(u_idx, v_idx):
+            raise ValueError(
+                f"Expected at least {max(u_idx, v_idx) + 1} NWP channels, got {latest_frame.shape[1]}"
+            )
+        wind_uv = latest_frame[:, [u_idx, v_idx]]
         return wind_uv.mean(dim=(-1, -2))
 
     def forward(self, x_seq):
-        # x_seq: [B, L, 6, Y, X]
+        # x_seq: [B, L, C, Y, X]
         batch_size, seq_len, channels, height, width = x_seq.shape
         x = x_seq.reshape(batch_size * seq_len, channels, height, width)
         feat = self.spatial(x)
@@ -161,13 +174,18 @@ class AdvectionMeanNet(nn.Module):
         feat = feat.reshape(batch_size, seq_len, embed_dim)
 
         h = self.temporal(feat)
-        mu_coeff_matrix = self.mu_scale * torch.tanh(self.mu_head(h)).reshape(batch_size, 2, 2)
+        mu_raw = self.mu_scale * torch.tanh(self.mu_head(h))
         base_anchor = self._extract_wind_anchor(x_seq)
         if self.mu_mode == "anchored":
+            mu_coeff_matrix = mu_raw.reshape(batch_size, 2, 2)
             wind_anchor = base_anchor
+            velocity = torch.einsum("bij,bj->bi", mu_coeff_matrix, wind_anchor)
         else:
+            velocity = mu_raw[:, :2]
+            mu_coeff_matrix = velocity.new_zeros(batch_size, 2, 2)
+            mu_coeff_matrix[:, 0, 0] = velocity[:, 0]
+            mu_coeff_matrix[:, 1, 1] = velocity[:, 1]
             wind_anchor = torch.ones_like(base_anchor)
-        velocity = torch.einsum("bij,bj->bi", mu_coeff_matrix, wind_anchor)
 
         if self.sigma_mode == "global":
             chol_factor = self._build_cholesky(self.global_chol_params.unsqueeze(0).expand(batch_size, -1))

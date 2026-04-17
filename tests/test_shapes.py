@@ -7,7 +7,7 @@ def test_adjuster_shape():
     model = CNNTransformerAdjuster()
     z = torch.randn(2, 4, 3, 40, 40)
     out = model(z)
-    assert out.shape == (2, 1, 40, 40)
+    assert out.shape == (2, 2, 40, 40)
 
 
 def test_joint_model_shape():
@@ -23,4 +23,4 @@ def test_joint_model_shape():
     }
     pred, alpha, _ = model(batch)
     assert pred.shape == (1, 8, 8)
-    assert alpha.shape == (1, 1, 8, 8)
+    assert alpha.shape == (1, 2, 8, 8)
