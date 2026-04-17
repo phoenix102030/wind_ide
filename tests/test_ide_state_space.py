@@ -60,6 +60,40 @@ def test_transition_matrix_uses_component_pair_kernels():
     assert torch.all(Q.diagonal(dim1=-2, dim2=-1) > 0)
 
 
+def test_transition_matrix_respects_site_component_state_order():
+    model = IDEStateSpaceModel(
+        num_sites=3,
+        dt=1.0,
+        total_steps=4,
+        param_window=1,
+        damping_min=1e-6,
+        damping_max=1.0,
+    )
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+    kernels = torch.arange(36, dtype=site_lon.dtype).reshape(1, 2, 2, 3, 3)
+
+    with torch.no_grad():
+        model.log_damping_knots.fill_(-20.0)
+
+    model.build_component_kernels = lambda **kwargs: kernels
+    A, _ = model.build_transition_matrix(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t={"mu": torch.zeros(1, 4), "sigma": torch.zeros(1, 4, 4)},
+        transition_idx=torch.tensor([0]),
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+    )
+
+    eye = torch.eye(model.state_dim, dtype=site_lon.dtype).unsqueeze(0)
+    damping = model._get_time_params(torch.tensor([[0]]))["damping"][:, 0].to(dtype=site_lon.dtype)
+    operator = A - eye + damping[:, None, None] * eye
+    expected = kernels.permute(0, 3, 1, 4, 2).reshape(1, model.state_dim, model.state_dim)
+
+    assert torch.allclose(operator, expected)
+
+
 def test_component_kernels_remain_finite_for_ill_conditioned_sigma():
     model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
     site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)

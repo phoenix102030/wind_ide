@@ -468,7 +468,8 @@ class IDEStateSpaceModel(nn.Module):
             transition_idx=transition_idx,
         )
 
-        operator = kernels.permute(0, 1, 3, 2, 4).reshape(batch_size, self.state_dim, self.state_dim)
+        # Match the [site, component] flattening used by _flatten_state().
+        operator = kernels.permute(0, 3, 1, 4, 2).reshape(batch_size, self.state_dim, self.state_dim)
         eye = torch.eye(self.state_dim, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
 
         time_params = self._get_time_params(transition_idx[:, None])
