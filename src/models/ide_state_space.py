@@ -461,7 +461,10 @@ class IDEStateSpaceModel(nn.Module):
         damping_t = time_params["damping"][:, 0].to(dtype=dtype)
         q_proc_t = time_params["q_proc"][:, 0].to(dtype=dtype)
 
-        A = eye + self.dt * (operator - damping_t[:, None, None] * eye)
+        # `operator` is already a discrete transport map because each kernel row is normalized.
+        # Applying Euler again as I + dt * (operator - gamma I) makes the constant mode unstable.
+        survival_t = 1.0 - self.dt * damping_t
+        A = survival_t[:, None, None] * operator
         Q = q_proc_t[:, None, None].square() * eye
         return A, Q
 

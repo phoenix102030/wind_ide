@@ -85,12 +85,42 @@ def test_transition_matrix_respects_site_component_state_order():
         dtype=site_lon.dtype,
     )
 
-    eye = torch.eye(model.state_dim, dtype=site_lon.dtype).unsqueeze(0)
     damping = model._get_time_params(torch.tensor([[0]]))["damping"][:, 0].to(dtype=site_lon.dtype)
-    operator = A - eye + damping[:, None, None] * eye
-    expected = kernels.permute(0, 3, 1, 4, 2).reshape(1, model.state_dim, model.state_dim)
+    operator = kernels.permute(0, 3, 1, 4, 2).reshape(1, model.state_dim, model.state_dim)
+    expected = (1.0 - model.dt * damping)[:, None, None] * operator
 
-    assert torch.allclose(operator, expected)
+    assert torch.allclose(A, expected)
+
+
+def test_transition_matrix_contracts_constant_mode_for_row_stochastic_operator():
+    model = IDEStateSpaceModel(
+        num_sites=3,
+        dt=1.0,
+        total_steps=4,
+        param_window=1,
+        damping_min=1e-6,
+        damping_max=1.0,
+    )
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+
+    with torch.no_grad():
+        model.log_damping_knots.fill_(torch.log(torch.tensor(0.3)).item())
+
+    A, _ = model.build_transition_matrix(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t={"mu": torch.zeros(1, 2), "sigma": torch.zeros(1, 2, 2)},
+        transition_idx=torch.tensor([0]),
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+    )
+
+    ones = torch.ones(1, model.state_dim, 1, dtype=site_lon.dtype)
+    damping = model._get_time_params(torch.tensor([[0]]))["damping"][:, 0].to(dtype=site_lon.dtype)
+    propagated = A @ ones
+    expected = (1.0 - damping)[:, None, None] * ones
+    assert torch.allclose(propagated, expected, atol=1e-5)
 
 
 def test_component_kernels_remain_finite_for_ill_conditioned_sigma():
