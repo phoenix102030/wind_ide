@@ -86,6 +86,42 @@ def test_component_kernels_remain_finite_for_ill_conditioned_sigma():
     assert torch.allclose(kernels.sum(dim=-1), torch.ones_like(kernels.sum(dim=-1)), atol=1e-5)
 
 
+def test_component_kernels_respond_to_learned_base_length_scales():
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+    dynamics_t = {
+        "mu": torch.tensor([[1.0, 0.0, 1.0, 0.0]], dtype=site_lon.dtype),
+        "sigma": torch.zeros(1, 4, 4, dtype=site_lon.dtype),
+    }
+
+    narrow = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
+    wide = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
+    with torch.no_grad():
+        narrow.log_ell_par_knots.fill_(-1.5)
+        narrow.log_ell_perp_knots.fill_(-1.5)
+        wide.log_ell_par_knots.fill_(1.0)
+        wide.log_ell_perp_knots.fill_(1.0)
+
+    narrow_kernels = narrow.build_component_kernels(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t=dynamics_t,
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+        transition_idx=torch.tensor([0]),
+    )
+    wide_kernels = wide.build_component_kernels(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t=dynamics_t,
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+        transition_idx=torch.tensor([0]),
+    )
+
+    assert wide_kernels[:, 0, 0].amax() < narrow_kernels[:, 0, 0].amax()
+
+
 def test_advection_mean_net_outputs_matrix_mean_and_spd_covariance():
     model = AdvectionMeanNet()
     x_seq = torch.randn(2, 4, 6, 8, 8)
@@ -200,7 +236,20 @@ def test_legacy_length_scale_keys_are_ignored_on_load():
     state_dict = model.state_dict()
     state_dict["log_ell_par"] = torch.tensor(0.3)
     state_dict["log_ell_perp"] = torch.tensor(-0.2)
+    state_dict.pop("log_ell_par_knots")
+    state_dict.pop("log_ell_perp_knots")
 
     model.load_state_dict(state_dict, strict=True)
-    assert float(model.ell_par) == 1.0
-    assert float(model.ell_perp) == 1.0
+    assert torch.allclose(model.log_ell_par_knots, torch.full((4,), 0.3))
+    assert torch.allclose(model.log_ell_perp_knots, torch.full((4,), -0.2))
+
+
+def test_missing_length_scale_keys_fall_back_to_model_defaults():
+    model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2)
+    state_dict = model.state_dict()
+    state_dict.pop("log_ell_par_knots")
+    state_dict.pop("log_ell_perp_knots")
+
+    model.load_state_dict(state_dict, strict=True)
+    assert torch.allclose(model.log_ell_par_knots, torch.full((4,), 0.5))
+    assert torch.allclose(model.log_ell_perp_knots, torch.full((4,), 0.0))

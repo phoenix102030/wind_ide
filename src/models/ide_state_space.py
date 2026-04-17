@@ -57,8 +57,6 @@ class IDEStateSpaceModel(nn.Module):
         init_log_damping=0.0,
     ):
         super().__init__()
-        del init_log_ell_par
-        del init_log_ell_perp
 
         self.dt = dt
         self.num_sites = num_sites
@@ -71,6 +69,8 @@ class IDEStateSpaceModel(nn.Module):
             raise ValueError(f"Unsupported param_mode={param_mode!r}; expected 'absolute' or 'global'.")
         self.num_knots = 1 if self.param_mode == "global" else math.ceil(self.total_steps / self.param_window)
 
+        self.log_ell_par_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_ell_par)))
+        self.log_ell_perp_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_ell_perp)))
         self.log_q_proc_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_q_proc)))
         self.log_r_obs_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_r_obs)))
         self.log_p0_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_p0)))
@@ -84,11 +84,11 @@ class IDEStateSpaceModel(nn.Module):
 
     @property
     def ell_par(self):
-        return self.log_q_proc_knots.new_tensor(1.0)
+        return self.ell_par_series.mean()
 
     @property
     def ell_perp(self):
-        return self.log_q_proc_knots.new_tensor(1.0)
+        return self.ell_perp_series.mean()
 
     def _expand_scalar_series(self, knots):
         if knots.shape[0] == 1:
@@ -99,6 +99,14 @@ class IDEStateSpaceModel(nn.Module):
         if knots.shape[0] == 1:
             return knots.expand(self.total_steps, -1)
         return knots.repeat_interleave(self.param_window, dim=0)[:self.total_steps]
+
+    @property
+    def ell_par_series(self):
+        return torch.exp(self._expand_scalar_series(self.log_ell_par_knots))
+
+    @property
+    def ell_perp_series(self):
+        return torch.exp(self._expand_scalar_series(self.log_ell_perp_knots))
 
     @property
     def q_proc_series(self):
@@ -141,6 +149,8 @@ class IDEStateSpaceModel(nn.Module):
 
     @torch.no_grad()
     def clamp_parameters_(self, log_min=-4.0, log_max=2.0):
+        self.log_ell_par_knots.clamp_(log_min, log_max)
+        self.log_ell_perp_knots.clamp_(log_min, log_max)
         self.log_q_proc_knots.clamp_(log_min, log_max)
         self.log_r_obs_knots.clamp_(log_min, log_max)
         self.log_p0_knots.clamp_(log_min, log_max)
@@ -182,6 +192,8 @@ class IDEStateSpaceModel(nn.Module):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         legacy_to_new = {
+            "log_ell_par": "log_ell_par_knots",
+            "log_ell_perp": "log_ell_perp_knots",
             "log_q_proc": "log_q_proc_knots",
             "log_r_obs": "log_r_obs_knots",
             "log_p0": "log_p0_knots",
@@ -201,7 +213,17 @@ class IDEStateSpaceModel(nn.Module):
             legacy_value = state_dict[legacy_init_mean].reshape(1, self.state_dim)
             state_dict[new_init_mean] = legacy_value.repeat(self.num_knots, 1)
 
+        for key, param in (
+            ("log_ell_par_knots", self.log_ell_par_knots),
+            ("log_ell_perp_knots", self.log_ell_perp_knots),
+        ):
+            full_key = f"{prefix}{key}"
+            if full_key not in state_dict:
+                state_dict[full_key] = param.detach().clone()
+
         resize_targets = {
+            "log_ell_par_knots": self.log_ell_par_knots.shape,
+            "log_ell_perp_knots": self.log_ell_perp_knots.shape,
             "log_q_proc_knots": self.log_q_proc_knots.shape,
             "log_r_obs_knots": self.log_r_obs_knots.shape,
             "log_p0_knots": self.log_p0_knots.shape,
@@ -348,6 +370,8 @@ class IDEStateSpaceModel(nn.Module):
 
     def _get_time_params(self, idx):
         return {
+            "ell_par": self._gather_scalar(self.ell_par_series, idx),
+            "ell_perp": self._gather_scalar(self.ell_perp_series, idx),
             "q_proc": self._gather_scalar(self.q_proc_series, idx),
             "r_obs": self._gather_scalar(self.r_obs_series, idx),
             "p0": self._gather_scalar(self.p0_series, idx),
@@ -355,7 +379,21 @@ class IDEStateSpaceModel(nn.Module):
             "init_mean": self._gather_vector(self.init_mean_series, idx),
         }
 
-    def build_component_kernels(self, site_lon, site_lat, dynamics_t, device, dtype):
+    def _oriented_base_covariance(self, drift_mean, ell_par, ell_perp, eye2):
+        drift_norm = drift_mean.norm(dim=-1, keepdim=True)
+        default_dir = drift_mean.new_zeros(drift_mean.shape)
+        default_dir[:, 0] = 1.0
+        parallel = torch.where(drift_norm > 1e-6, drift_mean / drift_norm.clamp_min(1e-6), default_dir)
+        perp = torch.stack([-parallel[:, 1], parallel[:, 0]], dim=-1)
+        basis = torch.stack([parallel, perp], dim=-1)
+
+        base_diag = eye2.clone()
+        base_diag[:, 0, 0] = ell_par.square()
+        base_diag[:, 1, 1] = ell_perp.square()
+        base_cov = basis @ base_diag @ basis.transpose(-1, -2)
+        return 0.5 * (base_cov + base_cov.transpose(-1, -2))
+
+    def build_component_kernels(self, site_lon, site_lat, dynamics_t, device, dtype, transition_idx=None):
         batch_size = site_lon.shape[0] if site_lon.ndim > 1 else dynamics_t["mu"].shape[0]
         site_lon, site_lat = self._expand_sites(site_lon, site_lat, batch_size)
         coords = project_lon_lat(site_lon, site_lat)
@@ -363,7 +401,14 @@ class IDEStateSpaceModel(nn.Module):
 
         mu_t, sigma_t = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
         eye2 = torch.eye(2, device=device, dtype=dtype).unsqueeze(0)
-        base_D = eye2.expand(batch_size, -1, -1)
+        if transition_idx is None:
+            ell_par_t = self.ell_par.to(device=device, dtype=dtype).expand(batch_size)
+            ell_perp_t = self.ell_perp.to(device=device, dtype=dtype).expand(batch_size)
+        else:
+            transition_idx = transition_idx.to(device=device, dtype=torch.long).reshape(batch_size)
+            time_params = self._get_time_params(transition_idx[:, None])
+            ell_par_t = time_params["ell_par"][:, 0].to(dtype=dtype)
+            ell_perp_t = time_params["ell_perp"][:, 0].to(dtype=dtype)
 
         kernels = []
         for target_idx in range(self.vec_dim):
@@ -374,7 +419,13 @@ class IDEStateSpaceModel(nn.Module):
                 drift_cov = torch.einsum("ab,nbc,dc->nad", selector, sigma_t, selector)
                 drift_cov = 0.5 * (drift_cov + drift_cov.transpose(-1, -2))
 
-                D = base_D + 2.0 * (self.dt ** 2) * drift_cov + 1e-4 * eye2
+                base_cov = self._oriented_base_covariance(
+                    drift_mean=drift_mean,
+                    ell_par=ell_par_t,
+                    ell_perp=ell_perp_t,
+                    eye2=eye2.expand(batch_size, -1, -1),
+                )
+                D = base_cov + 2.0 * (self.dt ** 2) * drift_cov + 1e-4 * eye2
                 D = self._make_spd(D, min_eig=1e-4)
                 D_inv, logdet = self._inv_and_logdet_2x2(D, min_det=1e-8)
                 drift = self.dt * drift_mean[:, None, None, :]
@@ -396,6 +447,7 @@ class IDEStateSpaceModel(nn.Module):
             dynamics_t=dynamics_t if dynamics_t is not None else self._default_dynamics(batch_size, device, dtype),
             device=device,
             dtype=dtype,
+            transition_idx=transition_idx,
         )
 
         operator = kernels.permute(0, 1, 3, 2, 4).reshape(batch_size, self.state_dim, self.state_dim)

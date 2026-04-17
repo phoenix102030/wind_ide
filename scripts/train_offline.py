@@ -102,6 +102,18 @@ def save_pair_checkpoint(path, mean_model, ide_model, cfg):
     )
 
 
+def save_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg):
+    save_pair_checkpoint(out_dir / "offline_last.pt", mean_model, ide_model, cfg)
+    save_pair_checkpoint(out_dir / "joint_last.pt", mean_model, ide_model, cfg)
+    save_pair_checkpoint(out_dir / "mu_last.pt", mean_model, ide_model, cfg)
+
+
+def save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg):
+    save_pair_checkpoint(out_dir / "offline_best.pt", mean_model, ide_model, cfg)
+    save_pair_checkpoint(out_dir / "joint_best.pt", mean_model, ide_model, cfg)
+    save_pair_checkpoint(out_dir / "mu_best.pt", mean_model, ide_model, cfg)
+
+
 def dataset_sample_span(dataset):
     if hasattr(dataset, "seq_len"):
         return int(dataset.seq_len + dataset.chunk_len)
@@ -297,6 +309,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         total_steps=cfg.get("ide_total_steps", 1),
         param_window=cfg.get("ide_param_window", 12),
         param_mode=cfg.get("ide_param_mode", "absolute"),
+        init_log_ell_par=cfg.get("init_log_ell_par", 0.5),
+        init_log_ell_perp=cfg.get("init_log_ell_perp", 0.0),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),
         init_log_r_obs=cfg.get("init_log_r_obs", -2.0),
         init_log_p0=cfg.get("init_log_p0", 0.0),
@@ -334,6 +348,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
             print(
                 f"[OFFLINE-STAT-ZERO][epoch {epoch}] "
                 f"train={tr:.6f} val={va:.6f} "
+                f"ell_par={float(raw_ide.ell_par.detach().cpu()):.4f} "
+                f"ell_perp={float(raw_ide.ell_perp.detach().cpu()):.4f} "
                 f"damping={float(raw_ide.damping.detach().cpu()):.4f} "
                 f"q_proc={float(raw_ide.q_proc.detach().cpu()):.4f} "
                 f"r_obs={float(raw_ide.r_obs.detach().cpu()):.4f}"
@@ -399,46 +415,9 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     use_advection_in_stat = cfg.get("use_advection_in_stat", True)
 
     for round_idx in range(offline_rounds):
-        for epoch in range(stat_epochs):
-            if ml_train_sampler is not None:
-                ml_train_sampler.set_epoch(round_idx * (stat_epochs + adv_epochs) + epoch)
-
-            tr = train_statistical_one_epoch(
-                mean_model=mean_model,
-                ide_model=ide_model,
-                loader=ml_train_loader,
-                optimizer=stat_opt,
-                device=device,
-                seq_len=seq_len,
-                max_steps=stat_max_steps,
-                noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
-                use_advection=use_advection_in_stat,
-            )
-            va = eval_statistical(
-                mean_model=mean_model,
-                ide_model=ide_model,
-                loader=ml_val_loader,
-                device=device,
-                seq_len=seq_len,
-                max_steps=stat_max_steps,
-                noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
-                use_advection=use_advection_in_stat,
-            )
-
-            raw_ide = unwrap_model(ide_model)
-            if is_main_process():
-                print(
-                    f"[OFFLINE-STAT][round {round_idx} epoch {epoch}] "
-                    f"train={tr['loss']:.6f} val={va['loss']:.6f} "
-                    f"train_nll={tr['nll']:.6f} val_nll={va['nll']:.6f} "
-                    f"damping={float(raw_ide.damping.detach().cpu()):.4f} "
-                    f"q_proc={float(raw_ide.q_proc.detach().cpu()):.4f} "
-                    f"r_obs={float(raw_ide.r_obs.detach().cpu()):.4f}"
-                )
-
         for epoch in range(adv_epochs):
             if ml_train_sampler is not None:
-                ml_train_sampler.set_epoch(round_idx * (stat_epochs + adv_epochs) + stat_epochs + epoch)
+                ml_train_sampler.set_epoch(round_idx * (stat_epochs + adv_epochs) + epoch)
 
             tr = train_advection_one_epoch(
                 mean_model=mean_model,
@@ -472,16 +451,54 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                     f"sigma_trace={tr['sigma_trace']:.6f} "
                     f"sigma_diag_min={tr['sigma_diag_min']:.6f}"
                 )
-
-                save_pair_checkpoint(out_dir / "offline_last.pt", mean_model, ide_model, cfg)
-                save_pair_checkpoint(out_dir / "joint_last.pt", mean_model, ide_model, cfg)
-                save_pair_checkpoint(out_dir / "mu_last.pt", mean_model, ide_model, cfg)
-
+                save_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
                 if va["loss"] < best_offline_val:
                     best_offline_val = va["loss"]
-                    save_pair_checkpoint(out_dir / "offline_best.pt", mean_model, ide_model, cfg)
-                    save_pair_checkpoint(out_dir / "joint_best.pt", mean_model, ide_model, cfg)
-                    save_pair_checkpoint(out_dir / "mu_best.pt", mean_model, ide_model, cfg)
+                    save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
+            maybe_barrier()
+
+        for epoch in range(stat_epochs):
+            if ml_train_sampler is not None:
+                ml_train_sampler.set_epoch(round_idx * (stat_epochs + adv_epochs) + adv_epochs + epoch)
+
+            tr = train_statistical_one_epoch(
+                mean_model=mean_model,
+                ide_model=ide_model,
+                loader=ml_train_loader,
+                optimizer=stat_opt,
+                device=device,
+                seq_len=seq_len,
+                max_steps=stat_max_steps,
+                noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
+                use_advection=use_advection_in_stat,
+            )
+            va = eval_statistical(
+                mean_model=mean_model,
+                ide_model=ide_model,
+                loader=ml_val_loader,
+                device=device,
+                seq_len=seq_len,
+                max_steps=stat_max_steps,
+                noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
+                use_advection=use_advection_in_stat,
+            )
+
+            raw_ide = unwrap_model(ide_model)
+            if is_main_process():
+                print(
+                    f"[OFFLINE-STAT][round {round_idx} epoch {epoch}] "
+                    f"train={tr['loss']:.6f} val={va['loss']:.6f} "
+                    f"train_nll={tr['nll']:.6f} val_nll={va['nll']:.6f} "
+                    f"ell_par={float(raw_ide.ell_par.detach().cpu()):.4f} "
+                    f"ell_perp={float(raw_ide.ell_perp.detach().cpu()):.4f} "
+                    f"damping={float(raw_ide.damping.detach().cpu()):.4f} "
+                    f"q_proc={float(raw_ide.q_proc.detach().cpu()):.4f} "
+                    f"r_obs={float(raw_ide.r_obs.detach().cpu()):.4f}"
+                )
+                save_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
+                if va["loss"] < best_offline_val:
+                    best_offline_val = va["loss"]
+                    save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
             maybe_barrier()
 
     if is_main_process():
