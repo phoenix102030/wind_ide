@@ -1,65 +1,64 @@
 measurement_file: ~/wind_ide/data/measurement/wv_h100_180_offline_imputed.mat
 nwp_file: ~/wind_ide/data/nwp/data_grid_offline.mat
+out_dir: outputs/offline_140m_01
 
 device: cuda
 seed: 42
-dt: 1.0
+num_gpus: 2
+num_workers: 0
+
 normalize_z: true
 normalize_nwp: true
 nwp_input_mode: all12
+val_fraction: 0.2
 
-# seq_len:
-#   advection 网络每次看多少帧 NWP 历史来输出一个时刻的 mu_t / Sigma_t
+# NWP history length used by the advection network.
 seq_len: 24
 
-# ide_param_window:
-#   连续多少个绝对时间步共用一组 IDE 参数
-#   取 1 会退化成每个时刻一套 IDE 参数，通常太自由
-ide_param_window: 4
-ide_param_mode: global
-
-# chunk_len:
-#   每个训练样本里用于 IDE likelihood 的转移步数
-#   stage 2 中每个样本会输出 chunk_len 个 advection 参数
+# Number of future transitions supervised inside each training window.
 chunk_len: 24
 
-# forecast_horizon:
-#   多步验证时递推预测的未来步数
-forecast_horizon: 12
-val_fraction: 0.2
-num_workers: 0
-num_gpus: 2
+# Piecewise-constant IDE parameter sharing over absolute time.
+ide_param_mode: global
+ide_param_window: 4
 
-out_dir: outputs/offline_140m_01
+# Joint training controls.
+batch_size: 128
+epochs: 30
+max_steps: 100
+mean_lr: 0.001
+ide_lr: 0.0002
 
-# IDE stage
-ide_batch_size: 128
-ide_lr: 0.001
-ide_epochs: 0
-ide_max_steps: 100
-skip_ide_warmup: true
-train_ell_params: true
+# Which IDE parameters still participate in joint optimization.
 train_q_proc: true
 train_r_obs: true
 train_damping: true
 train_p0: false
 train_init_mean: false
 
-init_log_q_proc: -2
-init_log_r_obs: -2
-init_log_p0: 0.0
+# IDE parameter ranges / initialization.
+dt: 1.0
+init_log_q_proc: -2.0
+init_log_r_obs: -2.0
 init_log_damping: -2.5
-init_log_ell_par: 0.5
-init_log_ell_perp: 0.0
 q_proc_min: 0.02
 q_proc_max: 0.2
 r_obs_min: 0.02
 r_obs_max: 0.25
 damping_min: 0.02
 damping_max: 0.5
-noise_reg_weight: 0.05
 
-# ML stage
+# Forecast objective weights.
+adv_one_step_weight: 0.25
+adv_rollout_weight: 1.0
+adv_history_len: 6
+step_nll_weight: 0.1
+noise_reg_weight: 0.05
+smoothness_weight: 0.001
+transport_reg_weight: 0.01
+state_bias_reg_weight: 0.001
+
+# Advection network capacity.
 hidden_dim: 32
 embed_dim: 32
 num_heads: 4
@@ -69,34 +68,20 @@ dropout: 0.1
 mu_mode: free
 sigma_mode: network
 
-ml_batch_size: 128
-ml_lr: 0.001
-joint_ide_lr: 0.0002
-ml_epochs: 40
-ml_max_steps: 100
-stat_lr: 0.0001
-smoothness_weight: 0.001
-adv_one_step_weight: 0.25
-adv_rollout_weight: 1.0
-adv_history_len: 6
-step_nll_weight: 0.1
-transport_reg_weight: 0.01
-state_bias_reg_weight: 0.001
+# Advection parameterization.
 mu_scale: 1.25
 chol_offdiag_scale: 0.15
 chol_diag_max: 1.5
 chol_eps: 0.0001
 init_global_sigma_diag: 0.15
+
+# Deterministic base kernel shape.
 init_base_scale_par: 1.0
 init_base_scale_perp: 1.0
 base_scale_min: 0.15
 base_scale_max: 2.5
+
+# Keep the model close to persistence unless transport helps.
 init_transport_gate: 0.05
 transport_gate_max: 0.35
 state_bias_scale: 1.0
-offline_rounds: 3
-joint_epochs: 30
-stat_epochs_per_round: 5
-adv_epochs_per_round: 10
-stat_max_steps: 100
-adv_max_steps: 100

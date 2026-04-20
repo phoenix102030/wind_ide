@@ -267,12 +267,21 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     cfg["nwp_in_channels"] = int(raw_bundle.nwp_uv.shape[1])
     cfg["nwp_anchor_channel_indices"] = list(get_nwp_uv_channel_indices(cfg["nwp_input_mode"], height="140"))
     cfg["ide_param_mode"] = str(cfg.get("ide_param_mode", "absolute")).lower()
-    cfg["skip_ide_warmup"] = bool(cfg.get("skip_ide_warmup", False))
-    cfg["train_ell_params"] = bool(cfg.get("train_ell_params", True))
+    cfg["train_ell_params"] = bool(cfg.get("train_ell_params", False))
     cfg["normalize_z"] = bool(cfg.get("normalize_z", True))
     cfg["normalize_nwp"] = bool(cfg.get("normalize_nwp", True))
     cfg["mu_mode"] = str(cfg.get("mu_mode", "free")).lower()
     cfg["sigma_mode"] = str(cfg.get("sigma_mode", "network")).lower()
+    batch_size = int(cfg.get("batch_size", cfg.get("ml_batch_size", 16)))
+    mean_lr = float(cfg.get("mean_lr", cfg.get("ml_lr", 1e-3)))
+    ide_lr = float(cfg.get("ide_lr", cfg.get("joint_ide_lr", cfg.get("stat_lr", 1e-4))))
+    joint_epochs = int(
+        cfg.get(
+            "epochs",
+            cfg.get("joint_epochs", cfg.get("offline_rounds", 3) * cfg.get("adv_epochs_per_round", cfg.get("ml_epochs", 20))),
+        )
+    )
+    joint_max_steps = cfg.get("max_steps", cfg.get("joint_max_steps", cfg.get("adv_max_steps", cfg.get("ml_max_steps", None))))
     out_dir = Path(cfg.get("out_dir", "outputs/measurement_140m_two_stage"))
     if is_main_process():
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -282,10 +291,13 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print("distributed_world_size:", world_size)
         print(f"advection_seq_len={seq_len}")
         print(f"ide_param_mode={cfg['ide_param_mode']}")
-        print(f"skip_ide_warmup={cfg['skip_ide_warmup']}")
-        print(f"train_ell_params={cfg['train_ell_params']}")
         print(f"ide_param_window={cfg.get('ide_param_window', 12)}")
         print(f"chunk_len={chunk_len}")
+        print(f"batch_size={batch_size}")
+        print(f"epochs={joint_epochs}")
+        print(f"max_steps={joint_max_steps}")
+        print(f"mean_lr={mean_lr}")
+        print(f"ide_lr={ide_lr}")
         print(f"normalize_z={cfg['normalize_z']}")
         print(f"normalize_nwp={cfg['normalize_nwp']}")
         print(f"mu_mode={cfg['mu_mode']}")
@@ -300,7 +312,6 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"init_transport_gate={cfg.get('init_transport_gate', 0.05)}")
         print(f"transport_gate_max={cfg.get('transport_gate_max', 0.35)}")
         print(f"state_bias_scale={cfg.get('state_bias_scale', 1.0)}")
-        print(f"joint_epochs={cfg.get('joint_epochs', cfg.get('offline_rounds', 3) * cfg.get('adv_epochs_per_round', cfg.get('ml_epochs', 20)))}")
         print(f"train_q_proc={cfg.get('train_q_proc', True)}")
         print(f"train_r_obs={cfg.get('train_r_obs', True)}")
         print(f"train_damping={cfg.get('train_damping', True)}")
@@ -323,8 +334,6 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                 "[warning] sigma_mode=global keeps the joint 4x4 advection covariance fixed over time, "
                 "so NWP cannot modulate pairwise kernel shape through Sigma_t."
             )
-        if cfg["skip_ide_warmup"]:
-            print("[note] skip_ide_warmup is ignored in the current joint-training pipeline.")
 
     raw_ml_ds = MLMuDataset(raw_bundle, seq_len=seq_len, chunk_len=chunk_len)
     _, _, raw_ml_split_info = contiguous_time_split(raw_ml_ds, val_fraction=val_fraction)
@@ -429,14 +438,14 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
 
     ml_train_loader, ml_train_sampler = build_loader(
         ml_train_ds,
-        batch_size=cfg.get("ml_batch_size", 16),
+        batch_size=batch_size,
         shuffle=True,
         distributed=distributed,
         num_workers=num_workers,
     )
     ml_val_loader, _ = build_loader(
         ml_val_ds,
-        batch_size=cfg.get("ml_batch_size", 16),
+        batch_size=batch_size,
         shuffle=False,
         distributed=distributed,
         num_workers=num_workers,
@@ -474,8 +483,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     ide_params = [p for p in unwrap_model(ide_model).parameters() if p.requires_grad]
     joint_opt = torch.optim.Adam(
         [
-            {"params": mean_params, "lr": cfg.get("ml_lr", 1e-3)},
-            {"params": ide_params, "lr": cfg.get("joint_ide_lr", cfg.get("stat_lr", 1e-4))},
+            {"params": mean_params, "lr": mean_lr},
+            {"params": ide_params, "lr": ide_lr},
         ]
     )
 
@@ -484,13 +493,6 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print("joint_trainable params:", sum(p.numel() for p in mean_params + ide_params if p.requires_grad))
 
     best_offline_val = float("inf")
-    joint_epochs = int(
-        cfg.get(
-            "joint_epochs",
-            cfg.get("offline_rounds", 3) * cfg.get("adv_epochs_per_round", cfg.get("ml_epochs", 20)),
-        )
-    )
-    joint_max_steps = cfg.get("joint_max_steps", cfg.get("adv_max_steps", cfg.get("ml_max_steps", None)))
 
     for epoch in range(joint_epochs):
         if ml_train_sampler is not None:
