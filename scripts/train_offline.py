@@ -122,10 +122,23 @@ def save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg):
     save_pair_checkpoint(out_dir / "mu_best.pt", mean_model, ide_model, cfg)
 
 
-def configure_ide_trainability(model, train_ell_params=True):
+def configure_ide_trainability(
+    model,
+    train_ell_params=True,
+    train_q_proc=True,
+    train_r_obs=True,
+    train_p0=True,
+    train_damping=True,
+    train_init_mean=True,
+):
     del train_ell_params
     model.log_ell_par_knots.requires_grad_(False)
     model.log_ell_perp_knots.requires_grad_(False)
+    model.log_q_proc_knots.requires_grad_(bool(train_q_proc))
+    model.log_r_obs_knots.requires_grad_(bool(train_r_obs))
+    model.log_p0_knots.requires_grad_(bool(train_p0))
+    model.log_damping_knots.requires_grad_(bool(train_damping))
+    model.init_mean_knots.requires_grad_(bool(train_init_mean))
 
 
 def dataset_sample_span(dataset):
@@ -284,6 +297,12 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"adv_history_len={cfg.get('adv_history_len', 6)}")
         print(f"adv_one_step_weight={cfg.get('adv_one_step_weight', 0.25)}")
         print(f"adv_rollout_weight={cfg.get('adv_rollout_weight', 1.0)}")
+        print(f"use_advection_in_stat={cfg.get('use_advection_in_stat', True)}")
+        print(f"train_q_proc_in_stat={cfg.get('train_q_proc_in_stat', False)}")
+        print(f"train_r_obs_in_stat={cfg.get('train_r_obs_in_stat', False)}")
+        print(f"train_damping_in_stat={cfg.get('train_damping_in_stat', True)}")
+        print(f"train_p0_in_stat={cfg.get('train_p0_in_stat', True)}")
+        print(f"train_init_mean_in_stat={cfg.get('train_init_mean_in_stat', True)}")
         if cfg["nwp_input_mode"] != "all12":
             print(
                 "[warning] nwp_input_mode!=all12 means the advection net only sees wind U/V channels "
@@ -398,7 +417,15 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         damping_min=cfg.get("damping_min", math.exp(-4.0)),
         damping_max=cfg.get("damping_max", 1.0),
     ).to(device)
-    configure_ide_trainability(ide_model, train_ell_params=cfg["train_ell_params"])
+    configure_ide_trainability(
+        ide_model,
+        train_ell_params=cfg["train_ell_params"],
+        train_q_proc=cfg.get("train_q_proc_in_stat", False),
+        train_r_obs=cfg.get("train_r_obs_in_stat", False),
+        train_p0=cfg.get("train_p0_in_stat", True),
+        train_damping=cfg.get("train_damping_in_stat", True),
+        train_init_mean=cfg.get("train_init_mean_in_stat", True),
+    )
     ide_model = maybe_wrap_ddp(ide_model, device, distributed)
     ide_opt = torch.optim.Adam(
         [p for p in unwrap_model(ide_model).parameters() if p.requires_grad],

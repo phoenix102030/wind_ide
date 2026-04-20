@@ -87,4 +87,9 @@ stat_epochs_per_round: 5
 adv_epochs_per_round: 10
 stat_max_steps: 100
 adv_max_steps: 100
-use_advection_in_stat: false
+use_advection_in_stat: true
+train_q_proc_in_stat: false
+train_r_obs_in_stat: false
+train_damping_in_stat: true
+train_p0_in_stat: true
+train_init_mean_in_stat: true

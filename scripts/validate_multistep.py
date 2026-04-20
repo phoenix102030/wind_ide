@@ -273,7 +273,7 @@ def main():
             dynamics_hist=dynamics_hist,
             dynamics_future=dynamics_future,
             start_idx=torch.tensor([start + context_len - 1], device=device),
-        )[0].cpu().numpy()
+        )[0].detach().cpu().numpy()
         if not np.isfinite(pred).all():
             nonfinite_windows.append(int(start))
         truth = y_future_np
