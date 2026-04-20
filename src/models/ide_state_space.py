@@ -396,6 +396,36 @@ class IDEStateSpaceModel(nn.Module):
         logdet = torch.log(det)
         return inv, logdet
 
+    def _symmetrize(self, matrix):
+        matrix = 0.5 * (matrix + matrix.transpose(-1, -2))
+        return torch.nan_to_num(matrix, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    def _stabilize_psd(self, matrix, eye, base_jitter=1e-6, max_tries=8):
+        stabilized = self._symmetrize(matrix)
+        jitter = float(base_jitter)
+        chol = None
+        for _ in range(max_tries):
+            candidate = stabilized + jitter * eye
+            chol, info = torch.linalg.cholesky_ex(candidate)
+            if int(info.max().item()) == 0:
+                return candidate, chol
+            jitter *= 10.0
+
+        # Final fallback keeps validation alive even if covariance has badly drifted.
+        evals, evecs = torch.linalg.eigh(stabilized)
+        clipped = evals.clamp_min(jitter)
+        candidate = evecs @ torch.diag_embed(clipped) @ evecs.transpose(-1, -2)
+        candidate = self._symmetrize(candidate)
+        chol = torch.linalg.cholesky(candidate + 1e-6 * eye)
+        return candidate + 1e-6 * eye, chol
+
+    def _innovation_inverse_and_logdet(self, P, Rm_t, eye):
+        S_mat = P + Rm_t
+        S_mat, chol = self._stabilize_psd(S_mat, eye, base_jitter=1e-5)
+        S_inv = torch.cholesky_inverse(chol)
+        logdet = 2.0 * torch.log(torch.diagonal(chol, dim1=-2, dim2=-1)).sum(dim=-1)
+        return S_mat, S_inv, logdet
+
     def _prepare_start_idx(self, start_idx, batch_size, device):
         if start_idx is None:
             return torch.zeros(batch_size, dtype=torch.long, device=device)
@@ -489,7 +519,7 @@ class IDEStateSpaceModel(nn.Module):
             kernels.append(torch.stack(row_kernels, dim=1))
         return torch.stack(kernels, dim=1)
 
-    def build_transition_matrix(self, site_lon, site_lat, dynamics_t, transition_idx, device, dtype):
+    def build_transition_matrix(self, site_lon, site_lat, dynamics_t, transition_idx, device, dtype, apply_damping=True):
         transition_idx = transition_idx.to(device=device, dtype=torch.long).reshape(-1)
         batch_size = transition_idx.shape[0]
         kernels = self.build_component_kernels(
@@ -513,7 +543,7 @@ class IDEStateSpaceModel(nn.Module):
 
         # `operator` is already a discrete transport map because each kernel row is normalized.
         # Applying Euler again as I + dt * (operator - gamma I) makes the constant mode unstable.
-        survival_t = 1.0 - self.dt * damping_t
+        survival_t = 1.0 - self.dt * damping_t if apply_damping else torch.ones_like(damping_t)
         A = survival_t[:, None, None] * operator
         Q = q_proc_t[:, None, None].square() * eye
         return A, Q
@@ -567,17 +597,14 @@ class IDEStateSpaceModel(nn.Module):
             z_t = z[:, t]
             Rm_t = r_obs_seq[:, t][:, None, None].square() * eye
             innov = z_t - m
-            S_mat = P + Rm_t + 1e-5 * eye
-
-            S_inv = torch.linalg.inv(S_mat)
-            _, logdet = torch.linalg.slogdet(S_mat)
+            S_mat, S_inv, logdet = self._innovation_inverse_and_logdet(P, Rm_t, eye)
             maha = torch.einsum("bi,bij,bj->b", innov, S_inv, innov)
             total_nll = total_nll + 0.5 * (logdet + maha + self.state_dim * math.log(2 * math.pi)).mean()
 
             K_gain = P @ S_inv
             m = m + torch.einsum("bij,bj->bi", K_gain, innov)
             I_K = eye - K_gain
-            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2)
+            P = self._symmetrize(I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2))
 
             if t == steps - 1:
                 continue
@@ -585,7 +612,7 @@ class IDEStateSpaceModel(nn.Module):
             dynamics_t = self._dynamics_at_t(dynamics_seq, t, batch_size, device, dtype)
             A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, trans_idx[:, t], device, dtype)
             m = torch.einsum("bij,bj->bi", A, m)
-            P = A @ P @ A.transpose(-1, -2) + Q
+            P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q)
 
         return total_nll / max(steps, 1)
 
@@ -607,18 +634,17 @@ class IDEStateSpaceModel(nn.Module):
             z_t = z[:, t]
             Rm_t = r_obs_seq[:, t][:, None, None].square() * eye
             innov = z_t - m
-            S_mat = P + Rm_t + 1e-5 * eye
-            S_inv = torch.linalg.inv(S_mat)
+            _, S_inv, _ = self._innovation_inverse_and_logdet(P, Rm_t, eye)
 
             K_gain = P @ S_inv
             m = m + torch.einsum("bij,bj->bi", K_gain, innov)
             I_K = eye - K_gain
-            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2)
+            P = self._symmetrize(I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2))
 
             dynamics_t = self._dynamics_at_t(dynamics_seq, t, batch_size, device, dtype)
             A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, trans_idx[:, t], device, dtype)
             m = torch.einsum("bij,bj->bi", A, m)
-            P = A @ P @ A.transpose(-1, -2) + Q
+            P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q)
             preds.append(m.reshape(batch_size, self.num_sites, self.vec_dim))
 
         return torch.stack(preds, dim=1)
@@ -643,18 +669,25 @@ class IDEStateSpaceModel(nn.Module):
             z_t = z[:, t]
             Rm_t = r_obs_seq[:, t][:, None, None].square() * eye
             innov = z_t - m
-            S_mat = P + Rm_t + 1e-5 * eye
-            S_inv = torch.linalg.inv(S_mat)
+            _, S_inv, _ = self._innovation_inverse_and_logdet(P, Rm_t, eye)
 
             K_gain = P @ S_inv
             m = m + torch.einsum("bij,bj->bi", K_gain, innov)
             I_K = eye - K_gain
-            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2)
+            P = self._symmetrize(I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2))
 
             dynamics_t = self._dynamics_at_t(dynamics_seq, t, batch_size, device, dtype)
-            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, trans_idx[:, t], device, dtype)
+            A, Q = self.build_transition_matrix(
+                site_lon,
+                site_lat,
+                dynamics_t,
+                trans_idx[:, t],
+                device,
+                dtype,
+                apply_damping=False,
+            )
             m = torch.einsum("bij,bj->bi", A, m)
-            P = A @ P @ A.transpose(-1, -2) + Q
+            P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q)
 
         return m.reshape(batch_size, self.num_sites, self.vec_dim)
 
@@ -680,13 +713,12 @@ class IDEStateSpaceModel(nn.Module):
             z_t = z[:, t]
             Rm_t = r_obs_seq[:, t][:, None, None].square() * eye
             innov = z_t - m
-            S_mat = P + Rm_t + 1e-5 * eye
-            S_inv = torch.linalg.inv(S_mat)
+            _, S_inv, _ = self._innovation_inverse_and_logdet(P, Rm_t, eye)
 
             K_gain = P @ S_inv
             m = m + torch.einsum("bij,bj->bi", K_gain, innov)
             I_K = eye - K_gain
-            P = I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2)
+            P = self._symmetrize(I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2))
 
             if t == steps - 1:
                 continue
@@ -694,7 +726,7 @@ class IDEStateSpaceModel(nn.Module):
             dynamics_t = self._dynamics_at_t(dynamics_hist, t, batch_size, device, dtype)
             A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, hist_trans_idx[:, t], device, dtype)
             m = torch.einsum("bij,bj->bi", A, m)
-            P = A @ P @ A.transpose(-1, -2) + Q
+            P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q)
 
         preds = []
         horizon = dynamics_future["mu"].shape[1]
@@ -703,9 +735,17 @@ class IDEStateSpaceModel(nn.Module):
                 "mu": dynamics_future["mu"][:, h],
                 "sigma": dynamics_future["sigma"][:, h],
             }
-            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, future_trans_idx[:, h], device, dtype)
+            A, Q = self.build_transition_matrix(
+                site_lon,
+                site_lat,
+                dynamics_t,
+                future_trans_idx[:, h],
+                device,
+                dtype,
+                apply_damping=False,
+            )
             m = torch.einsum("bij,bj->bi", A, m)
-            P = A @ P @ A.transpose(-1, -2) + Q + 1e-5 * eye
+            P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q + 1e-5 * eye)
             preds.append(m.reshape(batch_size, self.num_sites, self.vec_dim))
 
         return torch.stack(preds, dim=1)

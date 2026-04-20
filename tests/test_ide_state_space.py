@@ -151,6 +151,36 @@ def test_transition_matrix_contracts_constant_mode_for_row_stochastic_operator()
     assert torch.allclose(propagated, expected, atol=1e-5)
 
 
+def test_transition_matrix_can_skip_damping_for_open_loop_forecast():
+    model = IDEStateSpaceModel(
+        num_sites=3,
+        dt=1.0,
+        total_steps=4,
+        param_window=1,
+        damping_min=1e-6,
+        damping_max=1.0,
+    )
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+
+    with torch.no_grad():
+        model.log_damping_knots.fill_(torch.log(torch.tensor(0.8)).item())
+
+    A, _ = model.build_transition_matrix(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t={"mu": torch.zeros(1, 4), "sigma": torch.zeros(1, 4, 4)},
+        transition_idx=torch.tensor([0]),
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+        apply_damping=False,
+    )
+
+    ones = torch.ones(1, model.state_dim, 1, dtype=site_lon.dtype)
+    propagated = A @ ones
+    assert torch.allclose(propagated, ones, atol=1e-5)
+
+
 def test_component_kernels_remain_finite_for_large_joint_sigma():
     model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
     site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
@@ -274,6 +304,46 @@ def test_forecast_multistep_runs_with_dynamic_advection_only():
     )
 
     assert pred.shape == (2, 3, 3, 2)
+
+
+def test_forecast_multistep_remains_finite_with_nearly_singular_filter_covariance():
+    model = IDEStateSpaceModel(
+        num_sites=3,
+        total_steps=16,
+        param_window=2,
+        q_proc_min=1e-8,
+        q_proc_max=1e-6,
+        r_obs_min=1e-8,
+        r_obs_max=1e-6,
+    )
+    with torch.no_grad():
+        model.log_q_proc_knots.fill_(math.log(1e-6))
+        model.log_r_obs_knots.fill_(math.log(1e-6))
+        model.log_p0_knots.fill_(math.log(1e-6))
+
+    z_hist = torch.zeros(1, 6, 3, 2)
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+    dynamics_hist = {
+        "mu": torch.zeros(1, 5, 4),
+        "sigma": torch.zeros(1, 5, 4, 4),
+    }
+    dynamics_future = {
+        "mu": torch.zeros(1, 3, 4),
+        "sigma": torch.zeros(1, 3, 4, 4),
+    }
+
+    pred = model.forecast_multistep(
+        z_hist=z_hist,
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_hist=dynamics_hist,
+        dynamics_future=dynamics_future,
+        start_idx=torch.tensor([0]),
+    )
+
+    assert torch.isfinite(pred).all()
+
 
 
 def test_time_varying_ide_params_follow_absolute_index():

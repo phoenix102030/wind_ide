@@ -52,6 +52,13 @@ def parse_args():
 
 def reconstruct_models(ckpt, device):
     cfg = ckpt["config"]
+    ide_state = ckpt["ide_model_state"] if "ide_model_state" in ckpt else ckpt["model_state"]
+    if "log_damping" in ide_state or "coupling_raw" in ide_state:
+        print(
+            "[warning] This checkpoint was trained with a legacy IDE parameterization. "
+            "It can be loaded for compatibility, but multistep behavior may be poor after the "
+            "pair-kernel refactor until the model is retrained."
+        )
     ide_model = IDEStateSpaceModel(
         dt=cfg.get("dt", 1.0),
         total_steps=cfg.get("ide_total_steps", 1),
@@ -70,7 +77,7 @@ def reconstruct_models(ckpt, device):
         damping_min=cfg.get("damping_min", math.exp(-4.0)),
         damping_max=cfg.get("damping_max", 1.0),
     ).to(device)
-    ide_model.load_state_dict(ckpt["ide_model_state"] if "ide_model_state" in ckpt else ckpt["model_state"])
+    ide_model.load_state_dict(ide_state)
     ide_model.eval()
 
     mean_model = None
@@ -100,14 +107,28 @@ def reconstruct_models(ckpt, device):
 
 
 def scalar_metrics(y_true, y_pred):
-    err = y_pred - y_true
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if mask.sum() == 0:
+        return {
+            "mae": np.nan,
+            "rmse": np.nan,
+            "corr": np.nan,
+            "valid_fraction": 0.0,
+            "n_valid": 0,
+        }
+
+    yt = y_true[mask]
+    yp = y_pred[mask]
+    err = yp - yt
     corr = np.nan
-    if y_true.size > 1 and np.std(y_true) > 0 and np.std(y_pred) > 0:
-        corr = float(np.corrcoef(y_true, y_pred)[0, 1])
+    if yt.size > 1 and np.std(yt) > 0 and np.std(yp) > 0:
+        corr = float(np.corrcoef(yt, yp)[0, 1])
     return {
         "mae": float(np.mean(np.abs(err))),
         "rmse": float(np.sqrt(np.mean(err ** 2))),
         "corr": corr,
+        "valid_fraction": float(mask.mean()),
+        "n_valid": int(mask.sum()),
     }
 
 
@@ -218,6 +239,7 @@ def main():
     model_preds = [[] for _ in range(horizon)]
     pers_preds = [[] for _ in range(horizon)]
     sample_payload = None
+    nonfinite_windows = []
 
     for start in range(max_windows):
         z_hist_np = bundle.z_meas[start + context_len - 1:start + context_len + args.history_len]
@@ -248,6 +270,8 @@ def main():
             dynamics_future=dynamics_future,
             start_idx=torch.tensor([start + context_len - 1], device=device),
         )[0].cpu().numpy()
+        if not np.isfinite(pred).all():
+            nonfinite_windows.append(int(start))
         truth = y_future_np
         persistence = np.repeat(z_hist_np[-1:], horizon, axis=0)
         if norm_stats is not None:
@@ -291,6 +315,8 @@ def main():
                 "history_len": args.history_len,
                 "horizon": horizon,
                 "num_windows": max_windows,
+                "nonfinite_window_count": len(nonfinite_windows),
+                "first_nonfinite_windows": nonfinite_windows[:20],
                 "seq_len": seq_len,
                 "metrics_by_horizon": metrics_by_horizon,
                 "overall": {
@@ -312,6 +338,11 @@ def main():
         )
 
     print(f"history_len={args.history_len} horizon={horizon} windows={max_windows}")
+    if nonfinite_windows:
+        print(
+            f"[warning] non-finite model forecasts occurred in {len(nonfinite_windows)} windows; "
+            f"first few starts: {nonfinite_windows[:10]}"
+        )
     for h in range(1, horizon + 1):
         model_rmse = metrics_by_horizon[h]["model"]["overall"]["WS"]["rmse"]
         pers_rmse = metrics_by_horizon[h]["persistence"]["overall"]["WS"]["rmse"]
