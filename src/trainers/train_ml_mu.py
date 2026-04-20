@@ -27,6 +27,8 @@ def build_dynamics_sequence(mean_model, nwp_seq_full, seq_len, start_at=None):
     nwp_seq_full: [B, seq_len+chunk_len-1, 6, Y, X]
     returns:
         mu:            [B, chunk_len, 4]
+        transport_gates:[B, chunk_len, 2]
+        state_bias:    [B, chunk_len, state_dim]
         sigma:         [B, chunk_len, 4, 4]
     """
     if start_at is None:
@@ -40,21 +42,25 @@ def build_dynamics_sequence(mean_model, nwp_seq_full, seq_len, start_at=None):
     return {
         "mu": torch.stack([out["mu"] for out in outputs], dim=1),
         "base_scales": torch.stack([out["base_scales"] for out in outputs], dim=1),
+        "transport_gates": torch.stack([out["transport_gates"] for out in outputs], dim=1),
+        "state_bias": torch.stack([out["state_bias"] for out in outputs], dim=1),
         "sigma": torch.stack([out["sigma"] for out in outputs], dim=1),
     }
 
 
-def zero_dynamics_sequence(batch_size, chunk_len, device, dtype):
+def zero_dynamics_sequence(batch_size, chunk_len, device, dtype, state_dim=6):
     return {
         "mu": torch.zeros(batch_size, chunk_len, 4, device=device, dtype=dtype),
         "base_scales": torch.ones(batch_size, chunk_len, 2, device=device, dtype=dtype),
+        "transport_gates": torch.zeros(batch_size, chunk_len, 2, device=device, dtype=dtype),
+        "state_bias": torch.zeros(batch_size, chunk_len, state_dim, device=device, dtype=dtype),
         "sigma": torch.zeros(batch_size, chunk_len, 4, 4, device=device, dtype=dtype),
     }
 
 
 def dynamics_smoothness_penalty(dynamics_seq):
     penalty = 0.0
-    for name in ("mu", "base_scales", "sigma"):
+    for name in ("mu", "base_scales", "transport_gates", "state_bias", "sigma"):
         tensor = dynamics_seq[name]
         if tensor.shape[1] <= 1:
             continue
@@ -98,6 +104,16 @@ def base_scale_anisotropy_summary(dynamics_seq):
     return float(ratio.mean().detach().cpu())
 
 
+def transport_gate_summary(dynamics_seq):
+    gates = dynamics_seq["transport_gates"]
+    return float(gates.mean().detach().cpu())
+
+
+def state_bias_summary(dynamics_seq):
+    bias = dynamics_seq["state_bias"]
+    return float(bias.abs().mean().detach().cpu())
+
+
 def sigma_offdiag_summary(dynamics_seq):
     sigma = dynamics_seq["sigma"]
     diag = torch.diagonal(sigma, dim1=-2, dim2=-1)
@@ -118,6 +134,7 @@ def _aligned_inputs(batch, seq_len, mean_model=None):
             chunk_len=chunk_len,
             device=z_full.device,
             dtype=z_full.dtype,
+            state_dim=z_full.shape[-2] * z_full.shape[-1],
         )
     else:
         dynamics_seq = build_dynamics_sequence(mean_model, nwp_full, seq_len=seq_len)
@@ -164,6 +181,8 @@ def _advection_prediction_loss(
     one_step_weight,
     rollout_weight,
     rollout_history,
+    transport_reg_weight,
+    state_bias_reg_weight,
 ):
     raw_ide = unwrap_model(ide_model)
 
@@ -200,12 +219,22 @@ def _advection_prediction_loss(
     rollout = _prediction_mse(rollout_pred, rollout_target)
 
     smoothness = dynamics_smoothness_penalty(dynamics_seq)
-    loss = one_step_weight * one_step + rollout_weight * rollout + smoothness_weight * smoothness
+    transport_reg = dynamics_seq["transport_gates"].square().mean()
+    state_bias_reg = dynamics_seq["state_bias"].square().mean()
+    loss = (
+        one_step_weight * one_step
+        + rollout_weight * rollout
+        + smoothness_weight * smoothness
+        + transport_reg_weight * transport_reg
+        + state_bias_reg_weight * state_bias_reg
+    )
     return loss, {
         "loss": float(loss.detach().cpu()),
         "one_step_mse": float(one_step.detach().cpu()),
         "rollout_mse": float(rollout.detach().cpu()),
         "smoothness": float(smoothness.detach().cpu()),
+        "transport_reg": float(transport_reg.detach().cpu()),
+        "state_bias_reg": float(state_bias_reg.detach().cpu()),
         "sigma_mean": sigma_summary(dynamics_seq),
         "sigma_trace": sigma_trace_summary(dynamics_seq),
         "sigma_diag_min": sigma_diag_min_summary(dynamics_seq),
@@ -214,6 +243,8 @@ def _advection_prediction_loss(
         "mu_abs_mean": mu_abs_summary(dynamics_seq),
         "base_scale_mean": base_scale_summary(dynamics_seq),
         "base_scale_anisotropy": base_scale_anisotropy_summary(dynamics_seq),
+        "transport_gate_mean": transport_gate_summary(dynamics_seq),
+        "state_bias_abs_mean": state_bias_summary(dynamics_seq),
     }
 
 
@@ -326,6 +357,8 @@ def train_advection_one_epoch(
     one_step_weight=0.25,
     rollout_weight=1.0,
     rollout_history=6,
+    transport_reg_weight=1e-2,
+    state_bias_reg_weight=1e-3,
 ):
     mean_model.train()
     ide_model.eval()
@@ -335,6 +368,8 @@ def train_advection_one_epoch(
         "one_step_mse": [],
         "rollout_mse": [],
         "smoothness": [],
+        "transport_reg": [],
+        "state_bias_reg": [],
         "sigma_mean": [],
         "sigma_trace": [],
         "sigma_diag_min": [],
@@ -343,6 +378,8 @@ def train_advection_one_epoch(
         "mu_abs_mean": [],
         "base_scale_mean": [],
         "base_scale_anisotropy": [],
+        "transport_gate_mean": [],
+        "state_bias_abs_mean": [],
     }
 
     for step, batch in enumerate(loader):
@@ -364,6 +401,8 @@ def train_advection_one_epoch(
             one_step_weight=one_step_weight,
             rollout_weight=rollout_weight,
             rollout_history=rollout_history,
+            transport_reg_weight=transport_reg_weight,
+            state_bias_reg_weight=state_bias_reg_weight,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(mean_model.parameters(), 1.0)
@@ -389,6 +428,8 @@ def eval_advection(
     one_step_weight=0.25,
     rollout_weight=1.0,
     rollout_history=6,
+    transport_reg_weight=1e-2,
+    state_bias_reg_weight=1e-3,
 ):
     mean_model.eval()
     ide_model.eval()
@@ -398,6 +439,8 @@ def eval_advection(
         "one_step_mse": [],
         "rollout_mse": [],
         "smoothness": [],
+        "transport_reg": [],
+        "state_bias_reg": [],
         "sigma_mean": [],
         "sigma_trace": [],
         "sigma_diag_min": [],
@@ -406,6 +449,8 @@ def eval_advection(
         "mu_abs_mean": [],
         "base_scale_mean": [],
         "base_scale_anisotropy": [],
+        "transport_gate_mean": [],
+        "state_bias_abs_mean": [],
     }
 
     for step, batch in enumerate(loader):
@@ -426,6 +471,8 @@ def eval_advection(
             one_step_weight=one_step_weight,
             rollout_weight=rollout_weight,
             rollout_history=rollout_history,
+            transport_reg_weight=transport_reg_weight,
+            state_bias_reg_weight=state_bias_reg_weight,
         )
         for key in metrics:
             metrics[key].append(stats[key])

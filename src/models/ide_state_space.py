@@ -313,6 +313,8 @@ class IDEStateSpaceModel(nn.Module):
         return {
             "mu": torch.zeros(batch_size, self.mu_dim, device=device, dtype=dtype),
             "base_scales": torch.ones(batch_size, 2, device=device, dtype=dtype),
+            "transport_gates": torch.zeros(batch_size, self.vec_dim, device=device, dtype=dtype),
+            "state_bias": torch.zeros(batch_size, self.state_dim, device=device, dtype=dtype),
             "sigma": torch.zeros(batch_size, self.mu_dim, self.mu_dim, device=device, dtype=dtype),
         }
 
@@ -350,7 +352,29 @@ class IDEStateSpaceModel(nn.Module):
         else:
             base_scales = base_scales.to(device=device, dtype=dtype).reshape(batch_size, 2)
         base_scales = torch.nan_to_num(base_scales, nan=1.0, posinf=10.0, neginf=1e-3).clamp_min(1e-3)
-        return mu, sigma, base_scales
+        transport_gates = dynamics_t.get("transport_gates", None)
+        if transport_gates is None:
+            transport_gates = torch.zeros(batch_size, self.vec_dim, device=device, dtype=dtype)
+        else:
+            transport_gates = transport_gates.to(device=device, dtype=dtype)
+            if transport_gates.shape[-1] == 1:
+                transport_gates = transport_gates.expand(batch_size, self.vec_dim)
+            transport_gates = transport_gates.reshape(batch_size, self.vec_dim)
+        transport_gates = torch.nan_to_num(transport_gates, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+        state_bias = dynamics_t.get("state_bias", None)
+        if state_bias is None:
+            state_bias = torch.zeros(batch_size, self.state_dim, device=device, dtype=dtype)
+        else:
+            state_bias = state_bias.to(device=device, dtype=dtype)
+            if state_bias.shape[-1] == self.vec_dim:
+                state_bias = state_bias.repeat(1, self.num_sites)
+            state_bias = state_bias.reshape(batch_size, self.state_dim)
+        state_bias = torch.nan_to_num(state_bias, nan=0.0, posinf=1e3, neginf=-1e3)
+        return mu, sigma, base_scales, transport_gates, state_bias
+
+    def _state_transport_gates(self, transport_gates):
+        return transport_gates.repeat(1, self.num_sites)
 
     def _split_mu_pairs(self, mu):
         return mu.reshape(mu.shape[0], self.num_advections, self.advection_dim)
@@ -525,7 +549,7 @@ class IDEStateSpaceModel(nn.Module):
         site_lon, site_lat = self._expand_sites(site_lon, site_lat, batch_size)
         coords = project_lon_lat(site_lon, site_lat)
 
-        mu_t, sigma_t, base_scales = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
+        mu_t, sigma_t, base_scales, _, _ = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
         mu_pairs = self._split_mu_pairs(mu_t)
         sigma_blocks = self._split_sigma_blocks(sigma_t)
 
@@ -563,17 +587,24 @@ class IDEStateSpaceModel(nn.Module):
         row_mass = operator.abs().sum(dim=-1, keepdim=True).clamp_min(1.0)
         operator = operator / row_mass
         eye = torch.eye(self.state_dim, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
+        _, _, _, transport_gates, state_bias = self._parse_dynamics(
+            dynamics_t if dynamics_t is not None else self._default_dynamics(batch_size, device, dtype),
+            batch_size,
+            device,
+            dtype,
+        )
 
         time_params = self._get_time_params(transition_idx[:, None])
         damping_t = time_params["damping"][:, 0].to(dtype=dtype)
         q_proc_t = time_params["q_proc"][:, 0].to(dtype=dtype)
 
-        # `operator` is already a discrete transport map because each kernel row is normalized.
-        # Applying Euler again as I + dt * (operator - gamma I) makes the constant mode unstable.
+        # Keep persistence as the trunk: when transport_gates=0 the transition is exactly identity.
         survival_t = 1.0 - self.dt * damping_t if apply_damping else torch.ones_like(damping_t)
-        A = survival_t[:, None, None] * operator
+        transport_target = survival_t[:, None, None] * operator
+        row_gates = self._state_transport_gates(transport_gates)[:, :, None]
+        A = eye + row_gates * (transport_target - eye)
         Q = q_proc_t[:, None, None].square() * eye
-        return A, Q
+        return A, Q, state_bias
 
     def _dynamics_at_t(self, dynamics_seq, t, batch_size, device, dtype):
         if dynamics_seq is None:
@@ -581,6 +612,8 @@ class IDEStateSpaceModel(nn.Module):
         return {
             "mu": dynamics_seq["mu"][:, t],
             "base_scales": dynamics_seq["base_scales"][:, t] if "base_scales" in dynamics_seq else None,
+            "transport_gates": dynamics_seq["transport_gates"][:, t] if "transport_gates" in dynamics_seq else None,
+            "state_bias": dynamics_seq["state_bias"][:, t] if "state_bias" in dynamics_seq else None,
             "sigma": dynamics_seq["sigma"][:, t],
         }
 
@@ -638,8 +671,8 @@ class IDEStateSpaceModel(nn.Module):
                 continue
 
             dynamics_t = self._dynamics_at_t(dynamics_seq, t, batch_size, device, dtype)
-            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, trans_idx[:, t], device, dtype)
-            m = torch.einsum("bij,bj->bi", A, m)
+            A, Q, b = self.build_transition_matrix(site_lon, site_lat, dynamics_t, trans_idx[:, t], device, dtype)
+            m = torch.einsum("bij,bj->bi", A, m) + b
             P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q)
 
         return total_nll / max(steps, 1)
@@ -669,8 +702,8 @@ class IDEStateSpaceModel(nn.Module):
             P = self._symmetrize(I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2))
 
             dynamics_t = self._dynamics_at_t(dynamics_seq, t, batch_size, device, dtype)
-            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, trans_idx[:, t], device, dtype)
-            m = torch.einsum("bij,bj->bi", A, m)
+            A, Q, b = self.build_transition_matrix(site_lon, site_lat, dynamics_t, trans_idx[:, t], device, dtype)
+            m = torch.einsum("bij,bj->bi", A, m) + b
             P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q)
             preds.append(m.reshape(batch_size, self.num_sites, self.vec_dim))
 
@@ -703,7 +736,7 @@ class IDEStateSpaceModel(nn.Module):
             P = self._symmetrize(I_K @ P @ I_K.transpose(-1, -2) + K_gain @ Rm_t @ K_gain.transpose(-1, -2))
 
             dynamics_t = self._dynamics_at_t(dynamics_seq, t, batch_size, device, dtype)
-            A, Q = self.build_transition_matrix(
+            A, Q, b = self.build_transition_matrix(
                 site_lon,
                 site_lat,
                 dynamics_t,
@@ -712,7 +745,7 @@ class IDEStateSpaceModel(nn.Module):
                 dtype,
                 apply_damping=False,
             )
-            m = torch.einsum("bij,bj->bi", A, m)
+            m = torch.einsum("bij,bj->bi", A, m) + b
             P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q)
 
         return m.reshape(batch_size, self.num_sites, self.vec_dim)
@@ -749,8 +782,8 @@ class IDEStateSpaceModel(nn.Module):
                 continue
 
             dynamics_t = self._dynamics_at_t(dynamics_hist, t, batch_size, device, dtype)
-            A, Q = self.build_transition_matrix(site_lon, site_lat, dynamics_t, hist_trans_idx[:, t], device, dtype)
-            m = torch.einsum("bij,bj->bi", A, m)
+            A, Q, b = self.build_transition_matrix(site_lon, site_lat, dynamics_t, hist_trans_idx[:, t], device, dtype)
+            m = torch.einsum("bij,bj->bi", A, m) + b
             P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q)
 
         preds = []
@@ -759,9 +792,11 @@ class IDEStateSpaceModel(nn.Module):
             dynamics_t = {
                 "mu": dynamics_future["mu"][:, h],
                 "base_scales": dynamics_future["base_scales"][:, h] if "base_scales" in dynamics_future else None,
+                "transport_gates": dynamics_future["transport_gates"][:, h] if "transport_gates" in dynamics_future else None,
+                "state_bias": dynamics_future["state_bias"][:, h] if "state_bias" in dynamics_future else None,
                 "sigma": dynamics_future["sigma"][:, h],
             }
-            A, Q = self.build_transition_matrix(
+            A, Q, b = self.build_transition_matrix(
                 site_lon,
                 site_lat,
                 dynamics_t,
@@ -770,7 +805,7 @@ class IDEStateSpaceModel(nn.Module):
                 dtype,
                 apply_damping=False,
             )
-            m = torch.einsum("bij,bj->bi", A, m)
+            m = torch.einsum("bij,bj->bi", A, m) + b
             P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q + 1e-5 * eye)
             preds.append(m.reshape(batch_size, self.num_sites, self.vec_dim))
 

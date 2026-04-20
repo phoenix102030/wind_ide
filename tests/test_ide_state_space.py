@@ -48,7 +48,7 @@ def test_transition_matrix_uses_pair_specific_kernels():
         device=site_lon.device,
         dtype=site_lon.dtype,
     )
-    A, Q = model.build_transition_matrix(
+    A, Q, b = model.build_transition_matrix(
         site_lon=site_lon,
         site_lat=site_lat,
         dynamics_t=dynamics_t,
@@ -60,6 +60,7 @@ def test_transition_matrix_uses_pair_specific_kernels():
     assert kernels.shape == (1, 2, 2, 3, 3)
     assert A.shape == (1, 6, 6)
     assert Q.shape == (1, 6, 6)
+    assert b.shape == (1, 6)
     assert not torch.allclose(kernels[:, 0, 0], kernels[:, 1, 1])
     assert not torch.allclose(kernels[:, 0, 1], kernels[:, 1, 0])
     assert torch.all(Q.diagonal(dim1=-2, dim2=-1) > 0)
@@ -103,10 +104,14 @@ def test_transition_matrix_respects_site_component_state_order():
         model.log_damping_knots.fill_(-20.0)
 
     model.build_component_kernels = lambda **kwargs: kernels
-    A, _ = model.build_transition_matrix(
+    A, _, b = model.build_transition_matrix(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t={"mu": torch.zeros(1, 4), "sigma": torch.zeros(1, 4, 4)},
+        dynamics_t={
+            "mu": torch.zeros(1, 4),
+            "transport_gates": torch.tensor([[0.25, 0.75]], dtype=site_lon.dtype),
+            "sigma": torch.zeros(1, 4, 4),
+        },
         transition_idx=torch.tensor([0]),
         device=site_lon.device,
         dtype=site_lon.dtype,
@@ -115,9 +120,13 @@ def test_transition_matrix_respects_site_component_state_order():
     damping = model._get_time_params(torch.tensor([[0]]))["damping"][:, 0].to(dtype=site_lon.dtype)
     operator = kernels.permute(0, 3, 1, 4, 2).reshape(1, model.state_dim, model.state_dim)
     operator = operator / operator.abs().sum(dim=-1, keepdim=True).clamp_min(1.0)
-    expected = (1.0 - model.dt * damping)[:, None, None] * operator
+    transport_target = (1.0 - model.dt * damping)[:, None, None] * operator
+    eye = torch.eye(model.state_dim, dtype=site_lon.dtype).unsqueeze(0)
+    row_gates = torch.tensor([[0.25, 0.75, 0.25, 0.75, 0.25, 0.75]], dtype=site_lon.dtype).unsqueeze(-1)
+    expected = eye + row_gates * (transport_target - eye)
 
     assert torch.allclose(A, expected)
+    assert torch.allclose(b, torch.zeros_like(b))
 
 
 def test_transition_matrix_contracts_constant_mode_for_row_stochastic_operator():
@@ -135,10 +144,14 @@ def test_transition_matrix_contracts_constant_mode_for_row_stochastic_operator()
     with torch.no_grad():
         model.log_damping_knots.fill_(torch.log(torch.tensor(0.3)).item())
 
-    A, _ = model.build_transition_matrix(
+    A, _, _ = model.build_transition_matrix(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t={"mu": torch.zeros(1, 4), "sigma": torch.zeros(1, 4, 4)},
+        dynamics_t={
+            "mu": torch.zeros(1, 4),
+            "transport_gates": torch.ones(1, 2),
+            "sigma": torch.zeros(1, 4, 4),
+        },
         transition_idx=torch.tensor([0]),
         device=site_lon.device,
         dtype=site_lon.dtype,
@@ -166,10 +179,14 @@ def test_transition_matrix_can_skip_damping_for_open_loop_forecast():
     with torch.no_grad():
         model.log_damping_knots.fill_(torch.log(torch.tensor(0.8)).item())
 
-    A, _ = model.build_transition_matrix(
+    A, _, _ = model.build_transition_matrix(
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_t={"mu": torch.zeros(1, 4), "sigma": torch.zeros(1, 4, 4)},
+        dynamics_t={
+            "mu": torch.zeros(1, 4),
+            "transport_gates": torch.ones(1, 2),
+            "sigma": torch.zeros(1, 4, 4),
+        },
         transition_idx=torch.tensor([0]),
         device=site_lon.device,
         dtype=site_lon.dtype,
@@ -179,6 +196,30 @@ def test_transition_matrix_can_skip_damping_for_open_loop_forecast():
     ones = torch.ones(1, model.state_dim, 1, dtype=site_lon.dtype)
     propagated = A @ ones
     assert torch.allclose(propagated, ones, atol=1e-5)
+
+
+def test_zero_transport_gates_reduce_transition_to_identity():
+    model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=4, param_window=1)
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+
+    A, _, b = model.build_transition_matrix(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t={
+            "mu": torch.tensor([[0.8, -0.1, 0.3, 0.5]], dtype=site_lon.dtype),
+            "base_scales": torch.full((1, 2), 2.0, dtype=site_lon.dtype),
+            "transport_gates": torch.zeros(1, 2, dtype=site_lon.dtype),
+            "sigma": 0.2 * torch.eye(4, dtype=site_lon.dtype).unsqueeze(0),
+        },
+        transition_idx=torch.tensor([0]),
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+    )
+
+    eye = torch.eye(model.state_dim, dtype=site_lon.dtype).unsqueeze(0)
+    assert torch.allclose(A, eye, atol=1e-6)
+    assert torch.allclose(b, torch.zeros_like(b))
 
 
 def test_component_kernels_remain_finite_for_large_joint_sigma():
@@ -228,9 +269,12 @@ def test_advection_mean_net_outputs_four_dimensional_mean_and_spd_covariance():
     assert out["mu"].shape == (2, 4)
     assert out["mu_pairs"].shape == (2, 2, 2)
     assert out["base_scales"].shape == (2, 2)
+    assert out["transport_gates"].shape == (2, 2)
+    assert out["state_bias"].shape == (2, 6)
     assert out["sigma"].shape == (2, 4, 4)
     assert out["chol_factor"].shape == (2, 4, 4)
     assert torch.all(out["base_scales"] > 0)
+    assert torch.all(out["transport_gates"] >= 0)
     assert torch.allclose(out["sigma"], out["sigma"].transpose(-1, -2), atol=1e-6)
     assert torch.all(torch.linalg.eigvalsh(out["sigma"]) > 0)
 
@@ -390,6 +434,8 @@ def test_predict_sequence_keeps_gradients_for_advection_supervision():
     dynamics_seq = {
         "mu": torch.zeros(1, 3, 4, requires_grad=True),
         "base_scales": torch.ones(1, 3, 2, requires_grad=True),
+        "transport_gates": torch.zeros(1, 3, 2, requires_grad=True),
+        "state_bias": torch.zeros(1, 3, 6, requires_grad=True),
         "sigma": (0.05 * torch.eye(4).reshape(1, 1, 4, 4).expand(1, 3, -1, -1)).clone().requires_grad_(True),
     }
 
@@ -405,6 +451,8 @@ def test_predict_sequence_keeps_gradients_for_advection_supervision():
 
     assert dynamics_seq["mu"].grad is not None
     assert dynamics_seq["base_scales"].grad is not None
+    assert dynamics_seq["transport_gates"].grad is not None
+    assert dynamics_seq["state_bias"].grad is not None
     assert dynamics_seq["sigma"].grad is not None
 
 

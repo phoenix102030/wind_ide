@@ -9,6 +9,11 @@ def inverse_softplus(value, eps=1e-6):
     return value + math.log(-math.expm1(-value))
 
 
+def inverse_sigmoid(value, eps=1e-6):
+    value = min(max(float(value), float(eps)), 1.0 - float(eps))
+    return math.log(value / (1.0 - value))
+
+
 class SpatialEncoder(nn.Module):
     def __init__(self, in_channels=6, hidden_dim=32, out_dim=32):
         super().__init__()
@@ -80,6 +85,10 @@ class AdvectionMeanNet(nn.Module):
         init_base_scale_perp=1.0,
         base_scale_min=0.15,
         base_scale_max=2.5,
+        num_sites=3,
+        init_transport_gate=0.05,
+        transport_gate_max=0.35,
+        state_bias_scale=1.0,
         wind_anchor_indices=None,
     ):
         super().__init__()
@@ -94,6 +103,11 @@ class AdvectionMeanNet(nn.Module):
         self.sigma_mode = str(sigma_mode).lower()
         self.base_scale_min = max(float(base_scale_min), 1e-4)
         self.base_scale_max = max(float(base_scale_max), self.base_scale_min)
+        self.num_sites = max(int(num_sites), 1)
+        self.vec_dim = 2
+        self.state_dim = self.num_sites * self.vec_dim
+        self.transport_gate_max = max(float(transport_gate_max), 0.0)
+        self.state_bias_scale = max(float(state_bias_scale), 0.0)
         self.num_advections = 2
         self.advection_dim = 2
         self.mu_dim = self.num_advections * self.advection_dim
@@ -122,6 +136,8 @@ class AdvectionMeanNet(nn.Module):
         mu_head_dim = self.mu_dim if self.mu_mode == "free" else self.mu_dim * self.advection_dim
         self.mu_head = nn.Linear(embed_dim, mu_head_dim)
         self.base_scale_head = nn.Linear(embed_dim, 2)
+        self.transport_gate_head = nn.Linear(embed_dim, self.vec_dim)
+        self.state_bias_head = nn.Linear(embed_dim, self.state_dim)
         self.chol_head = nn.Linear(embed_dim, self.chol_param_dim)
 
         init_base = torch.tensor(
@@ -132,6 +148,13 @@ class AdvectionMeanNet(nn.Module):
         )
         with torch.no_grad():
             self.base_scale_head.bias.copy_(init_base)
+            self.transport_gate_head.weight.zero_()
+            self.state_bias_head.weight.zero_()
+            init_gate_ratio = 0.0
+            if self.transport_gate_max > 0.0:
+                init_gate_ratio = min(max(float(init_transport_gate) / self.transport_gate_max, 1e-4), 1.0 - 1e-4)
+            self.transport_gate_head.bias.fill_(inverse_sigmoid(init_gate_ratio) if self.transport_gate_max > 0.0 else -20.0)
+            self.state_bias_head.bias.zero_()
 
         init_diag_raw = inverse_softplus(max(float(init_global_sigma_diag) - self.chol_eps, 1e-4))
         global_chol_init = torch.zeros(self.chol_param_dim)
@@ -206,6 +229,12 @@ class AdvectionMeanNet(nn.Module):
             if full_key not in state_dict:
                 state_dict[full_key] = getattr(self.base_scale_head, key).detach().clone()
 
+        for layer_name in ("transport_gate_head", "state_bias_head"):
+            for key in ("weight", "bias"):
+                full_key = f"{prefix}{layer_name}.{key}"
+                if full_key not in state_dict:
+                    state_dict[full_key] = getattr(getattr(self, layer_name), key).detach().clone()
+
         for key in ("weight", "bias"):
             full_key = f"{prefix}chol_head.{key}"
             expected = getattr(self.chol_head, key)
@@ -278,6 +307,16 @@ class AdvectionMeanNet(nn.Module):
             scales = torch.clamp(scales, max=self.base_scale_max)
         return scales
 
+    def _predict_transport_gates(self, h):
+        if self.transport_gate_max <= 0.0:
+            return h.new_zeros(h.shape[0], self.vec_dim)
+        return self.transport_gate_max * torch.sigmoid(self.transport_gate_head(h))
+
+    def _predict_state_bias(self, h):
+        if self.state_bias_scale <= 0.0:
+            return h.new_zeros(h.shape[0], self.state_dim)
+        return self.state_bias_scale * torch.tanh(self.state_bias_head(h))
+
     def forward(self, x_seq):
         # x_seq: [B, L, C, Y, X]
         batch_size, seq_len, channels, height, width = x_seq.shape
@@ -289,6 +328,8 @@ class AdvectionMeanNet(nn.Module):
         h = self.temporal(feat)
         mu, mu_coeff_matrix, wind_anchor = self._predict_mu(h, x_seq)
         base_scales = self._predict_base_scales(h)
+        transport_gates = self._predict_transport_gates(h)
+        state_bias = self._predict_state_bias(h)
 
         if self.sigma_mode == "global":
             chol_raw = self.global_chol_params.unsqueeze(0).expand(batch_size, -1)
@@ -303,6 +344,8 @@ class AdvectionMeanNet(nn.Module):
             "mu_coeff_matrix": mu_coeff_matrix,
             "wind_anchor": wind_anchor,
             "base_scales": base_scales,
+            "transport_gates": transport_gates,
+            "state_bias": state_bias,
             "sigma": sigma,
             "chol_factor": chol_factor,
         }

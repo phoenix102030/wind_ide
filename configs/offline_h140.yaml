@@ -43,7 +43,7 @@ train_ell_params: true
 init_log_q_proc: -2
 init_log_r_obs: -2
 init_log_p0: 0.0
-init_log_damping: 0.0
+init_log_damping: -2.5
 init_log_ell_par: 0.5
 init_log_ell_perp: 0.0
 q_proc_min: 0.02
@@ -73,6 +73,8 @@ smoothness_weight: 0.001
 adv_one_step_weight: 0.25
 adv_rollout_weight: 1.0
 adv_history_len: 6
+transport_reg_weight: 0.01
+state_bias_reg_weight: 0.001
 mu_scale: 1.25
 chol_offdiag_scale: 0.15
 chol_diag_max: 1.5
@@ -82,6 +84,9 @@ init_base_scale_par: 1.0
 init_base_scale_perp: 1.0
 base_scale_min: 0.15
 base_scale_max: 2.5
+init_transport_gate: 0.05
+transport_gate_max: 0.35
+state_bias_scale: 1.0
 offline_rounds: 3
 stat_epochs_per_round: 5
 adv_epochs_per_round: 10

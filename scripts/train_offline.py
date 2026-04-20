@@ -267,6 +267,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     raw_bundle = build_aligned_bundle(meas_file, nwp_file, nwp_channel_mode=cfg["nwp_input_mode"])
     cfg = dict(cfg)
     cfg["ide_total_steps"] = int(raw_bundle.z_meas.shape[0])
+    cfg["num_sites"] = int(raw_bundle.z_meas.shape[1])
     cfg["nwp_in_channels"] = int(raw_bundle.nwp_uv.shape[1])
     cfg["nwp_anchor_channel_indices"] = list(get_nwp_uv_channel_indices(cfg["nwp_input_mode"], height="140"))
     cfg["ide_param_mode"] = str(cfg.get("ide_param_mode", "absolute")).lower()
@@ -297,6 +298,11 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"adv_history_len={cfg.get('adv_history_len', 6)}")
         print(f"adv_one_step_weight={cfg.get('adv_one_step_weight', 0.25)}")
         print(f"adv_rollout_weight={cfg.get('adv_rollout_weight', 1.0)}")
+        print(f"transport_reg_weight={cfg.get('transport_reg_weight', 1e-2)}")
+        print(f"state_bias_reg_weight={cfg.get('state_bias_reg_weight', 1e-3)}")
+        print(f"init_transport_gate={cfg.get('init_transport_gate', 0.05)}")
+        print(f"transport_gate_max={cfg.get('transport_gate_max', 0.35)}")
+        print(f"state_bias_scale={cfg.get('state_bias_scale', 1.0)}")
         print(f"use_advection_in_stat={cfg.get('use_advection_in_stat', True)}")
         print(f"train_q_proc_in_stat={cfg.get('train_q_proc_in_stat', False)}")
         print(f"train_r_obs_in_stat={cfg.get('train_r_obs_in_stat', False)}")
@@ -537,6 +543,10 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         init_base_scale_perp=cfg.get("init_base_scale_perp", 1.0),
         base_scale_min=cfg.get("base_scale_min", 0.15),
         base_scale_max=cfg.get("base_scale_max", 2.5),
+        num_sites=cfg.get("num_sites", raw_bundle.z_meas.shape[1]),
+        init_transport_gate=cfg.get("init_transport_gate", 0.05),
+        transport_gate_max=cfg.get("transport_gate_max", 0.35),
+        state_bias_scale=cfg.get("state_bias_scale", 1.0),
         wind_anchor_indices=cfg.get("nwp_anchor_channel_indices", None),
     ).to(device)
     mean_model = maybe_wrap_ddp(mean_model, device, distributed)
@@ -575,6 +585,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                 one_step_weight=cfg.get("adv_one_step_weight", 0.25),
                 rollout_weight=cfg.get("adv_rollout_weight", 1.0),
                 rollout_history=cfg.get("adv_history_len", 6),
+                transport_reg_weight=cfg.get("transport_reg_weight", 1e-2),
+                state_bias_reg_weight=cfg.get("state_bias_reg_weight", 1e-3),
             )
             va = eval_advection(
                 mean_model=mean_model,
@@ -587,6 +599,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                 one_step_weight=cfg.get("adv_one_step_weight", 0.25),
                 rollout_weight=cfg.get("adv_rollout_weight", 1.0),
                 rollout_history=cfg.get("adv_history_len", 6),
+                transport_reg_weight=cfg.get("transport_reg_weight", 1e-2),
+                state_bias_reg_weight=cfg.get("state_bias_reg_weight", 1e-3),
             )
 
             if is_main_process():
@@ -600,6 +614,10 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                     f"mu_abs={tr['mu_abs_mean']:.6f} "
                     f"base_mean={tr['base_scale_mean']:.6f} "
                     f"base_aniso={tr['base_scale_anisotropy']:.6f} "
+                    f"transport={tr['transport_gate_mean']:.6f} "
+                    f"bias_abs={tr['state_bias_abs_mean']:.6f} "
+                    f"transport_reg={tr['transport_reg']:.6f} "
+                    f"bias_reg={tr['state_bias_reg']:.6f} "
                     f"sigma_mean={tr['sigma_mean']:.6f} "
                     f"sigma_trace={tr['sigma_trace']:.6f} "
                     f"sigma_diag_min={tr['sigma_diag_min']:.6f}"

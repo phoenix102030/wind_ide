@@ -122,6 +122,10 @@ def reconstruct_models(ckpt, device):
         init_base_scale_perp=cfg.get("init_base_scale_perp", 1.0),
         base_scale_min=cfg.get("base_scale_min", 0.15),
         base_scale_max=cfg.get("base_scale_max", 2.5),
+        num_sites=cfg.get("num_sites", 3),
+        init_transport_gate=cfg.get("init_transport_gate", 0.05),
+        transport_gate_max=cfg.get("transport_gate_max", 0.35),
+        state_bias_scale=cfg.get("state_bias_scale", 1.0),
         wind_anchor_indices=cfg.get("nwp_anchor_channel_indices", None),
     ).to(device)
     if "mean_model_state" in ckpt:
