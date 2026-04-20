@@ -165,12 +165,14 @@ def _advection_prediction_loss(
     rollout_weight,
     rollout_history,
 ):
+    raw_ide = unwrap_model(ide_model)
+
     if z_seq.shape[1] < 2:
         raise ValueError("Advection supervision requires at least two observations per window.")
 
     one_step = z_seq.new_tensor(0.0)
     if one_step_weight > 0.0:
-        pred_next = ide_model.predict_sequence(
+        pred_next = raw_ide.predict_sequence(
             z_seq=z_seq,
             site_lon=site_lon,
             site_lat=site_lat,
@@ -186,7 +188,7 @@ def _advection_prediction_loss(
         raise ValueError("Need at least one open-loop target step for advection supervision.")
 
     hist_dyn_len = max(history_len - 1, 0)
-    rollout_pred = ide_model.forecast_multistep(
+    rollout_pred = raw_ide.forecast_multistep(
         z_hist=z_seq[:, :history_len],
         site_lon=site_lon,
         site_lat=site_lat,
