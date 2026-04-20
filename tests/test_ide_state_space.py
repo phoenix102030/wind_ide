@@ -227,8 +227,10 @@ def test_advection_mean_net_outputs_four_dimensional_mean_and_spd_covariance():
 
     assert out["mu"].shape == (2, 4)
     assert out["mu_pairs"].shape == (2, 2, 2)
+    assert out["base_scales"].shape == (2, 2)
     assert out["sigma"].shape == (2, 4, 4)
     assert out["chol_factor"].shape == (2, 4, 4)
+    assert torch.all(out["base_scales"] > 0)
     assert torch.allclose(out["sigma"], out["sigma"].transpose(-1, -2), atol=1e-6)
     assert torch.all(torch.linalg.eigvalsh(out["sigma"]) > 0)
 
@@ -287,10 +289,12 @@ def test_forecast_multistep_runs_with_dynamic_advection_only():
 
     dynamics_hist = {
         "mu": torch.randn(2, 5, 4),
+        "base_scales": torch.ones(2, 5, 2),
         "sigma": 0.05 * torch.eye(4).reshape(1, 1, 4, 4).expand(2, 5, -1, -1),
     }
     dynamics_future = {
         "mu": torch.randn(2, 3, 4),
+        "base_scales": torch.ones(2, 3, 2),
         "sigma": 0.05 * torch.eye(4).reshape(1, 1, 4, 4).expand(2, 3, -1, -1),
     }
 
@@ -326,10 +330,12 @@ def test_forecast_multistep_remains_finite_with_nearly_singular_filter_covarianc
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
     dynamics_hist = {
         "mu": torch.zeros(1, 5, 4),
+        "base_scales": torch.ones(1, 5, 2),
         "sigma": torch.zeros(1, 5, 4, 4),
     }
     dynamics_future = {
         "mu": torch.zeros(1, 3, 4),
+        "base_scales": torch.ones(1, 3, 2),
         "sigma": torch.zeros(1, 3, 4, 4),
     }
 
@@ -343,6 +349,63 @@ def test_forecast_multistep_remains_finite_with_nearly_singular_filter_covarianc
     )
 
     assert torch.isfinite(pred).all()
+
+
+def test_small_base_scales_produce_sharper_kernel_than_unit_floor():
+    model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+
+    wide = model.build_component_kernels(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t={
+            "mu": torch.zeros(1, 4),
+            "base_scales": torch.ones(1, 2),
+            "sigma": torch.zeros(1, 4, 4),
+        },
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+    )
+    sharp = model.build_component_kernels(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t={
+            "mu": torch.zeros(1, 4),
+            "base_scales": torch.full((1, 2), 0.2),
+            "sigma": torch.zeros(1, 4, 4),
+        },
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+    )
+
+    assert torch.all(torch.diagonal(sharp[0, 0, 0]) >= torch.diagonal(wide[0, 0, 0]))
+
+
+def test_predict_sequence_keeps_gradients_for_advection_supervision():
+    model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=8, param_window=2)
+    z_seq = torch.randn(1, 4, 3, 2)
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+    dynamics_seq = {
+        "mu": torch.zeros(1, 3, 4, requires_grad=True),
+        "base_scales": torch.ones(1, 3, 2, requires_grad=True),
+        "sigma": (0.05 * torch.eye(4).reshape(1, 1, 4, 4).expand(1, 3, -1, -1)).clone().requires_grad_(True),
+    }
+
+    pred = model.predict_sequence(
+        z_seq=z_seq,
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_seq=dynamics_seq,
+        start_idx=torch.tensor([0]),
+    )
+    loss = pred.square().mean()
+    loss.backward()
+
+    assert dynamics_seq["mu"].grad is not None
+    assert dynamics_seq["base_scales"].grad is not None
+    assert dynamics_seq["sigma"].grad is not None
 
 
 

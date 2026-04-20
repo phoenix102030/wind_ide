@@ -312,6 +312,7 @@ class IDEStateSpaceModel(nn.Module):
     def _default_dynamics(self, batch_size, device, dtype):
         return {
             "mu": torch.zeros(batch_size, self.mu_dim, device=device, dtype=dtype),
+            "base_scales": torch.ones(batch_size, 2, device=device, dtype=dtype),
             "sigma": torch.zeros(batch_size, self.mu_dim, self.mu_dim, device=device, dtype=dtype),
         }
 
@@ -343,7 +344,13 @@ class IDEStateSpaceModel(nn.Module):
             sigma = sigma.reshape(batch_size, self.mu_dim, self.mu_dim)
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
         sigma = torch.nan_to_num(sigma, nan=0.0, posinf=1e6, neginf=-1e6)
-        return mu, sigma
+        base_scales = dynamics_t.get("base_scales", None)
+        if base_scales is None:
+            base_scales = torch.ones(batch_size, 2, device=device, dtype=dtype)
+        else:
+            base_scales = base_scales.to(device=device, dtype=dtype).reshape(batch_size, 2)
+        base_scales = torch.nan_to_num(base_scales, nan=1.0, posinf=10.0, neginf=1e-3).clamp_min(1e-3)
+        return mu, sigma, base_scales
 
     def _split_mu_pairs(self, mu):
         return mu.reshape(mu.shape[0], self.num_advections, self.advection_dim)
@@ -477,14 +484,33 @@ class IDEStateSpaceModel(nn.Module):
         )
         return drift, covariance
 
-    def build_pair_kernel(self, coords, mu_pairs, sigma_blocks, target_idx, source_idx):
+    def _directional_base_covariance(self, direction, base_scales):
+        batch_size = direction.shape[0]
+        safe_dir = direction.clone()
+        norms = safe_dir.norm(dim=-1, keepdim=True)
+        fallback = safe_dir.new_tensor([1.0, 0.0]).reshape(1, 2).expand(batch_size, -1)
+        safe_dir = torch.where(norms > 1e-6, safe_dir / norms.clamp_min(1e-6), fallback)
+
+        e_par = safe_dir
+        e_perp = torch.stack([-e_par[:, 1], e_par[:, 0]], dim=-1)
+        ell_par_sq = base_scales[:, 0].square()
+        ell_perp_sq = base_scales[:, 1].square()
+        par_cov = ell_par_sq[:, None, None] * torch.einsum("bi,bj->bij", e_par, e_par)
+        perp_cov = ell_perp_sq[:, None, None] * torch.einsum("bi,bj->bij", e_perp, e_perp)
+        return self._symmetrize(par_cov + perp_cov)
+
+    def build_pair_kernel(self, coords, mu_pairs, sigma_blocks, base_scales, target_idx, source_idx):
         batch_size = coords.shape[0]
         h = coords[:, :, None, :] - coords[:, None, :, :]
         drift, pair_cov = self._pair_transport_params(mu_pairs, sigma_blocks, target_idx, source_idx)
+        direction = drift
+        if target_idx != source_idx:
+            direction = direction + 0.5 * (mu_pairs[:, target_idx] + mu_pairs[:, source_idx])
+        base_cov = self._directional_base_covariance(direction, base_scales)
 
         eye2 = torch.eye(self.advection_dim, device=coords.device, dtype=coords.dtype).unsqueeze(0)
         D = self._make_spd(
-            eye2.expand(batch_size, -1, -1) + 2.0 * (self.dt ** 2) * pair_cov + 1e-4 * eye2,
+            base_cov + 2.0 * (self.dt ** 2) * pair_cov + 1e-4 * eye2,
             min_eig=1e-4,
         )
         D_inv, logdet = self._inv_and_logdet_2x2(D, min_det=1e-8)
@@ -499,7 +525,7 @@ class IDEStateSpaceModel(nn.Module):
         site_lon, site_lat = self._expand_sites(site_lon, site_lat, batch_size)
         coords = project_lon_lat(site_lon, site_lat)
 
-        mu_t, sigma_t = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
+        mu_t, sigma_t, base_scales = self._parse_dynamics(dynamics_t, batch_size, device, dtype)
         mu_pairs = self._split_mu_pairs(mu_t)
         sigma_blocks = self._split_sigma_blocks(sigma_t)
 
@@ -512,6 +538,7 @@ class IDEStateSpaceModel(nn.Module):
                         coords=coords,
                         mu_pairs=mu_pairs,
                         sigma_blocks=sigma_blocks,
+                        base_scales=base_scales,
                         target_idx=target_idx,
                         source_idx=source_idx,
                     )
@@ -553,6 +580,7 @@ class IDEStateSpaceModel(nn.Module):
             return self._default_dynamics(batch_size, device, dtype)
         return {
             "mu": dynamics_seq["mu"][:, t],
+            "base_scales": dynamics_seq["base_scales"][:, t] if "base_scales" in dynamics_seq else None,
             "sigma": dynamics_seq["sigma"][:, t],
         }
 
@@ -616,7 +644,6 @@ class IDEStateSpaceModel(nn.Module):
 
         return total_nll / max(steps, 1)
 
-    @torch.no_grad()
     def predict_sequence(self, z_seq, site_lon, site_lat, dynamics_seq=None, start_idx=None):
         z = self._flatten_state(z_seq)
         batch_size, steps, _ = z.shape
@@ -649,7 +676,6 @@ class IDEStateSpaceModel(nn.Module):
 
         return torch.stack(preds, dim=1)
 
-    @torch.no_grad()
     def forecast_next(self, z_hist, site_lon, site_lat, dynamics_seq, start_idx=None):
         z = self._flatten_state(z_hist)
         batch_size, steps, _ = z.shape
@@ -691,7 +717,6 @@ class IDEStateSpaceModel(nn.Module):
 
         return m.reshape(batch_size, self.num_sites, self.vec_dim)
 
-    @torch.no_grad()
     def forecast_multistep(self, z_hist, site_lon, site_lat, dynamics_hist, dynamics_future, start_idx=None):
         z = self._flatten_state(z_hist)
         batch_size, steps, _ = z.shape
@@ -733,6 +758,7 @@ class IDEStateSpaceModel(nn.Module):
         for h in range(horizon):
             dynamics_t = {
                 "mu": dynamics_future["mu"][:, h],
+                "base_scales": dynamics_future["base_scales"][:, h] if "base_scales" in dynamics_future else None,
                 "sigma": dynamics_future["sigma"][:, h],
             }
             A, Q = self.build_transition_matrix(

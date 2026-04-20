@@ -180,6 +180,10 @@ def main():
         mu_mode=cfg.get("mu_mode", "free"),
         sigma_mode=cfg.get("sigma_mode", "network"),
         init_global_sigma_diag=cfg.get("init_global_sigma_diag", 0.2),
+        init_base_scale_par=cfg.get("init_base_scale_par", 1.0),
+        init_base_scale_perp=cfg.get("init_base_scale_perp", 1.0),
+        base_scale_min=cfg.get("base_scale_min", 0.15),
+        base_scale_max=cfg.get("base_scale_max", 2.5),
         wind_anchor_indices=cfg.get("nwp_anchor_channel_indices", None),
     ).to(device)
     if "mean_model_state" in ckpt:

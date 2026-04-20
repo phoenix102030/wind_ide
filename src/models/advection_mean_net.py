@@ -76,6 +76,10 @@ class AdvectionMeanNet(nn.Module):
         mu_mode="free",
         sigma_mode="network",
         init_global_sigma_diag=0.2,
+        init_base_scale_par=1.0,
+        init_base_scale_perp=1.0,
+        base_scale_min=0.15,
+        base_scale_max=2.5,
         wind_anchor_indices=None,
     ):
         super().__init__()
@@ -88,6 +92,8 @@ class AdvectionMeanNet(nn.Module):
         self.chol_eps = float(chol_eps)
         self.mu_mode = str(mu_mode).lower()
         self.sigma_mode = str(sigma_mode).lower()
+        self.base_scale_min = max(float(base_scale_min), 1e-4)
+        self.base_scale_max = max(float(base_scale_max), self.base_scale_min)
         self.num_advections = 2
         self.advection_dim = 2
         self.mu_dim = self.num_advections * self.advection_dim
@@ -115,7 +121,17 @@ class AdvectionMeanNet(nn.Module):
 
         mu_head_dim = self.mu_dim if self.mu_mode == "free" else self.mu_dim * self.advection_dim
         self.mu_head = nn.Linear(embed_dim, mu_head_dim)
+        self.base_scale_head = nn.Linear(embed_dim, 2)
         self.chol_head = nn.Linear(embed_dim, self.chol_param_dim)
+
+        init_base = torch.tensor(
+            [
+                inverse_softplus(max(float(init_base_scale_par) - self.base_scale_min, 1e-4)),
+                inverse_softplus(max(float(init_base_scale_perp) - self.base_scale_min, 1e-4)),
+            ]
+        )
+        with torch.no_grad():
+            self.base_scale_head.bias.copy_(init_base)
 
         init_diag_raw = inverse_softplus(max(float(init_global_sigma_diag) - self.chol_eps, 1e-4))
         global_chol_init = torch.zeros(self.chol_param_dim)
@@ -186,6 +202,11 @@ class AdvectionMeanNet(nn.Module):
             ).reshape(-1)
 
         for key in ("weight", "bias"):
+            full_key = f"{prefix}base_scale_head.{key}"
+            if full_key not in state_dict:
+                state_dict[full_key] = getattr(self.base_scale_head, key).detach().clone()
+
+        for key in ("weight", "bias"):
             full_key = f"{prefix}chol_head.{key}"
             expected = getattr(self.chol_head, key)
             if full_key in state_dict and state_dict[full_key].shape != expected.shape:
@@ -249,6 +270,14 @@ class AdvectionMeanNet(nn.Module):
 
         return mu, mu_coeff, wind_anchor
 
+    def _predict_base_scales(self, h):
+        raw = self.base_scale_head(h)
+        max_delta = self.base_scale_max - self.base_scale_min
+        scales = self.base_scale_min + torch.nn.functional.softplus(raw)
+        if math.isfinite(max_delta):
+            scales = torch.clamp(scales, max=self.base_scale_max)
+        return scales
+
     def forward(self, x_seq):
         # x_seq: [B, L, C, Y, X]
         batch_size, seq_len, channels, height, width = x_seq.shape
@@ -259,6 +288,7 @@ class AdvectionMeanNet(nn.Module):
 
         h = self.temporal(feat)
         mu, mu_coeff_matrix, wind_anchor = self._predict_mu(h, x_seq)
+        base_scales = self._predict_base_scales(h)
 
         if self.sigma_mode == "global":
             chol_raw = self.global_chol_params.unsqueeze(0).expand(batch_size, -1)
@@ -272,6 +302,7 @@ class AdvectionMeanNet(nn.Module):
             "mu_pairs": mu.reshape(batch_size, self.num_advections, self.advection_dim),
             "mu_coeff_matrix": mu_coeff_matrix,
             "wind_anchor": wind_anchor,
+            "base_scales": base_scales,
             "sigma": sigma,
             "chol_factor": chol_factor,
         }

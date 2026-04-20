@@ -6,7 +6,7 @@ seed: 42
 dt: 1.0
 normalize_z: true
 normalize_nwp: true
-nwp_input_mode: uv6
+nwp_input_mode: all12
 
 # seq_len:
 #   advection 网络每次看多少帧 NWP 历史来输出一个时刻的 mu_t / Sigma_t
@@ -35,7 +35,7 @@ out_dir: outputs/offline_140m_01
 # IDE stage
 ide_batch_size: 128
 ide_lr: 0.001
-ide_epochs: 15
+ide_epochs: 0
 ide_max_steps: 100
 skip_ide_warmup: true
 train_ell_params: true
@@ -47,12 +47,12 @@ init_log_damping: 0.0
 init_log_ell_par: 0.5
 init_log_ell_perp: 0.0
 q_proc_min: 0.02
-q_proc_max: 0.5
+q_proc_max: 0.2
 r_obs_min: 0.02
-r_obs_max: 0.75
+r_obs_max: 0.25
 damping_min: 0.02
 damping_max: 0.5
-noise_reg_weight: 0.0001
+noise_reg_weight: 0.05
 
 # ML stage
 hidden_dim: 32
@@ -70,14 +70,21 @@ ml_epochs: 40
 ml_max_steps: 100
 stat_lr: 0.0001
 smoothness_weight: 0.001
-mu_scale: 0.75
+adv_one_step_weight: 0.25
+adv_rollout_weight: 1.0
+adv_history_len: 6
+mu_scale: 1.25
 chol_offdiag_scale: 0.15
 chol_diag_max: 1.5
 chol_eps: 0.0001
 init_global_sigma_diag: 0.15
+init_base_scale_par: 1.0
+init_base_scale_perp: 1.0
+base_scale_min: 0.15
+base_scale_max: 2.5
 offline_rounds: 3
 stat_epochs_per_round: 5
 adv_epochs_per_round: 10
 stat_max_steps: 100
 adv_max_steps: 100
-use_advection_in_stat: true
+use_advection_in_stat: false

@@ -281,6 +281,9 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"mu_mode={cfg['mu_mode']}")
         print(f"sigma_mode={cfg['sigma_mode']}")
         print(f"nwp_input_mode={cfg['nwp_input_mode']}")
+        print(f"adv_history_len={cfg.get('adv_history_len', 6)}")
+        print(f"adv_one_step_weight={cfg.get('adv_one_step_weight', 0.25)}")
+        print(f"adv_rollout_weight={cfg.get('adv_rollout_weight', 1.0)}")
         if cfg["nwp_input_mode"] != "all12":
             print(
                 "[warning] nwp_input_mode!=all12 means the advection net only sees wind U/V channels "
@@ -503,6 +506,10 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         mu_mode=cfg.get("mu_mode", "free"),
         sigma_mode=cfg.get("sigma_mode", "network"),
         init_global_sigma_diag=cfg.get("init_global_sigma_diag", 0.2),
+        init_base_scale_par=cfg.get("init_base_scale_par", 1.0),
+        init_base_scale_perp=cfg.get("init_base_scale_perp", 1.0),
+        base_scale_min=cfg.get("base_scale_min", 0.15),
+        base_scale_max=cfg.get("base_scale_max", 2.5),
         wind_anchor_indices=cfg.get("nwp_anchor_channel_indices", None),
     ).to(device)
     mean_model = maybe_wrap_ddp(mean_model, device, distributed)
@@ -538,6 +545,9 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                 seq_len=seq_len,
                 max_steps=adv_max_steps,
                 smoothness_weight=cfg.get("smoothness_weight", 1e-3),
+                one_step_weight=cfg.get("adv_one_step_weight", 0.25),
+                rollout_weight=cfg.get("adv_rollout_weight", 1.0),
+                rollout_history=cfg.get("adv_history_len", 6),
             )
             va = eval_advection(
                 mean_model=mean_model,
@@ -547,16 +557,22 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                 seq_len=seq_len,
                 max_steps=adv_max_steps,
                 smoothness_weight=cfg.get("smoothness_weight", 1e-3),
+                one_step_weight=cfg.get("adv_one_step_weight", 0.25),
+                rollout_weight=cfg.get("adv_rollout_weight", 1.0),
+                rollout_history=cfg.get("adv_history_len", 6),
             )
 
             if is_main_process():
                 print(
                     f"[OFFLINE-ADV][round {round_idx} epoch {epoch}] "
                     f"train={tr['loss']:.6f} val={va['loss']:.6f} "
-                    f"train_nll={tr['nll']:.6f} val_nll={va['nll']:.6f} "
+                    f"train_roll={tr['rollout_mse']:.6f} val_roll={va['rollout_mse']:.6f} "
+                    f"train_step={tr['one_step_mse']:.6f} val_step={va['one_step_mse']:.6f} "
                     f"smooth={tr['smoothness']:.6f} "
                     f"mu_norm={tr['mu_norm']:.6f} "
                     f"mu_abs={tr['mu_abs_mean']:.6f} "
+                    f"base_mean={tr['base_scale_mean']:.6f} "
+                    f"base_aniso={tr['base_scale_anisotropy']:.6f} "
                     f"sigma_mean={tr['sigma_mean']:.6f} "
                     f"sigma_trace={tr['sigma_trace']:.6f} "
                     f"sigma_diag_min={tr['sigma_diag_min']:.6f}"
