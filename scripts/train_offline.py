@@ -21,17 +21,13 @@ from src.data.aligned_measurement_nwp import (
     build_aligned_bundle,
     fit_bundle_normalization,
     get_nwp_uv_channel_indices,
-    IDEBaselineDataset,
     MLMuDataset,
 )
 from src.models.advection_mean_net import AdvectionMeanNet
 from src.models.ide_state_space import IDEStateSpaceModel
-from src.trainers.train_ide_baseline import train_ide_baseline_one_epoch, eval_ide_baseline
 from src.trainers.train_ml_mu import (
-    train_statistical_one_epoch,
-    eval_statistical,
-    train_advection_one_epoch,
-    eval_advection,
+    train_joint_one_epoch,
+    eval_joint,
 )
 from src.utils.misc import set_seed, count_parameters
 
@@ -127,9 +123,9 @@ def configure_ide_trainability(
     train_ell_params=True,
     train_q_proc=True,
     train_r_obs=True,
-    train_p0=True,
+    train_p0=False,
     train_damping=True,
-    train_init_mean=True,
+    train_init_mean=False,
 ):
     del train_ell_params
     model.log_ell_par_knots.requires_grad_(False)
@@ -298,17 +294,18 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"adv_history_len={cfg.get('adv_history_len', 6)}")
         print(f"adv_one_step_weight={cfg.get('adv_one_step_weight', 0.25)}")
         print(f"adv_rollout_weight={cfg.get('adv_rollout_weight', 1.0)}")
+        print(f"step_nll_weight={cfg.get('step_nll_weight', 0.1)}")
         print(f"transport_reg_weight={cfg.get('transport_reg_weight', 1e-2)}")
         print(f"state_bias_reg_weight={cfg.get('state_bias_reg_weight', 1e-3)}")
         print(f"init_transport_gate={cfg.get('init_transport_gate', 0.05)}")
         print(f"transport_gate_max={cfg.get('transport_gate_max', 0.35)}")
         print(f"state_bias_scale={cfg.get('state_bias_scale', 1.0)}")
-        print(f"use_advection_in_stat={cfg.get('use_advection_in_stat', True)}")
-        print(f"train_q_proc_in_stat={cfg.get('train_q_proc_in_stat', False)}")
-        print(f"train_r_obs_in_stat={cfg.get('train_r_obs_in_stat', False)}")
-        print(f"train_damping_in_stat={cfg.get('train_damping_in_stat', True)}")
-        print(f"train_p0_in_stat={cfg.get('train_p0_in_stat', True)}")
-        print(f"train_init_mean_in_stat={cfg.get('train_init_mean_in_stat', True)}")
+        print(f"joint_epochs={cfg.get('joint_epochs', cfg.get('offline_rounds', 3) * cfg.get('adv_epochs_per_round', cfg.get('ml_epochs', 20)))}")
+        print(f"train_q_proc={cfg.get('train_q_proc', True)}")
+        print(f"train_r_obs={cfg.get('train_r_obs', True)}")
+        print(f"train_damping={cfg.get('train_damping', True)}")
+        print(f"train_p0={cfg.get('train_p0', False)}")
+        print(f"train_init_mean={cfg.get('train_init_mean', False)}")
         if cfg["nwp_input_mode"] != "all12":
             print(
                 "[warning] nwp_input_mode!=all12 means the advection net only sees wind U/V channels "
@@ -326,15 +323,15 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                 "[warning] sigma_mode=global keeps the joint 4x4 advection covariance fixed over time, "
                 "so NWP cannot modulate pairwise kernel shape through Sigma_t."
             )
+        if cfg["skip_ide_warmup"]:
+            print("[note] skip_ide_warmup is ignored in the current joint-training pipeline.")
 
-    raw_ide_base_ds = IDEBaselineDataset(raw_bundle, chunk_len=chunk_len)
-    _, _, raw_ide_split_info = contiguous_time_split(raw_ide_base_ds, val_fraction=val_fraction)
     raw_ml_ds = MLMuDataset(raw_bundle, seq_len=seq_len, chunk_len=chunk_len)
     _, _, raw_ml_split_info = contiguous_time_split(raw_ml_ds, val_fraction=val_fraction)
 
     bundle = raw_bundle
     if cfg["normalize_z"] or cfg["normalize_nwp"]:
-        norm_train_stop = min(raw_ide_split_info["split_time"], raw_ml_split_info["split_time"])
+        norm_train_stop = raw_ml_split_info["split_time"]
         norm_stats = fit_bundle_normalization(raw_bundle, end_time=norm_train_stop)
         cfg["normalization"] = norm_stats.to_config_dict()
         bundle = apply_bundle_normalization(
@@ -353,57 +350,42 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     else:
         cfg["normalization"] = None
 
-    ide_base_ds = IDEBaselineDataset(bundle, chunk_len=chunk_len)
-    ide_train_ds, ide_val_ds, ide_split_info = contiguous_time_split(ide_base_ds, val_fraction=val_fraction)
+    ml_ds = MLMuDataset(bundle, seq_len=seq_len, chunk_len=chunk_len)
+    ml_train_ds, ml_val_ds, ml_split_info = contiguous_time_split(ml_ds, val_fraction=val_fraction)
     if is_main_process():
         print(
-            "[IDE split] "
-            f"split_time={ide_split_info['split_time']} "
-            f"sample_span={ide_split_info['sample_span']} "
-            f"train={ide_split_info['train_windows']} "
-            f"val={ide_split_info['val_windows']}"
+            "[Joint split] "
+            f"split_time={ml_split_info['split_time']} "
+            f"sample_span={ml_split_info['sample_span']} "
+            f"train={ml_split_info['train_windows']} "
+            f"val={ml_split_info['val_windows']}"
         )
         if cfg["ide_param_mode"] == "absolute":
-            ide_coverage_train = summarize_knot_coverage(
-                ide_train_ds,
-                sample_span=ide_split_info["sample_span"],
+            coverage_train = summarize_knot_coverage(
+                ml_train_ds,
+                sample_span=ml_split_info["sample_span"],
                 param_window=int(cfg.get("ide_param_window", 12)),
             )
-            ide_coverage_val = summarize_knot_coverage(
-                ide_val_ds,
-                sample_span=ide_split_info["sample_span"],
+            coverage_val = summarize_knot_coverage(
+                ml_val_ds,
+                sample_span=ml_split_info["sample_span"],
                 param_window=int(cfg.get("ide_param_window", 12)),
             )
-            overlap = len(ide_coverage_train["knot_set"] & ide_coverage_val["knot_set"])
+            overlap = len(coverage_train["knot_set"] & coverage_val["knot_set"])
             print(
                 "[IDE knot coverage] "
-                f"train={ide_coverage_train['knot_min']}..{ide_coverage_train['knot_max']} "
-                f"({ide_coverage_train['knot_count']} knots) "
-                f"val={ide_coverage_val['knot_min']}..{ide_coverage_val['knot_max']} "
-                f"({ide_coverage_val['knot_count']} knots) "
+                f"train={coverage_train['knot_min']}..{coverage_train['knot_max']} "
+                f"({coverage_train['knot_count']} knots) "
+                f"val={coverage_val['knot_min']}..{coverage_val['knot_max']} "
+                f"({coverage_val['knot_count']} knots) "
                 f"overlap={overlap}"
             )
             if overlap == 0:
                 print(
                     "[warning] ide_param_mode=absolute with a contiguous time split means the validation "
-                    "windows use a disjoint set of learned IDE time knots; val loss can stay flat even "
-                    "while train loss drops."
+                    "windows use a disjoint set of learned IDE time knots; use joint val curves as a trend, "
+                    "and rely on held-out forecast validation for the final check."
                 )
-
-    ide_train_loader, ide_train_sampler = build_loader(
-        ide_train_ds,
-        batch_size=cfg.get("ide_batch_size", 32),
-        shuffle=True,
-        distributed=distributed,
-        num_workers=num_workers,
-    )
-    ide_val_loader, _ = build_loader(
-        ide_val_ds,
-        batch_size=cfg.get("ide_batch_size", 32),
-        shuffle=False,
-        distributed=distributed,
-        num_workers=num_workers,
-    )
 
     ide_model = IDEStateSpaceModel(
         dt=cfg.get("dt", 1.0),
@@ -426,17 +408,13 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     configure_ide_trainability(
         ide_model,
         train_ell_params=cfg["train_ell_params"],
-        train_q_proc=cfg.get("train_q_proc_in_stat", False),
-        train_r_obs=cfg.get("train_r_obs_in_stat", False),
-        train_p0=cfg.get("train_p0_in_stat", True),
-        train_damping=cfg.get("train_damping_in_stat", True),
-        train_init_mean=cfg.get("train_init_mean_in_stat", True),
+        train_q_proc=cfg.get("train_q_proc", True),
+        train_r_obs=cfg.get("train_r_obs", True),
+        train_p0=cfg.get("train_p0", False),
+        train_damping=cfg.get("train_damping", True),
+        train_init_mean=cfg.get("train_init_mean", False),
     )
     ide_model = maybe_wrap_ddp(ide_model, device, distributed)
-    ide_opt = torch.optim.Adam(
-        [p for p in unwrap_model(ide_model).parameters() if p.requires_grad],
-        lr=cfg.get("ide_lr", 1e-3),
-    )
 
     if is_main_process():
         print("ide_model params:", count_parameters(unwrap_model(ide_model)))
@@ -447,65 +425,6 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
             f"damping={float(raw_ide.damping.detach().cpu()):.4f} "
             f"q_proc={float(raw_ide.q_proc.detach().cpu()):.4f} "
             f"r_obs={float(raw_ide.r_obs.detach().cpu()):.4f}"
-        )
-
-    warmup_epochs = int(cfg.get("ide_epochs", 20))
-    skip_ide_warmup = cfg["skip_ide_warmup"] or warmup_epochs <= 0
-    best_ide_val = float("nan") if skip_ide_warmup else float("inf")
-    if skip_ide_warmup:
-        raw_ide = unwrap_model(ide_model)
-        if is_main_process():
-            print("[IDE warmup] skipped; starting directly from alternating optimization.")
-            torch.save({"model_state": raw_ide.state_dict(), "config": cfg}, out_dir / "ide_last.pt")
-            torch.save({"model_state": raw_ide.state_dict(), "config": cfg}, out_dir / "ide_best.pt")
-        maybe_barrier()
-    else:
-        for epoch in range(warmup_epochs):
-            if ide_train_sampler is not None:
-                ide_train_sampler.set_epoch(epoch)
-
-            tr = train_ide_baseline_one_epoch(
-                ide_model=ide_model,
-                loader=ide_train_loader,
-                optimizer=ide_opt,
-                device=device,
-                max_steps=cfg.get("ide_max_steps", None),
-                noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
-            )
-            va = eval_ide_baseline(
-                ide_model=ide_model,
-                loader=ide_val_loader,
-                device=device,
-                max_steps=cfg.get("ide_max_steps", None),
-                noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
-            )
-
-            raw_ide = unwrap_model(ide_model)
-            if is_main_process():
-                print(
-                    f"[OFFLINE-STAT-ZERO][epoch {epoch}] "
-                    f"train={tr:.6f} val={va:.6f} "
-                    f"ell_par={float(raw_ide.ell_par.detach().cpu()):.4f} "
-                    f"ell_perp={float(raw_ide.ell_perp.detach().cpu()):.4f} "
-                    f"damping={float(raw_ide.damping.detach().cpu()):.4f} "
-                    f"q_proc={float(raw_ide.q_proc.detach().cpu()):.4f} "
-                    f"r_obs={float(raw_ide.r_obs.detach().cpu()):.4f}"
-                )
-                torch.save({"model_state": raw_ide.state_dict(), "config": cfg}, out_dir / "ide_last.pt")
-                if va < best_ide_val:
-                    best_ide_val = va
-                    torch.save({"model_state": raw_ide.state_dict(), "config": cfg}, out_dir / "ide_best.pt")
-            maybe_barrier()
-
-    ml_ds = MLMuDataset(bundle, seq_len=seq_len, chunk_len=chunk_len)
-    ml_train_ds, ml_val_ds, ml_split_info = contiguous_time_split(ml_ds, val_fraction=val_fraction)
-    if is_main_process():
-        print(
-            "[ML split] "
-            f"split_time={ml_split_info['split_time']} "
-            f"sample_span={ml_split_info['sample_span']} "
-            f"train={ml_split_info['train_windows']} "
-            f"val={ml_split_info['val_windows']}"
         )
 
     ml_train_loader, ml_train_sampler = build_loader(
@@ -551,129 +470,98 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     ).to(device)
     mean_model = maybe_wrap_ddp(mean_model, device, distributed)
 
-    stat_opt = torch.optim.Adam(
-        [p for p in unwrap_model(ide_model).parameters() if p.requires_grad],
-        lr=cfg.get("stat_lr", 1e-4),
+    mean_params = list(unwrap_model(mean_model).parameters())
+    ide_params = [p for p in unwrap_model(ide_model).parameters() if p.requires_grad]
+    joint_opt = torch.optim.Adam(
+        [
+            {"params": mean_params, "lr": cfg.get("ml_lr", 1e-3)},
+            {"params": ide_params, "lr": cfg.get("joint_ide_lr", cfg.get("stat_lr", 1e-4))},
+        ]
     )
-    adv_opt = torch.optim.Adam(unwrap_model(mean_model).parameters(), lr=cfg.get("ml_lr", 1e-3))
 
     if is_main_process():
         print("mean_model params:", count_parameters(unwrap_model(mean_model)))
+        print("joint_trainable params:", sum(p.numel() for p in mean_params + ide_params if p.requires_grad))
 
     best_offline_val = float("inf")
-    offline_rounds = cfg.get("offline_rounds", 3)
-    stat_epochs = cfg.get("stat_epochs_per_round", 5)
-    adv_epochs = cfg.get("adv_epochs_per_round", cfg.get("ml_epochs", 20))
-    stat_max_steps = cfg.get("stat_max_steps", cfg.get("ml_max_steps", None))
-    adv_max_steps = cfg.get("adv_max_steps", cfg.get("ml_max_steps", None))
-    use_advection_in_stat = cfg.get("use_advection_in_stat", True)
+    joint_epochs = int(
+        cfg.get(
+            "joint_epochs",
+            cfg.get("offline_rounds", 3) * cfg.get("adv_epochs_per_round", cfg.get("ml_epochs", 20)),
+        )
+    )
+    joint_max_steps = cfg.get("joint_max_steps", cfg.get("adv_max_steps", cfg.get("ml_max_steps", None)))
 
-    for round_idx in range(offline_rounds):
-        for epoch in range(adv_epochs):
-            if ml_train_sampler is not None:
-                ml_train_sampler.set_epoch(round_idx * (stat_epochs + adv_epochs) + epoch)
+    for epoch in range(joint_epochs):
+        if ml_train_sampler is not None:
+            ml_train_sampler.set_epoch(epoch)
 
-            tr = train_advection_one_epoch(
-                mean_model=mean_model,
-                ide_model=ide_model,
-                loader=ml_train_loader,
-                optimizer=adv_opt,
-                device=device,
-                seq_len=seq_len,
-                max_steps=adv_max_steps,
-                smoothness_weight=cfg.get("smoothness_weight", 1e-3),
-                one_step_weight=cfg.get("adv_one_step_weight", 0.25),
-                rollout_weight=cfg.get("adv_rollout_weight", 1.0),
-                rollout_history=cfg.get("adv_history_len", 6),
-                transport_reg_weight=cfg.get("transport_reg_weight", 1e-2),
-                state_bias_reg_weight=cfg.get("state_bias_reg_weight", 1e-3),
+        tr = train_joint_one_epoch(
+            mean_model=mean_model,
+            ide_model=ide_model,
+            loader=ml_train_loader,
+            optimizer=joint_opt,
+            device=device,
+            seq_len=seq_len,
+            max_steps=joint_max_steps,
+            smoothness_weight=cfg.get("smoothness_weight", 1e-3),
+            one_step_weight=cfg.get("adv_one_step_weight", 0.25),
+            rollout_weight=cfg.get("adv_rollout_weight", 1.0),
+            rollout_history=cfg.get("adv_history_len", 6),
+            step_nll_weight=cfg.get("step_nll_weight", 0.1),
+            noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
+            transport_reg_weight=cfg.get("transport_reg_weight", 1e-2),
+            state_bias_reg_weight=cfg.get("state_bias_reg_weight", 1e-3),
+        )
+        va = eval_joint(
+            mean_model=mean_model,
+            ide_model=ide_model,
+            loader=ml_val_loader,
+            device=device,
+            seq_len=seq_len,
+            max_steps=joint_max_steps,
+            smoothness_weight=cfg.get("smoothness_weight", 1e-3),
+            one_step_weight=cfg.get("adv_one_step_weight", 0.25),
+            rollout_weight=cfg.get("adv_rollout_weight", 1.0),
+            rollout_history=cfg.get("adv_history_len", 6),
+            step_nll_weight=cfg.get("step_nll_weight", 0.1),
+            noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
+            transport_reg_weight=cfg.get("transport_reg_weight", 1e-2),
+            state_bias_reg_weight=cfg.get("state_bias_reg_weight", 1e-3),
+        )
+
+        raw_ide = unwrap_model(ide_model)
+        if is_main_process():
+            print(
+                f"[OFFLINE-JOINT][epoch {epoch}] "
+                f"train={tr['loss']:.6f} val={va['loss']:.6f} "
+                f"train_roll={tr['rollout_mse']:.6f} val_roll={va['rollout_mse']:.6f} "
+                f"train_step={tr['one_step_mse']:.6f} val_step={va['one_step_mse']:.6f} "
+                f"train_nll={tr['step_nll']:.6f} val_nll={va['step_nll']:.6f} "
+                f"noise={tr['noise_reg']:.6f} "
+                f"smooth={tr['smoothness']:.6f} "
+                f"mu_norm={tr['mu_norm']:.6f} "
+                f"mu_abs={tr['mu_abs_mean']:.6f} "
+                f"base_mean={tr['base_scale_mean']:.6f} "
+                f"base_aniso={tr['base_scale_anisotropy']:.6f} "
+                f"transport={tr['transport_gate_mean']:.6f} "
+                f"bias_abs={tr['state_bias_abs_mean']:.6f} "
+                f"transport_reg={tr['transport_reg']:.6f} "
+                f"bias_reg={tr['state_bias_reg']:.6f} "
+                f"damping={float(raw_ide.damping.detach().cpu()):.6f} "
+                f"q_proc={float(raw_ide.q_proc.detach().cpu()):.6f} "
+                f"r_obs={float(raw_ide.r_obs.detach().cpu()):.6f} "
+                f"sigma_mean={tr['sigma_mean']:.6f} "
+                f"sigma_trace={tr['sigma_trace']:.6f} "
+                f"sigma_diag_min={tr['sigma_diag_min']:.6f}"
             )
-            va = eval_advection(
-                mean_model=mean_model,
-                ide_model=ide_model,
-                loader=ml_val_loader,
-                device=device,
-                seq_len=seq_len,
-                max_steps=adv_max_steps,
-                smoothness_weight=cfg.get("smoothness_weight", 1e-3),
-                one_step_weight=cfg.get("adv_one_step_weight", 0.25),
-                rollout_weight=cfg.get("adv_rollout_weight", 1.0),
-                rollout_history=cfg.get("adv_history_len", 6),
-                transport_reg_weight=cfg.get("transport_reg_weight", 1e-2),
-                state_bias_reg_weight=cfg.get("state_bias_reg_weight", 1e-3),
-            )
-
-            if is_main_process():
-                print(
-                    f"[OFFLINE-ADV][round {round_idx} epoch {epoch}] "
-                    f"train={tr['loss']:.6f} val={va['loss']:.6f} "
-                    f"train_roll={tr['rollout_mse']:.6f} val_roll={va['rollout_mse']:.6f} "
-                    f"train_step={tr['one_step_mse']:.6f} val_step={va['one_step_mse']:.6f} "
-                    f"smooth={tr['smoothness']:.6f} "
-                    f"mu_norm={tr['mu_norm']:.6f} "
-                    f"mu_abs={tr['mu_abs_mean']:.6f} "
-                    f"base_mean={tr['base_scale_mean']:.6f} "
-                    f"base_aniso={tr['base_scale_anisotropy']:.6f} "
-                    f"transport={tr['transport_gate_mean']:.6f} "
-                    f"bias_abs={tr['state_bias_abs_mean']:.6f} "
-                    f"transport_reg={tr['transport_reg']:.6f} "
-                    f"bias_reg={tr['state_bias_reg']:.6f} "
-                    f"sigma_mean={tr['sigma_mean']:.6f} "
-                    f"sigma_trace={tr['sigma_trace']:.6f} "
-                    f"sigma_diag_min={tr['sigma_diag_min']:.6f}"
-                )
-                save_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
-                if va["loss"] < best_offline_val:
-                    best_offline_val = va["loss"]
-                    save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
-            maybe_barrier()
-
-        for epoch in range(stat_epochs):
-            if ml_train_sampler is not None:
-                ml_train_sampler.set_epoch(round_idx * (stat_epochs + adv_epochs) + adv_epochs + epoch)
-
-            tr = train_statistical_one_epoch(
-                mean_model=mean_model,
-                ide_model=ide_model,
-                loader=ml_train_loader,
-                optimizer=stat_opt,
-                device=device,
-                seq_len=seq_len,
-                max_steps=stat_max_steps,
-                noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
-                use_advection=use_advection_in_stat,
-            )
-            va = eval_statistical(
-                mean_model=mean_model,
-                ide_model=ide_model,
-                loader=ml_val_loader,
-                device=device,
-                seq_len=seq_len,
-                max_steps=stat_max_steps,
-                noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
-                use_advection=use_advection_in_stat,
-            )
-
-            raw_ide = unwrap_model(ide_model)
-            if is_main_process():
-                print(
-                    f"[OFFLINE-STAT][round {round_idx} epoch {epoch}] "
-                    f"train={tr['loss']:.6f} val={va['loss']:.6f} "
-                    f"train_nll={tr['nll']:.6f} val_nll={va['nll']:.6f} "
-                    f"ell_par={float(raw_ide.ell_par.detach().cpu()):.4f} "
-                    f"ell_perp={float(raw_ide.ell_perp.detach().cpu()):.4f} "
-                    f"damping={float(raw_ide.damping.detach().cpu()):.4f} "
-                    f"q_proc={float(raw_ide.q_proc.detach().cpu()):.4f} "
-                    f"r_obs={float(raw_ide.r_obs.detach().cpu()):.4f}"
-                )
-                save_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
-                if va["loss"] < best_offline_val:
-                    best_offline_val = va["loss"]
-                    save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
-            maybe_barrier()
+            save_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
+            if va["loss"] < best_offline_val:
+                best_offline_val = va["loss"]
+                save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
+        maybe_barrier()
 
     if is_main_process():
-        print("best ide val:", best_ide_val)
         print("best offline val:", best_offline_val)
 
     cleanup_process_group()

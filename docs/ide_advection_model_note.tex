@@ -1,13 +1,11 @@
 \documentclass[11pt,a4paper]{article}
 
-% --- Essential Packages ---
 \usepackage[margin=1in]{geometry}
 \usepackage{amsmath,amssymb,amsfonts,bm,mathtools}
 \usepackage{booktabs}
 \usepackage{hyperref}
 \usepackage{enumitem}
 
-% --- Hyperref Setup ---
 \hypersetup{
   colorlinks=true,
   linkcolor=blue,
@@ -15,245 +13,328 @@
   citecolor=blue
 }
 
-% --- Custom Math Commands ---
 \newcommand{\R}{\mathbb{R}}
-\newcommand{\E}{\mathbb{E}}
-\newcommand{\Var}{\mathrm{Var}}
-\newcommand{\Cov}{\mathrm{Cov}}
 \newcommand{\Normal}{\mathcal{N}}
-\newcommand{\vect}{\mathrm{vec}}
-\newcommand{\tr}{\mathrm{tr}}
 \newcommand{\Id}{I}
+\newcommand{\diag}{\mathrm{diag}}
 
-\title{\textbf{Wind IDE-Advection Model Specification}}
+\title{\textbf{Current Offline Wind IDE-Advection Model}}
 \author{}
 \date{\today}
 
 \begin{document}
 \maketitle
 
-\section{Document Purpose}
+\section{Purpose}
 
-This document outlines the current implementation of the IDE-Advection model. The goal is to clarify the following:
-\begin{enumerate}[label=\arabic*.]
-  \item Definition of state variables;
-  \item Advection network output parameterization;
-  \item Integration of covariance $\Sigma_t$ into the propagation shape;
-  \item Allocation of parameters between the IDE and Machine Learning modules;
-  \item Offline two-stage training and multi-step validation procedures.
-\end{enumerate}
+This note describes the \emph{current} offline model implemented in the codebase after the shift away from alternating optimization and away from Kalman-style initialization during offline training.
 
-\section{State Variables and Observations}
+The key design choice is:
+\begin{quote}
+At forecast time origin, the model uses the \textbf{current observed truth} as the current state, and only learns how to map that state to future states.
+\end{quote}
 
-We consider 3 spatial stations, each with two-dimensional wind components $(u, v)$. At time $t$, the state vector is defined as:
+Therefore the current offline model is best understood as a \textbf{deterministic forecast model with a residual uncertainty head}, not as a latent-state filter that must infer an unobserved $x_t$ before predicting $x_{t+1}$.
+
+\section{State and Observation}
+
+We have three stations and two wind components per station. The state is
 \begin{equation}
-Y_t
-=
+Y_t =
 \begin{bmatrix}
 u_t(s_1) & v_t(s_1) & u_t(s_2) & v_t(s_2) & u_t(s_3) & v_t(s_3)
 \end{bmatrix}^{\!\top}
 \in \R^6.
 \end{equation}
 
-The observation vector is given by:
+For offline training and validation, the observation at the current forecast origin is treated as the current state:
 \begin{equation}
-Z_t = Y_t + \varepsilon_t,
-\qquad
-\varepsilon_t \sim \Normal(0, R),
-\end{equation}
-where in the current implementation:
-\begin{equation}
-R = r_{\mathrm{obs}}^2 \Id_6.
-\end{equation}
-Thus, the observation equation is a linear Gaussian model where the observation matrix is the identity matrix.
-
-\section{NWP-driven Advection Distribution}
-
-\subsection{Definition of Random Advection}
-The NWP encoder consumes the recent $L$ frames of gridded NWP inputs
-\begin{equation}
-X_{t-L+1:t} \in \R^{L \times C \times Y \times X},
-\end{equation}
-applies a frame-wise CNN, and then aggregates the temporal embeddings with a Transformer encoder.
-
-Instead of outputting a free transition matrix directly, the network outputs the parameters of a paired advection distribution:
-\begin{equation}
-\begin{bmatrix}
-A_{uu,t} \\
-A_{vv,t}
-\end{bmatrix}
-\sim \Normal(\mu_t, \Sigma_t),
-\qquad
-\mu_t \in \R^4,\ \Sigma_t \in \R^{4\times 4},
-\end{equation}
-where
-\begin{equation}
-A_{uu,t}, A_{vv,t} \in \R^2,
-\qquad
-\mu_t =
-\begin{bmatrix}
-\mu_{uu,x}(t) & \mu_{uu,y}(t) & \mu_{vv,x}(t) & \mu_{vv,y}(t)
-\end{bmatrix}^{\!\top}.
+X_t \equiv Y_t.
 \end{equation}
 
-\subsection{Network Output Parameterization}
-The advection network outputs two objects:
+In other words, the current model does \emph{not} train by first inferring a separate latent $p(X_t \mid Y_{0:t})$ with learnable $p_0$ and $m_0$. Those parameters remain in the code only for legacy compatibility, and they are not meant to dominate the current offline objective.
+
+\section{NWP-driven Dynamics Outputs}
+
+Given the recent NWP tensor
+\begin{equation}
+\mathcal{N}_{t-L+1:t} \in \R^{L \times C \times H \times W},
+\end{equation}
+the advection network produces the following quantities:
 \begin{enumerate}[label=\arabic*.]
-  \item \textbf{Mean advection vector} $\mu_t \in \R^4$;
-  \item \textbf{Joint covariance} $\Sigma_t \in \R^{4\times 4}$.
+  \item a paired mean advection vector
+  \begin{equation}
+  \mu_t \in \R^4,
+  \qquad
+  \mu_t =
+  \begin{bmatrix}
+  \mu_{uu,x}(t) & \mu_{uu,y}(t) & \mu_{vv,x}(t) & \mu_{vv,y}(t)
+  \end{bmatrix}^{\!\top},
+  \end{equation}
+  \item a joint covariance
+  \begin{equation}
+  \Sigma_t \in \R^{4 \times 4},
+  \end{equation}
+  \item directional base scales
+  \begin{equation}
+  s_t =
+  \begin{bmatrix}
+  s_{\parallel}(t) & s_{\perp}(t)
+  \end{bmatrix}
+  \in \R_{+}^2,
+  \end{equation}
+  \item component-wise transport gates
+  \begin{equation}
+  g_t =
+  \begin{bmatrix}
+  g_u(t) & g_v(t)
+  \end{bmatrix}
+  \in [0,g_{\max}]^2,
+  \end{equation}
+  \item an additive state-bias residual
+  \begin{equation}
+  b_t \in \R^6.
+  \end{equation}
 \end{enumerate}
 
-The covariance matrix is constructed through a Cholesky factor:
-\begin{equation}
-L_t=
-\begin{pmatrix}
-\ell_{11} & 0 & 0 & 0\\
-\ell_{21} & \ell_{22} & 0 & 0\\
-\ell_{31} & \ell_{32} & \ell_{33} & 0\\
-\ell_{41} & \ell_{42} & \ell_{43} & \ell_{44}
-\end{pmatrix},
-\qquad
-\Sigma_t = L_t L_t^\top.
-\end{equation}
+The intended interpretation is:
+\begin{itemize}
+  \item $\mu_t$ gives the preferred transport direction;
+  \item $\Sigma_t$ gives uncertainty broadening of that transport;
+  \item $s_{\parallel}(t), s_{\perp}(t)$ define the \emph{deterministic base shape} of the kernel;
+  \item $g_t$ controls how much the model deviates from persistence;
+  \item $b_t$ lets NWP directly correct systematic amplitude and bias errors.
+\end{itemize}
 
-\section{Spatial Transport Kernel}
-\subsection{Theorem-inspired spatial propagation}
+\section{Pairwise Transport Kernels}
 
-The physical transport part is defined on the three station locations. Let
-\begin{equation}
-h_{ij}=
-\begin{bmatrix}
-x_i-x_j \\
-y_i-y_j
-\end{bmatrix}
-\in \R^2
-\end{equation}
-be the displacement from site $s_j$ to site $s_i$. This same spatial vector is used for all four component pairs $(u,u)$, $(u,v)$, $(v,u)$, $(v,v)$. In particular, when two components come from the same site, the spatial distance is zero even if one is $u$ and the other is $v$.
+Let $h_{ab} \in \R^2$ denote the projected spatial displacement from source site $s_b$ to target site $s_a$.
 
-Following the corrected Lagrangian form in Theorem 2', we define one kernel for each target/source component pair. For $i,j \in \{u,v\}$:
+For each target/source component pair $(i,j) \in \{u,v\}^2$, the model constructs a Gaussian-like transport kernel
 \begin{equation}
 K_t^{(ij)}(a,b)
 \propto
 \left|D_t^{(ij)}\right|^{-1/2}
-\exp\left(
-- {h_t^{(ij)}(a,b)}^\top
-{D_t^{(ij)}}^{-1}
-h_t^{(ij)}(a,b)
+\exp\!\left(
+-
+\bigl(h_{ab} - d_t^{(ij)}\bigr)^\top
+\left(D_t^{(ij)}\right)^{-1}
+\bigl(h_{ab} - d_t^{(ij)}\bigr)
 \right),
 \end{equation}
+followed by row normalization over source site index $b$.
+
+The drift term $d_t^{(ij)}$ is derived from the corresponding blocks of $\mu_t$, and the covariance term has the form
 \begin{equation}
-h_t^{(uu)}(a,b)=h_{ab}-\Delta t\,\mu_{uu}(t),
-\qquad
-h_t^{(vv)}(a,b)=h_{ab}-\Delta t\,\mu_{vv}(t),
-\end{equation}
-\begin{equation}
-h_t^{(uv)}(a,b)=h_{ab}-\Delta t\,(\mu_{uu}(t)-\mu_{vv}(t)),
-\qquad
-h_t^{(vu)}(a,b)=h_{ab}-\Delta t\,(\mu_{vv}(t)-\mu_{uu}(t)),
-\end{equation}
-and
-\begin{equation}
-D_t^{(uu)}=\Id_2+2\Delta t^2\Sigma_{uu,uu}(t)+\epsilon \Id_2,
-\qquad
-D_t^{(vv)}=\Id_2+2\Delta t^2\Sigma_{vv,vv}(t)+\epsilon \Id_2,
-\end{equation}
-\begin{equation}
-D_t^{(uv)}=\Id_2+2\Delta t^2\left(
-\Sigma_{uu,uu}(t)+\Sigma_{vv,vv}(t)-\Sigma_{uu,vv}(t)-\Sigma_{vv,uu}(t)
-\right)+\epsilon \Id_2,
-\end{equation}
-\begin{equation}
-D_t^{(vu)}=\Id_2+2\Delta t^2\left(
-\Sigma_{vv,vv}(t)+\Sigma_{uu,uu}(t)-\Sigma_{vv,uu}(t)-\Sigma_{uu,vv}(t)
-\right)+\epsilon \Id_2.
+D_t^{(ij)} = B_t^{(ij)} + 2 \Delta t^2 \, \Sigma_{t,\mathrm{pair}}^{(ij)} + \varepsilon \Id_2.
 \end{equation}
 
-\section{State Transition Equation}
-
-The full transition is assembled directly from the four theorem-based kernels. Each block from source site $s_b$ to target site $s_a$ is
-\begin{equation}
-A_t^{(a,b)}=
-\begin{pmatrix}
-K_t^{(uu)}(a,b) & K_t^{(uv)}(a,b) \\
-K_t^{(vu)}(a,b) & K_t^{(vv)}(a,b)
-\end{pmatrix}.
-\end{equation}
-
-The state transition is
-\begin{equation}
-Y_{t+1} = A_t Y_t + \eta_t, \quad \eta_t \sim \Normal(0, Q_t),
-\end{equation}
-\begin{equation}
-A_t = \rho_t \, \widetilde{A}_t, \qquad \rho_t = 1 - \Delta t\, \lambda(t),
-\qquad
-Q_t = q_{\mathrm{proc}}(t)^2 \Id_6,
-\end{equation}
-where $\widetilde{A}_t$ is the block matrix assembled from $\{A_t^{(i,j)}\}$ and $\lambda(t)$ is a time-varying damping parameter.
-
-\section{Time-varying IDE Parameters}
-
-The IDE parameters are no longer global constants. Instead, they are learned as time-varying sequences indexed by the absolute time location of each training window.
-
-To avoid introducing a separate NWP-driven IDE network, the current code uses a piecewise-constant parameterization. Let the total sequence length be $T$, and let $w$ be a configurable temporal window size. Then each IDE parameter is first learned on a coarse knot grid:
-\begin{equation}
-\{\tilde q_k\}_{k=1}^{K},\quad
-\{\tilde r_k\}_{k=1}^{K},\quad
-\{\tilde p_k\}_{k=1}^{K},\quad
-\{\tilde \lambda_k\}_{k=1}^{K},\quad
-\{\tilde m_k\}_{k=1}^{K},
-\end{equation}
-with
-\begin{equation}
-K = \left\lceil \frac{T}{w} \right\rceil.
-\end{equation}
-Each knot value is then repeated within its window to produce the full time-varying series:
-\begin{equation}
-q_{\mathrm{proc}}(t), \quad
-r_{\mathrm{obs}}(t), \quad
-p_0(t), \quad
-\lambda(t), \quad
-m_0(t).
-\end{equation}
-
-This means:
+Here:
 \begin{itemize}
-  \item $w=1$ gives the finest possible time resolution;
-  \item larger $w$ gives a smoother, coarser parameter trajectory.
+  \item $B_t^{(ij)}$ is a directional base covariance obtained from $(s_{\parallel}(t), s_{\perp}(t))$ and the local transport direction;
+  \item $\Sigma_{t,\mathrm{pair}}^{(ij)}$ is the relevant pairwise block induced by the joint covariance $\Sigma_t$;
+  \item $\varepsilon \Id_2$ is only a numerical stabilizer.
 \end{itemize}
 
-\section{Two-Stage Offline Training}
-
-\subsection{Stage 1: Measurement-only IDE Fitting}
-Stage 1 assumes $\mu_t=0$ and $\Sigma_t=0$, so the system reduces to a measurement-only IDE model. In this stage, the model fits the time-varying IDE parameter trajectories
+This means the kernel width is no longer a hard-coded $\Id_2$ floor. Instead:
 \begin{equation}
-q_{\mathrm{proc}}(t),\quad r_{\mathrm{obs}}(t),\quad p_0(t),\quad \lambda(t),\quad m_0(t)
+\text{kernel width} = \text{deterministic base shape} + \text{uncertainty broadening}.
 \end{equation}
-directly from measurement data.
 
-\subsection{Stage 2: Alternating Training}
+\section{Gated State Transition}
+
+The normalized pairwise kernels are assembled into a block transport operator
+\begin{equation}
+\widetilde{A}_t \in \R^{6 \times 6}.
+\end{equation}
+
+Let
+\begin{equation}
+\rho_t = 1 - \Delta t \, \lambda_t,
+\end{equation}
+where $\lambda_t$ is the learned damping coefficient. The damped transport target is
+\begin{equation}
+T_t = \rho_t \widetilde{A}_t.
+\end{equation}
+
+Define the state-level gate matrix by repeating the component gates over sites:
+\begin{equation}
+G_t =
+\diag\!\bigl(
+g_u(t), g_v(t),
+g_u(t), g_v(t),
+g_u(t), g_v(t)
+\bigr).
+\end{equation}
+
+The actual transition used by the current model is
+\begin{equation}
+A_t = \Id_6 + G_t \bigl(T_t - \Id_6 \bigr).
+\end{equation}
+
+This is the most important structural change. It implies:
+\begin{equation}
+g_t = 0
+\quad \Longrightarrow \quad
+A_t = \Id_6,
+\end{equation}
+so zero transport now means exact persistence rather than automatic spatial smoothing.
+
+The one-step deterministic forecast is
+\begin{equation}
+\widehat{Y}_{t+1 \mid t} = A_t Y_t + b_t.
+\end{equation}
+
+\section{Residual Uncertainty Model}
+
+Although the offline forecast path is deterministic, the model still keeps scalar process and observation noise parameters:
+\begin{equation}
+q_{\mathrm{proc}}(t), \qquad r_{\mathrm{obs}}(t).
+\end{equation}
+
+They are \emph{not} used to infer the current state during offline training. Instead, they parameterize the predictive residual scale for one-step teacher-forced forecasts:
+\begin{equation}
+E_t = Y_{t+1} - \widehat{Y}_{t+1 \mid t},
+\end{equation}
+\begin{equation}
+E_t \sim \Normal\!\left(0, \sigma_t^2 \Id_6\right),
+\qquad
+\sigma_t^2 = q_{\mathrm{proc}}(t)^2 + r_{\mathrm{obs}}(t+1)^2.
+\end{equation}
+
+So in the current formulation:
 \begin{itemize}
-  \item \textbf{Statistical Step}: Fix the advection network, update the time-varying IDE parameters $\theta_{\mathrm{ide}}$.
-  \item \textbf{Advection Step}: Fix IDE parameters, update advection network parameters $\theta_{\mathrm{adv}}$ using a smoothness penalty on the 4-dimensional $\mu_t$ and the 4-by-4 $\Sigma_t$ trajectories.
+  \item $q_{\mathrm{proc}}$ is a forecast uncertainty term;
+  \item $r_{\mathrm{obs}}$ is a residual observation/error floor;
+  \item neither is supposed to replace the transport dynamics.
 \end{itemize}
 
-The optimized parameter groups are therefore:
+\section{Joint Offline Training Objective}
+
+Training is now performed in a \textbf{single joint stage}: the advection network and the IDE parameters $(q_{\mathrm{proc}}, r_{\mathrm{obs}}, \lambda)$ are optimized together.
+
+For a window
+\begin{equation}
+Y_{t_0:t_0+K} = (Y_{t_0}, Y_{t_0+1}, \dots, Y_{t_0+K}),
+\end{equation}
+define the teacher-forced one-step forecasts
+\begin{equation}
+\widehat{Y}_{t+1 \mid t} = A_t Y_t + b_t,
+\qquad
+t=t_0,\dots,t_0+K-1.
+\end{equation}
+
+Define the one-step MSE:
+\begin{equation}
+\mathcal{L}_{\mathrm{step}}
+=
+\frac{1}{K}
+\sum_{k=0}^{K-1}
+\left\|
+\widehat{Y}_{t_0+k+1 \mid t_0+k} - Y_{t_0+k+1}
+\right\|_2^2.
+\end{equation}
+
+Choose a forecast origin $t_\star$ inside the window. Starting from the \emph{true} state $Y_{t_\star}$, the model rolls out open-loop:
+\begin{equation}
+\widehat{Y}_{t_\star+h+1 \mid t_\star}
+=
+A_{t_\star+h}\widehat{Y}_{t_\star+h \mid t_\star}+b_{t_\star+h}.
+\end{equation}
+
+This gives the rollout loss
+\begin{equation}
+\mathcal{L}_{\mathrm{roll}}
+=
+\frac{1}{H}
+\sum_{h=0}^{H-1}
+\left\|
+\widehat{Y}_{t_\star+h+1 \mid t_\star} - Y_{t_\star+h+1}
+\right\|_2^2.
+\end{equation}
+
+The one-step Gaussian residual NLL is
+\begin{equation}
+\mathcal{L}_{\mathrm{nll}}
+=
+\frac{1}{K}
+\sum_{k=0}^{K-1}
+\frac{1}{2}
+\sum_{d=1}^{6}
+\left[
+\frac{\bigl(Y_{t_0+k+1}^{(d)}-\widehat{Y}_{t_0+k+1 \mid t_0+k}^{(d)}\bigr)^2}{\sigma_{t_0+k}^2}
+\;+\;
+\log \sigma_{t_0+k}^2
+\;+\;
+\log(2\pi)
+\right].
+\end{equation}
+
+Finally, the total joint objective is
+\begin{equation}
+\mathcal{L}
+=
+\alpha_{\mathrm{step}}\mathcal{L}_{\mathrm{step}}
+\;+\;
+\alpha_{\mathrm{roll}}\mathcal{L}_{\mathrm{roll}}
+\;+\;
+\alpha_{\mathrm{nll}}\mathcal{L}_{\mathrm{nll}}
+\;+\;
+\alpha_{\mathrm{noise}}\mathcal{R}_{\mathrm{noise}}
+\;+\;
+\alpha_{\mathrm{smooth}}\mathcal{R}_{\mathrm{smooth}}
+\;+\;
+\alpha_{\mathrm{gate}}\mathcal{R}_{\mathrm{gate}}
+\;+\;
+\alpha_{\mathrm{bias}}\mathcal{R}_{\mathrm{bias}},
+\end{equation}
+where:
 \begin{align}
-\theta_{\mathrm{ide}}
-&=
-\left\{
-\{\log \tilde q_k\}_{k=1}^{K},
-\{\log \tilde r_k\}_{k=1}^{K},
-\{\log \tilde p_k\}_{k=1}^{K},
-\{\log \tilde \lambda_k\}_{k=1}^{K},
-\{\tilde m_k\}_{k=1}^{K}
-\right\}, \\
-\theta_{\mathrm{adv}}
-&=
-\text{all trainable parameters in the NWP encoder, temporal encoder, mean head, and Cholesky head.}
+\mathcal{R}_{\mathrm{noise}} &= q_{\mathrm{proc}}^2 + r_{\mathrm{obs}}^2, \\
+\mathcal{R}_{\mathrm{smooth}} &= \sum_t \|\theta_{t+1}-\theta_t\|_2^2,
+\quad
+\theta_t := (\mu_t, \Sigma_t, s_t, g_t, b_t), \\
+\mathcal{R}_{\mathrm{gate}} &= \sum_t \|g_t\|_2^2, \\
+\mathcal{R}_{\mathrm{bias}} &= \sum_t \|b_t\|_2^2.
 \end{align}
 
-\section{Multi-step Validation}
+This objective explicitly encodes the modeling preference:
+\begin{quote}
+Stay close to persistence unless transport or NWP residual correction produces a real forecast gain.
+\end{quote}
 
-Validation uses a \textit{rolling forecast origin} approach. After filtering through the \texttt{history\_len}, the model predicts $H$ steps into the future using only NWP-generated $\mu_t$ and $\Sigma_t$, without feeding in future ground truth observations.
+\section{Validation Protocol}
+
+The current validation should match the current training semantics:
+\begin{enumerate}[label=\arabic*.]
+  \item \textbf{Teacher-forced one-step validation:} use the true current state $Y_t$ to predict $Y_{t+1}$.
+  \item \textbf{Open-loop multi-step validation:} use the true state at forecast origin and then recursively roll forward without future truth updates.
+\end{enumerate}
+
+Persistence remains the main baseline:
+\begin{equation}
+\widehat{Y}_{t+h}^{\mathrm{pers}} = Y_t.
+\end{equation}
+
+If the proposed model cannot beat persistence under this protocol, then either:
+\begin{enumerate}[label=\arabic*.]
+  \item the transport correction is still too weak,
+  \item the residual bias path is misused,
+  \item or the state-transition family is still too restrictive.
+\end{enumerate}
+
+\section{What Is No Longer the Main Offline Story}
+
+The following objects still exist in the codebase for compatibility, but they are no longer the intended center of the offline model:
+\begin{itemize}
+  \item a learned initial prior mean $m_0$,
+  \item a learned initial covariance scale $p_0$,
+  \item alternating IDE-only versus ML-only optimization rounds.
+\end{itemize}
+
+The current offline formulation should instead be read as:
+\begin{quote}
+\textbf{current truth} $+$ \textbf{gated transport correction} $+$ \textbf{NWP residual bias correction} $+$ \textbf{residual uncertainty calibration}.
+\end{quote}
 
 \end{document}

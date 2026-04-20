@@ -181,6 +181,8 @@ def _advection_prediction_loss(
     one_step_weight,
     rollout_weight,
     rollout_history,
+    step_nll_weight,
+    noise_reg_weight,
     transport_reg_weight,
     state_bias_reg_weight,
 ):
@@ -191,14 +193,25 @@ def _advection_prediction_loss(
 
     one_step = z_seq.new_tensor(0.0)
     if one_step_weight > 0.0:
-        pred_next = raw_ide.predict_sequence(
+        pred_next = raw_ide.deterministic_predict_sequence(
             z_seq=z_seq,
             site_lon=site_lon,
             site_lat=site_lat,
             dynamics_seq=dynamics_seq,
             start_idx=start_idx,
+            apply_damping=True,
         )
         one_step = _prediction_mse(pred_next, z_seq[:, 1:])
+    step_nll = z_seq.new_tensor(0.0)
+    if step_nll_weight > 0.0:
+        step_nll = raw_ide.deterministic_sequence_nll(
+            z_seq=z_seq,
+            site_lon=site_lon,
+            site_lat=site_lat,
+            dynamics_seq=dynamics_seq,
+            start_idx=start_idx,
+            apply_damping=True,
+        )
 
     steps = z_seq.shape[1]
     history_len = min(max(int(rollout_history), 1), steps - 1)
@@ -206,14 +219,14 @@ def _advection_prediction_loss(
     if future_horizon <= 0:
         raise ValueError("Need at least one open-loop target step for advection supervision.")
 
-    hist_dyn_len = max(history_len - 1, 0)
-    rollout_pred = raw_ide.forecast_multistep(
-        z_hist=z_seq[:, :history_len],
+    forecast_start_idx = start_idx + history_len - 1
+    rollout_pred = raw_ide.deterministic_forecast_multistep(
+        z_start=z_seq[:, history_len - 1],
         site_lon=site_lon,
         site_lat=site_lat,
-        dynamics_hist=_slice_dynamics_sequence(dynamics_seq, 0, hist_dyn_len),
-        dynamics_future=_slice_dynamics_sequence(dynamics_seq, hist_dyn_len, dynamics_seq["mu"].shape[1]),
-        start_idx=start_idx,
+        dynamics_future=_slice_dynamics_sequence(dynamics_seq, history_len - 1, dynamics_seq["mu"].shape[1]),
+        start_idx=forecast_start_idx,
+        apply_damping=True,
     )
     rollout_target = z_seq[:, history_len:]
     rollout = _prediction_mse(rollout_pred, rollout_target)
@@ -221,9 +234,12 @@ def _advection_prediction_loss(
     smoothness = dynamics_smoothness_penalty(dynamics_seq)
     transport_reg = dynamics_seq["transport_gates"].square().mean()
     state_bias_reg = dynamics_seq["state_bias"].square().mean()
+    noise_reg = raw_ide.noise_regularization()
     loss = (
         one_step_weight * one_step
         + rollout_weight * rollout
+        + step_nll_weight * step_nll
+        + noise_reg_weight * noise_reg
         + smoothness_weight * smoothness
         + transport_reg_weight * transport_reg
         + state_bias_reg_weight * state_bias_reg
@@ -232,6 +248,8 @@ def _advection_prediction_loss(
         "loss": float(loss.detach().cpu()),
         "one_step_mse": float(one_step.detach().cpu()),
         "rollout_mse": float(rollout.detach().cpu()),
+        "step_nll": float(step_nll.detach().cpu()),
+        "noise_reg": float(noise_reg.detach().cpu()),
         "smoothness": float(smoothness.detach().cpu()),
         "transport_reg": float(transport_reg.detach().cpu()),
         "state_bias_reg": float(state_bias_reg.detach().cpu()),
@@ -357,6 +375,8 @@ def train_advection_one_epoch(
     one_step_weight=0.25,
     rollout_weight=1.0,
     rollout_history=6,
+    step_nll_weight=0.1,
+    noise_reg_weight=1e-4,
     transport_reg_weight=1e-2,
     state_bias_reg_weight=1e-3,
 ):
@@ -367,6 +387,8 @@ def train_advection_one_epoch(
         "loss": [],
         "one_step_mse": [],
         "rollout_mse": [],
+        "step_nll": [],
+        "noise_reg": [],
         "smoothness": [],
         "transport_reg": [],
         "state_bias_reg": [],
@@ -401,6 +423,8 @@ def train_advection_one_epoch(
             one_step_weight=one_step_weight,
             rollout_weight=rollout_weight,
             rollout_history=rollout_history,
+            step_nll_weight=step_nll_weight,
+            noise_reg_weight=noise_reg_weight,
             transport_reg_weight=transport_reg_weight,
             state_bias_reg_weight=state_bias_reg_weight,
         )
@@ -428,6 +452,8 @@ def eval_advection(
     one_step_weight=0.25,
     rollout_weight=1.0,
     rollout_history=6,
+    step_nll_weight=0.1,
+    noise_reg_weight=1e-4,
     transport_reg_weight=1e-2,
     state_bias_reg_weight=1e-3,
 ):
@@ -438,6 +464,8 @@ def eval_advection(
         "loss": [],
         "one_step_mse": [],
         "rollout_mse": [],
+        "step_nll": [],
+        "noise_reg": [],
         "smoothness": [],
         "transport_reg": [],
         "state_bias_reg": [],
@@ -471,6 +499,8 @@ def eval_advection(
             one_step_weight=one_step_weight,
             rollout_weight=rollout_weight,
             rollout_history=rollout_history,
+            step_nll_weight=step_nll_weight,
+            noise_reg_weight=noise_reg_weight,
             transport_reg_weight=transport_reg_weight,
             state_bias_reg_weight=state_bias_reg_weight,
         )
@@ -482,5 +512,154 @@ def eval_advection(
     return reduce_metric_means(metrics, device)
 
 
-train_ml_mu_one_epoch = train_advection_one_epoch
-eval_ml_mu = eval_advection
+def train_joint_one_epoch(
+    mean_model,
+    ide_model,
+    loader,
+    optimizer,
+    device,
+    seq_len,
+    max_steps=None,
+    smoothness_weight=1e-3,
+    one_step_weight=0.25,
+    rollout_weight=1.0,
+    rollout_history=6,
+    step_nll_weight=0.1,
+    noise_reg_weight=1e-4,
+    transport_reg_weight=1e-2,
+    state_bias_reg_weight=1e-3,
+):
+    mean_model.train()
+    ide_model.train()
+    metrics = {
+        "loss": [],
+        "one_step_mse": [],
+        "rollout_mse": [],
+        "step_nll": [],
+        "noise_reg": [],
+        "smoothness": [],
+        "transport_reg": [],
+        "state_bias_reg": [],
+        "sigma_mean": [],
+        "sigma_trace": [],
+        "sigma_diag_min": [],
+        "sigma_offdiag_mean": [],
+        "mu_norm": [],
+        "mu_abs_mean": [],
+        "base_scale_mean": [],
+        "base_scale_anisotropy": [],
+        "transport_gate_mean": [],
+        "state_bias_abs_mean": [],
+    }
+
+    for step, batch in enumerate(loader):
+        if max_steps is not None and step >= max_steps:
+            break
+
+        raw_ide = unwrap_model(ide_model)
+        batch = move_batch_to_device(batch, device)
+        optimizer.zero_grad()
+        z_aligned, dynamics_seq, aligned_start_idx = _aligned_inputs(batch, seq_len, mean_model=mean_model)
+
+        loss, stats = _advection_prediction_loss(
+            ide_model=ide_model,
+            z_seq=z_aligned,
+            site_lon=batch["site_lon"],
+            site_lat=batch["site_lat"],
+            dynamics_seq=dynamics_seq,
+            start_idx=aligned_start_idx,
+            smoothness_weight=smoothness_weight,
+            one_step_weight=one_step_weight,
+            rollout_weight=rollout_weight,
+            rollout_history=rollout_history,
+            step_nll_weight=step_nll_weight,
+            noise_reg_weight=noise_reg_weight,
+            transport_reg_weight=transport_reg_weight,
+            state_bias_reg_weight=state_bias_reg_weight,
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(mean_model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(ide_model.parameters(), 1.0)
+        optimizer.step()
+        raw_ide.clamp_parameters_()
+
+        for key in metrics:
+            metrics[key].append(stats[key])
+
+    if not metrics["loss"]:
+        return {key: float("nan") for key in metrics}
+    return reduce_metric_means(metrics, device)
+
+
+@torch.no_grad()
+def eval_joint(
+    mean_model,
+    ide_model,
+    loader,
+    device,
+    seq_len,
+    max_steps=None,
+    smoothness_weight=1e-3,
+    one_step_weight=0.25,
+    rollout_weight=1.0,
+    rollout_history=6,
+    step_nll_weight=0.1,
+    noise_reg_weight=1e-4,
+    transport_reg_weight=1e-2,
+    state_bias_reg_weight=1e-3,
+):
+    mean_model.eval()
+    ide_model.eval()
+    metrics = {
+        "loss": [],
+        "one_step_mse": [],
+        "rollout_mse": [],
+        "step_nll": [],
+        "noise_reg": [],
+        "smoothness": [],
+        "transport_reg": [],
+        "state_bias_reg": [],
+        "sigma_mean": [],
+        "sigma_trace": [],
+        "sigma_diag_min": [],
+        "sigma_offdiag_mean": [],
+        "mu_norm": [],
+        "mu_abs_mean": [],
+        "base_scale_mean": [],
+        "base_scale_anisotropy": [],
+        "transport_gate_mean": [],
+        "state_bias_abs_mean": [],
+    }
+
+    for step, batch in enumerate(loader):
+        if max_steps is not None and step >= max_steps:
+            break
+
+        batch = move_batch_to_device(batch, device)
+        z_aligned, dynamics_seq, aligned_start_idx = _aligned_inputs(batch, seq_len, mean_model=mean_model)
+        _, stats = _advection_prediction_loss(
+            ide_model=ide_model,
+            z_seq=z_aligned,
+            site_lon=batch["site_lon"],
+            site_lat=batch["site_lat"],
+            dynamics_seq=dynamics_seq,
+            start_idx=aligned_start_idx,
+            smoothness_weight=smoothness_weight,
+            one_step_weight=one_step_weight,
+            rollout_weight=rollout_weight,
+            rollout_history=rollout_history,
+            step_nll_weight=step_nll_weight,
+            noise_reg_weight=noise_reg_weight,
+            transport_reg_weight=transport_reg_weight,
+            state_bias_reg_weight=state_bias_reg_weight,
+        )
+        for key in metrics:
+            metrics[key].append(stats[key])
+
+    if not metrics["loss"]:
+        return {key: float("nan") for key in metrics}
+    return reduce_metric_means(metrics, device)
+
+
+train_ml_mu_one_epoch = train_joint_one_epoch
+eval_ml_mu = eval_joint

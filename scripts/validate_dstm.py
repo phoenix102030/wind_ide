@@ -267,7 +267,7 @@ def evaluate_dataset(
         start_idx = batch["time_idx_start"] + seq_len - 1
         y_true = z_aligned[:, 1:]
 
-        static_pred = ide_model.predict_sequence(
+        static_pred = ide_model.deterministic_predict_sequence(
             z_seq=z_aligned,
             site_lon=batch["site_lon"],
             site_lat=batch["site_lat"],
@@ -276,7 +276,7 @@ def evaluate_dataset(
         )
         nll_stats["static_ide"].append(
             float(
-                ide_model.sequence_nll(
+                ide_model.deterministic_sequence_nll(
                     z_seq=z_aligned,
                     site_lon=batch["site_lon"],
                     site_lat=batch["site_lat"],
@@ -308,7 +308,7 @@ def evaluate_dataset(
 
         if mean_model is not None:
             dynamics_seq = build_dynamics_sequence(mean_model, nwp_full, seq_len=seq_len)
-            joint_pred = ide_model.predict_sequence(
+            joint_pred = ide_model.deterministic_predict_sequence(
                 z_seq=z_aligned,
                 site_lon=batch["site_lon"],
                 site_lat=batch["site_lat"],
@@ -317,7 +317,7 @@ def evaluate_dataset(
             )
             nll_stats["joint_dstm"].append(
                 float(
-                    ide_model.sequence_nll(
+                    ide_model.deterministic_sequence_nll(
                         z_seq=z_aligned,
                         site_lon=batch["site_lon"],
                         site_lat=batch["site_lat"],

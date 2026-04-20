@@ -39,6 +39,11 @@ ide_epochs: 0
 ide_max_steps: 100
 skip_ide_warmup: true
 train_ell_params: true
+train_q_proc: true
+train_r_obs: true
+train_damping: true
+train_p0: false
+train_init_mean: false
 
 init_log_q_proc: -2
 init_log_r_obs: -2
@@ -66,6 +71,7 @@ sigma_mode: network
 
 ml_batch_size: 128
 ml_lr: 0.001
+joint_ide_lr: 0.0002
 ml_epochs: 40
 ml_max_steps: 100
 stat_lr: 0.0001
@@ -73,6 +79,7 @@ smoothness_weight: 0.001
 adv_one_step_weight: 0.25
 adv_rollout_weight: 1.0
 adv_history_len: 6
+step_nll_weight: 0.1
 transport_reg_weight: 0.01
 state_bias_reg_weight: 0.001
 mu_scale: 1.25
@@ -88,13 +95,8 @@ init_transport_gate: 0.05
 transport_gate_max: 0.35
 state_bias_scale: 1.0
 offline_rounds: 3
+joint_epochs: 30
 stat_epochs_per_round: 5
 adv_epochs_per_round: 10
 stat_max_steps: 100
 adv_max_steps: 100
-use_advection_in_stat: true
-train_q_proc_in_stat: false
-train_r_obs_in_stat: false
-train_damping_in_stat: true
-train_p0_in_stat: true
-train_init_mean_in_stat: true

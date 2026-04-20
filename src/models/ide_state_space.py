@@ -309,6 +309,23 @@ class IDEStateSpaceModel(nn.Module):
 
         raise ValueError(f"Expected z_seq to have 3 or 4 dims, got {tuple(z_seq.shape)}")
 
+    def _flatten_current_state(self, z_t):
+        if z_t.ndim == 3:
+            batch_size, num_sites, vec_dim = z_t.shape
+            if num_sites != self.num_sites or vec_dim != self.vec_dim:
+                raise ValueError(
+                    f"Expected current state shape [B,{self.num_sites},{self.vec_dim}], got {tuple(z_t.shape)}"
+                )
+            return z_t.reshape(batch_size, self.state_dim)
+
+        if z_t.ndim == 2:
+            batch_size, state_dim = z_t.shape
+            if state_dim != self.state_dim:
+                raise ValueError(f"Expected current state shape [B,{self.state_dim}], got {tuple(z_t.shape)}")
+            return z_t
+
+        raise ValueError(f"Expected current state to have 2 or 3 dims, got {tuple(z_t.shape)}")
+
     def _default_dynamics(self, batch_size, device, dtype):
         return {
             "mu": torch.zeros(batch_size, self.mu_dim, device=device, dtype=dtype),
@@ -709,6 +726,69 @@ class IDEStateSpaceModel(nn.Module):
 
         return torch.stack(preds, dim=1)
 
+    def deterministic_predict_sequence(self, z_seq, site_lon, site_lat, dynamics_seq=None, start_idx=None, apply_damping=True):
+        z = self._flatten_state(z_seq)
+        batch_size, steps, _ = z.shape
+        device = z.device
+        dtype = z.dtype
+        if steps <= 1:
+            return z.new_empty(batch_size, 0, self.num_sites, self.vec_dim)
+
+        start_idx = self._prepare_start_idx(start_idx, batch_size, device)
+        trans_idx = self._time_indices(start_idx, steps - 1)
+
+        preds = []
+        for t in range(steps - 1):
+            state_t = z[:, t]
+            dynamics_t = self._dynamics_at_t(dynamics_seq, t, batch_size, device, dtype)
+            A, _, b = self.build_transition_matrix(
+                site_lon,
+                site_lat,
+                dynamics_t,
+                trans_idx[:, t],
+                device,
+                dtype,
+                apply_damping=apply_damping,
+            )
+            pred = torch.einsum("bij,bj->bi", A, state_t) + b
+            preds.append(pred.reshape(batch_size, self.num_sites, self.vec_dim))
+
+        return torch.stack(preds, dim=1)
+
+    def deterministic_sequence_nll(self, z_seq, site_lon, site_lat, dynamics_seq=None, start_idx=None, apply_damping=True):
+        z = self._flatten_state(z_seq)
+        batch_size, steps, _ = z.shape
+        if steps <= 1:
+            return z.new_tensor(0.0)
+
+        device = z.device
+        dtype = z.dtype
+        start_idx = self._prepare_start_idx(start_idx, batch_size, device)
+        trans_idx = self._time_indices(start_idx, steps - 1)
+        next_obs_idx = self._time_indices(start_idx + 1, steps - 1)
+
+        preds = self.deterministic_predict_sequence(
+            z_seq=z_seq,
+            site_lon=site_lon,
+            site_lat=site_lat,
+            dynamics_seq=dynamics_seq,
+            start_idx=start_idx,
+            apply_damping=apply_damping,
+        ).reshape(batch_size, steps - 1, self.state_dim)
+        target = z[:, 1:]
+
+        q_proc = self._gather_scalar(self.q_proc_series, trans_idx).to(dtype=dtype)
+        r_obs = self._gather_scalar(self.r_obs_series, next_obs_idx).to(dtype=dtype)
+        variance = (q_proc.square() + r_obs.square()).clamp_min(1e-6)
+
+        residual = target - preds
+        nll = 0.5 * (
+            residual.square() / variance[:, :, None]
+            + torch.log(variance)[:, :, None]
+            + math.log(2.0 * math.pi)
+        )
+        return nll.sum(dim=-1).mean()
+
     def forecast_next(self, z_hist, site_lon, site_lat, dynamics_seq, start_idx=None):
         z = self._flatten_state(z_hist)
         batch_size, steps, _ = z.shape
@@ -749,6 +829,42 @@ class IDEStateSpaceModel(nn.Module):
             P = self._symmetrize(A @ P @ A.transpose(-1, -2) + Q)
 
         return m.reshape(batch_size, self.num_sites, self.vec_dim)
+
+    def deterministic_forecast_multistep(self, z_start, site_lon, site_lat, dynamics_future, start_idx=None, apply_damping=True):
+        state = self._flatten_current_state(z_start)
+        batch_size = state.shape[0]
+        device = state.device
+        dtype = state.dtype
+        horizon = dynamics_future["mu"].shape[1]
+        if horizon <= 0:
+            return state.new_empty(batch_size, 0, self.num_sites, self.vec_dim)
+
+        start_idx = self._prepare_start_idx(start_idx, batch_size, device)
+        future_trans_idx = self._time_indices(start_idx, horizon)
+
+        preds = []
+        current = state
+        for h in range(horizon):
+            dynamics_t = {
+                "mu": dynamics_future["mu"][:, h],
+                "base_scales": dynamics_future["base_scales"][:, h] if "base_scales" in dynamics_future else None,
+                "transport_gates": dynamics_future["transport_gates"][:, h] if "transport_gates" in dynamics_future else None,
+                "state_bias": dynamics_future["state_bias"][:, h] if "state_bias" in dynamics_future else None,
+                "sigma": dynamics_future["sigma"][:, h],
+            }
+            A, _, b = self.build_transition_matrix(
+                site_lon,
+                site_lat,
+                dynamics_t,
+                future_trans_idx[:, h],
+                device,
+                dtype,
+                apply_damping=apply_damping,
+            )
+            current = torch.einsum("bij,bj->bi", A, current) + b
+            preds.append(current.reshape(batch_size, self.num_sites, self.vec_dim))
+
+        return torch.stack(preds, dim=1)
 
     def forecast_multistep(self, z_hist, site_lon, site_lat, dynamics_hist, dynamics_future, start_idx=None):
         z = self._flatten_state(z_hist)

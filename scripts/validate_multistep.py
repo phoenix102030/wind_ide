@@ -267,16 +267,14 @@ def main():
             context_len=context_len,
         )
         hist_transitions = z_hist.shape[1] - 1
-        dynamics_hist = {k: v[:, :hist_transitions] for k, v in dynamics_full.items()}
         dynamics_future = {k: v[:, hist_transitions:hist_transitions + horizon] for k, v in dynamics_full.items()}
 
-        pred = ide_model.forecast_multistep(
-            z_hist=z_hist,
+        pred = ide_model.deterministic_forecast_multistep(
+            z_start=z_hist[:, -1],
             site_lon=site_lon,
             site_lat=site_lat,
-            dynamics_hist=dynamics_hist,
             dynamics_future=dynamics_future,
-            start_idx=torch.tensor([start + context_len - 1], device=device),
+            start_idx=torch.tensor([start + context_len + args.history_len - 1], device=device),
         )[0].detach().cpu().numpy()
         if not np.isfinite(pred).all():
             nonfinite_windows.append(int(start))
