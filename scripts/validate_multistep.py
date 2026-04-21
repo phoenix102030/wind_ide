@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--history-len", type=int, default=24, help="Number of observed transitions used before forecasting")
     parser.add_argument("--horizon", type=int, default=None, help="Forecast steps, defaults to config forecast_horizon")
+    parser.add_argument("--start-window", type=int, default=0, help="Start index of validation windows")
     parser.add_argument("--max-windows", type=int, default=None)
     parser.add_argument("--out-dir", type=str, default="outputs/validation_multistep")
     return parser.parse_args()
@@ -238,7 +239,11 @@ def main():
     total_windows = bundle.z_meas.shape[0] - (context_len + args.history_len + horizon - 1)
     if total_windows <= 0:
         raise ValueError("Not enough time steps for the requested history_len and horizon")
-    max_windows = total_windows if args.max_windows is None else min(total_windows, args.max_windows)
+    start_window = max(int(args.start_window), 0)
+    if start_window >= total_windows:
+        raise ValueError(f"start_window={start_window} is out of range for total_windows={total_windows}")
+    available_windows = total_windows - start_window
+    max_windows = available_windows if args.max_windows is None else min(available_windows, args.max_windows)
 
     site_lon = torch.from_numpy(bundle.meas_lon).float().unsqueeze(0).to(device)
     site_lat = torch.from_numpy(bundle.meas_lat).float().unsqueeze(0).to(device)
@@ -249,7 +254,8 @@ def main():
     sample_payload = None
     nonfinite_windows = []
 
-    for start in range(max_windows):
+    for offset in range(max_windows):
+        start = start_window + offset
         z_hist_np = bundle.z_meas[start + context_len - 1:start + context_len + args.history_len]
         y_future_np = bundle.z_meas[
             start + context_len + args.history_len:
@@ -320,6 +326,7 @@ def main():
                 "checkpoint": str(Path(args.ckpt).expanduser().resolve()),
                 "history_len": args.history_len,
                 "horizon": horizon,
+                "start_window": start_window,
                 "num_windows": max_windows,
                 "nonfinite_window_count": len(nonfinite_windows),
                 "first_nonfinite_windows": nonfinite_windows[:20],
@@ -343,7 +350,7 @@ def main():
             out_dir / "sample_multistep_forecast.png",
         )
 
-    print(f"history_len={args.history_len} horizon={horizon} windows={max_windows}")
+    print(f"history_len={args.history_len} horizon={horizon} start_window={start_window} windows={max_windows}")
     if nonfinite_windows:
         print(
             f"[warning] non-finite model forecasts occurred in {len(nonfinite_windows)} windows; "
