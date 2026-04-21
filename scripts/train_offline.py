@@ -26,6 +26,7 @@ from src.data.aligned_measurement_nwp import (
 from src.models.advection_mean_net import AdvectionMeanNet
 from src.models.ide_state_space import IDEStateSpaceModel
 from src.trainers.train_ml_mu import (
+    build_dynamics_sequence,
     train_joint_one_epoch,
     eval_joint,
 )
@@ -59,6 +60,10 @@ def is_main_process():
 def maybe_barrier():
     if is_distributed():
         dist.barrier()
+
+
+def move_batch_to_device(batch, device):
+    return {k: v.to(device) for k, v in batch.items()}
 
 
 def find_free_port():
@@ -116,6 +121,113 @@ def save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg):
     save_pair_checkpoint(out_dir / "offline_best.pt", mean_model, ide_model, cfg)
     save_pair_checkpoint(out_dir / "joint_best.pt", mean_model, ide_model, cfg)
     save_pair_checkpoint(out_dir / "mu_best.pt", mean_model, ide_model, cfg)
+
+
+def _stack_transition_diagnostics(diag_steps):
+    stacked = {}
+    for key in diag_steps[0]:
+        value0 = diag_steps[0][key]
+        if torch.is_tensor(value0):
+            stacked[key] = torch.stack([step[key] for step in diag_steps], dim=1)
+        else:
+            stacked[key] = [step[key] for step in diag_steps]
+    return stacked
+
+
+@torch.no_grad()
+def save_transition_dump(
+    out_dir,
+    split_name,
+    epoch,
+    mean_model,
+    ide_model,
+    loader,
+    device,
+    seq_len,
+    cfg,
+):
+    raw_mean = unwrap_model(mean_model)
+    raw_ide = unwrap_model(ide_model)
+    was_mean_training = mean_model.training
+    was_ide_training = ide_model.training
+    mean_model.eval()
+    ide_model.eval()
+    try:
+        try:
+            batch = next(iter(loader))
+        except StopIteration:
+            return None
+
+        batch = move_batch_to_device(batch, device)
+        z_full = batch["z_seq_full"]
+        nwp_full = batch["nwp_seq_full"]
+        start_idx = batch["time_idx_start"]
+        chunk_len = nwp_full.shape[1] - seq_len + 1
+        dynamics_seq = build_dynamics_sequence(mean_model, nwp_full, seq_len=seq_len)
+        z_aligned = z_full[:, -(chunk_len + 1):]
+        aligned_start_idx = start_idx + seq_len - 1
+        trans_idx = raw_ide._time_indices(aligned_start_idx, chunk_len)
+
+        diag_steps = []
+        for t in range(chunk_len):
+            dynamics_t = {
+                "mu": dynamics_seq["mu"][:, t],
+                "base_scales": dynamics_seq["base_scales"][:, t],
+                "transport_gates": dynamics_seq["transport_gates"][:, t],
+                "state_bias": dynamics_seq["state_bias"][:, t],
+                "sigma": dynamics_seq["sigma"][:, t],
+            }
+            diag_steps.append(
+                raw_ide.transition_diagnostics(
+                    site_lon=batch["site_lon"],
+                    site_lat=batch["site_lat"],
+                    dynamics_t=dynamics_t,
+                    transition_idx=trans_idx[:, t],
+                    device=device,
+                    dtype=z_aligned.dtype,
+                    apply_damping=True,
+                )
+            )
+
+        diagnostics = _stack_transition_diagnostics(diag_steps)
+        dump = {
+            "epoch": int(epoch),
+            "split": split_name,
+            "config": cfg,
+            "state_order": [f"{comp}(site{i+1})" for i in range(raw_ide.num_sites) for comp in ("u", "v")],
+            "site_lon": batch["site_lon"].detach().cpu(),
+            "site_lat": batch["site_lat"].detach().cpu(),
+            "time_idx_start": batch["time_idx_start"].detach().cpu(),
+            "aligned_start_idx": aligned_start_idx.detach().cpu(),
+            "z_seq_full": batch["z_seq_full"].detach().cpu(),
+            "nwp_seq_full": batch["nwp_seq_full"].detach().cpu(),
+            "z_aligned": z_aligned.detach().cpu(),
+            "dynamics_seq": {key: value.detach().cpu() for key, value in dynamics_seq.items()},
+            "transition_diagnostics": {key: value.detach().cpu() if torch.is_tensor(value) else value for key, value in diagnostics.items()},
+            "ide_parameter_series": {
+                "q_proc_series": raw_ide.q_proc_series.detach().cpu(),
+                "r_obs_series": raw_ide.r_obs_series.detach().cpu(),
+                "damping_series": raw_ide.damping_series.detach().cpu(),
+                "p0_series": raw_ide.p0_series.detach().cpu(),
+                "init_mean_series": raw_ide.init_mean_series.detach().cpu(),
+                "q_adv_scale": raw_ide.q_adv_scale.detach().cpu(),
+                "nll_sigma_scale": raw_ide.nll_sigma_scale.detach().cpu(),
+            },
+            "mean_model_parameters": {name: tensor.detach().cpu() for name, tensor in raw_mean.state_dict().items()},
+            "ide_model_parameters": {name: tensor.detach().cpu() for name, tensor in raw_ide.state_dict().items()},
+            "normalization": cfg.get("normalization"),
+            "normalize_z": bool(cfg.get("normalize_z", True)),
+            "normalize_nwp": bool(cfg.get("normalize_nwp", True)),
+        }
+
+        diagnostics_dir = out_dir / "diagnostics"
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        path = diagnostics_dir / f"{split_name}_epoch_{int(epoch):03d}_transition_dump.pt"
+        torch.save(dump, path)
+        return path
+    finally:
+        mean_model.train(was_mean_training)
+        ide_model.train(was_ide_training)
 
 
 def configure_ide_trainability(
@@ -270,7 +382,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     cfg["train_ell_params"] = bool(cfg.get("train_ell_params", False))
     cfg["normalize_z"] = bool(cfg.get("normalize_z", True))
     cfg["normalize_nwp"] = bool(cfg.get("normalize_nwp", True))
-    cfg["mu_mode"] = str(cfg.get("mu_mode", "free")).lower()
+    cfg["mu_mode"] = str(cfg.get("mu_mode", "anchored")).lower()
     cfg["sigma_mode"] = str(cfg.get("sigma_mode", "network")).lower()
     batch_size = int(cfg.get("batch_size", cfg.get("ml_batch_size", 16)))
     mean_lr = float(cfg.get("mean_lr", cfg.get("ml_lr", 1e-3)))
@@ -307,11 +419,18 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print(f"adv_one_step_weight={cfg.get('adv_one_step_weight', 0.25)}")
         print(f"adv_rollout_weight={cfg.get('adv_rollout_weight', 1.0)}")
         print(f"step_nll_weight={cfg.get('step_nll_weight', 0.1)}")
+        print(f"asymmetry_weight={cfg.get('asymmetry_weight', 0.01)}")
         print(f"transport_reg_weight={cfg.get('transport_reg_weight', 1e-2)}")
         print(f"state_bias_reg_weight={cfg.get('state_bias_reg_weight', 1e-3)}")
+        print(f"sigma_cross_reg_weight={cfg.get('sigma_cross_reg_weight', 1e-4)}")
         print(f"init_transport_gate={cfg.get('init_transport_gate', 0.05)}")
         print(f"transport_gate_max={cfg.get('transport_gate_max', 0.35)}")
         print(f"state_bias_scale={cfg.get('state_bias_scale', 1.0)}")
+        print(f"gate_warmup_fraction={cfg.get('gate_warmup_fraction', 0.2)}")
+        print(f"force_gate_value={cfg.get('force_gate_value', 0.8)}")
+        print(f"save_transition_dump={cfg.get('save_transition_dump', True)}")
+        print(f"transition_dump_split={cfg.get('transition_dump_split', 'val')}")
+        print(f"transition_dump_every={cfg.get('transition_dump_every', 1)}")
         print(f"train_q_proc={cfg.get('train_q_proc', True)}")
         print(f"train_r_obs={cfg.get('train_r_obs', True)}")
         print(f"train_damping={cfg.get('train_damping', True)}")
@@ -334,6 +453,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                 "[warning] sigma_mode=global keeps the joint 4x4 advection covariance fixed over time, "
                 "so NWP cannot modulate pairwise kernel shape through Sigma_t."
             )
+        if cfg["mu_mode"] == "free":
+            print("[warning] mu_mode=free bypasses the PDF's anchored alpha*bias advection design.")
 
     raw_ml_ds = MLMuDataset(raw_bundle, seq_len=seq_len, chunk_len=chunk_len)
     _, _, raw_ml_split_info = contiguous_time_split(raw_ml_ds, val_fraction=val_fraction)
@@ -493,10 +614,17 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         print("joint_trainable params:", sum(p.numel() for p in mean_params + ide_params if p.requires_grad))
 
     best_offline_val = float("inf")
+    warmup_epochs = max(int(round(joint_epochs * float(cfg.get("gate_warmup_fraction", 0.2)))), 0)
+    force_gate_value = cfg.get("force_gate_value", 0.8)
+    dump_every = max(int(cfg.get("transition_dump_every", 1)), 1)
+    dump_enabled = bool(cfg.get("save_transition_dump", True))
+    dump_split = str(cfg.get("transition_dump_split", "val")).lower()
 
     for epoch in range(joint_epochs):
         if ml_train_sampler is not None:
             ml_train_sampler.set_epoch(epoch)
+        raw_mean = unwrap_model(mean_model)
+        raw_mean.force_gate_value = float(force_gate_value) if epoch < warmup_epochs else None
 
         tr = train_joint_one_epoch(
             mean_model=mean_model,
@@ -514,7 +642,10 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
             noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
             transport_reg_weight=cfg.get("transport_reg_weight", 1e-2),
             state_bias_reg_weight=cfg.get("state_bias_reg_weight", 1e-3),
+            asymmetry_weight=cfg.get("asymmetry_weight", 0.01),
+            sigma_cross_reg_weight=cfg.get("sigma_cross_reg_weight", 1e-4),
         )
+        raw_mean.force_gate_value = None
         va = eval_joint(
             mean_model=mean_model,
             ide_model=ide_model,
@@ -530,6 +661,8 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
             noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
             transport_reg_weight=cfg.get("transport_reg_weight", 1e-2),
             state_bias_reg_weight=cfg.get("state_bias_reg_weight", 1e-3),
+            asymmetry_weight=cfg.get("asymmetry_weight", 0.01),
+            sigma_cross_reg_weight=cfg.get("sigma_cross_reg_weight", 1e-4),
         )
 
         raw_ide = unwrap_model(ide_model)
@@ -550,17 +683,37 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
                 f"bias_abs={tr['state_bias_abs_mean']:.6f} "
                 f"transport_reg={tr['transport_reg']:.6f} "
                 f"bias_reg={tr['state_bias_reg']:.6f} "
+                f"sigma_cross_reg={tr['sigma_cross_reg']:.6f} "
+                f"asym={tr['asym_loss']:.6f} "
                 f"damping={float(raw_ide.damping.detach().cpu()):.6f} "
                 f"q_proc={float(raw_ide.q_proc.detach().cpu()):.6f} "
                 f"r_obs={float(raw_ide.r_obs.detach().cpu()):.6f} "
+                f"q_adv_mean={tr['q_adv_mean']:.6f} "
                 f"sigma_mean={tr['sigma_mean']:.6f} "
                 f"sigma_trace={tr['sigma_trace']:.6f} "
-                f"sigma_diag_min={tr['sigma_diag_min']:.6f}"
+                f"sigma_diag_min={tr['sigma_diag_min']:.6f} "
+                f"sigma_state_var_mean={tr['sigma_state_var_mean']:.6f} "
+                f"gate_override={float(force_gate_value) if epoch < warmup_epochs else -1.0:.2f}"
             )
             save_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
             if va["loss"] < best_offline_val:
                 best_offline_val = va["loss"]
                 save_best_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
+            if dump_enabled and ((epoch + 1) % dump_every == 0 or epoch == joint_epochs - 1):
+                dump_loader = ml_val_loader if dump_split == "val" else ml_train_loader
+                dump_path = save_transition_dump(
+                    out_dir=out_dir,
+                    split_name=dump_split,
+                    epoch=epoch,
+                    mean_model=mean_model,
+                    ide_model=ide_model,
+                    loader=dump_loader,
+                    device=device,
+                    seq_len=seq_len,
+                    cfg=cfg,
+                )
+                if dump_path is not None:
+                    print(f"[transition-dump] saved {dump_path}")
         maybe_barrier()
 
     if is_main_process():

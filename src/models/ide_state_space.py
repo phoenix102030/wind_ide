@@ -99,6 +99,8 @@ class IDEStateSpaceModel(nn.Module):
         self.log_p0_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_p0)))
         self.log_damping_knots = nn.Parameter(torch.full((self.num_knots,), float(init_log_damping)))
         self.init_mean_knots = nn.Parameter(torch.zeros(self.num_knots, self.state_dim))
+        self.log_q_adv_scale = nn.Parameter(torch.tensor(-3.0))
+        self.log_nll_sigma_scale = nn.Parameter(torch.tensor(-3.0))
         self.clamp_parameters_()
 
     @property
@@ -166,6 +168,14 @@ class IDEStateSpaceModel(nn.Module):
     def noise_regularization(self):
         return self.q_proc_series.square().mean() + self.r_obs_series.square().mean()
 
+    @property
+    def q_adv_scale(self):
+        return torch.exp(self.log_q_adv_scale)
+
+    @property
+    def nll_sigma_scale(self):
+        return torch.exp(self.log_nll_sigma_scale)
+
     @torch.no_grad()
     def clamp_parameters_(self, log_min=-4.0, log_max=2.0):
         self.log_ell_par_knots.clamp_(log_min, log_max)
@@ -180,8 +190,15 @@ class IDEStateSpaceModel(nn.Module):
         damping_log_min = math.log(self.damping_min)
         damping_log_max = math.log(self.damping_max)
         self.log_damping_knots.clamp_(damping_log_min, damping_log_max)
+        self.log_q_adv_scale.clamp_(log_min, log_max)
+        self.log_nll_sigma_scale.clamp_(log_min, log_max)
 
     def _resize_loaded_knots(self, value, target_shape):
+        if len(target_shape) == 0:
+            if value.ndim == 0:
+                return value.reshape(target_shape)
+            return value.reshape(-1)[0].reshape(target_shape)
+
         target_num_knots = target_shape[0]
         if value.shape == target_shape:
             return value
@@ -254,6 +271,8 @@ class IDEStateSpaceModel(nn.Module):
             "log_p0_knots": self.log_p0_knots.shape,
             "log_damping_knots": self.log_damping_knots.shape,
             "init_mean_knots": self.init_mean_knots.shape,
+            "log_q_adv_scale": self.log_q_adv_scale.shape,
+            "log_nll_sigma_scale": self.log_nll_sigma_scale.shape,
         }
         for key, target_shape in resize_targets.items():
             full_key = f"{prefix}{key}"
@@ -448,6 +467,17 @@ class IDEStateSpaceModel(nn.Module):
         matrix = 0.5 * (matrix + matrix.transpose(-1, -2))
         return torch.nan_to_num(matrix, nan=0.0, posinf=1e6, neginf=-1e6)
 
+    def _sigma_to_state_noise_diag(self, sigma_t, transport_gates, dtype):
+        sigma_blocks = self._split_sigma_blocks(sigma_t)
+        sigma11 = sigma_blocks[:, 0, 0]
+        sigma22 = sigma_blocks[:, 1, 1]
+        tr11 = sigma11.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        tr22 = sigma22.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        comp_var = torch.stack([tr11, tr22], dim=-1).clamp_min(1e-6)
+        gate_scale = 0.5 + transport_gates
+        state_var = (gate_scale * comp_var).repeat(1, self.num_sites)
+        return state_var.to(dtype=dtype)
+
     def _stabilize_psd(self, matrix, eye, base_jitter=1e-6, max_tries=8):
         stabilized = self._symmetrize(matrix)
         jitter = float(base_jitter)
@@ -541,12 +571,9 @@ class IDEStateSpaceModel(nn.Module):
         return self._symmetrize(par_cov + perp_cov)
 
     def build_pair_kernel(self, coords, mu_pairs, sigma_blocks, base_scales, target_idx, source_idx):
-        batch_size = coords.shape[0]
         h = coords[:, :, None, :] - coords[:, None, :, :]
         drift, pair_cov = self._pair_transport_params(mu_pairs, sigma_blocks, target_idx, source_idx)
-        direction = drift
-        if target_idx != source_idx:
-            direction = direction + 0.5 * (mu_pairs[:, target_idx] + mu_pairs[:, source_idx])
+        direction = 0.5 * (mu_pairs[:, target_idx] + mu_pairs[:, source_idx])
         base_cov = self._directional_base_covariance(direction, base_scales)
 
         eye2 = torch.eye(self.advection_dim, device=coords.device, dtype=coords.dtype).unsqueeze(0)
@@ -604,7 +631,7 @@ class IDEStateSpaceModel(nn.Module):
         row_mass = operator.abs().sum(dim=-1, keepdim=True).clamp_min(1.0)
         operator = operator / row_mass
         eye = torch.eye(self.state_dim, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
-        _, _, _, transport_gates, state_bias = self._parse_dynamics(
+        _, sigma_t, _, transport_gates, state_bias = self._parse_dynamics(
             dynamics_t if dynamics_t is not None else self._default_dynamics(batch_size, device, dtype),
             batch_size,
             device,
@@ -620,8 +647,76 @@ class IDEStateSpaceModel(nn.Module):
         transport_target = survival_t[:, None, None] * operator
         row_gates = self._state_transport_gates(transport_gates)[:, :, None]
         A = eye + row_gates * (transport_target - eye)
-        Q = q_proc_t[:, None, None].square() * eye
+        q_iso = q_proc_t[:, None, None].square() * eye
+        state_var_from_sigma = self._sigma_to_state_noise_diag(sigma_t, transport_gates, dtype=dtype)
+        q_adv = torch.diag_embed(self.q_adv_scale.to(dtype=dtype) * state_var_from_sigma)
+        Q = q_iso + q_adv
         return A, Q, state_bias
+
+    def transition_diagnostics(self, site_lon, site_lat, dynamics_t, transition_idx, device, dtype, apply_damping=True):
+        transition_idx = transition_idx.to(device=device, dtype=torch.long).reshape(-1)
+        batch_size = transition_idx.shape[0]
+        site_lon, site_lat = self._expand_sites(site_lon, site_lat, batch_size)
+        coords = project_lon_lat(site_lon, site_lat)
+        mu_t, sigma_t, base_scales, transport_gates, state_bias = self._parse_dynamics(
+            dynamics_t if dynamics_t is not None else self._default_dynamics(batch_size, device, dtype),
+            batch_size,
+            device,
+            dtype,
+        )
+        mu_pairs = self._split_mu_pairs(mu_t)
+        sigma_blocks = self._split_sigma_blocks(sigma_t)
+        kernels = self.build_component_kernels(
+            site_lon=site_lon,
+            site_lat=site_lat,
+            dynamics_t={
+                "mu": mu_t,
+                "sigma": sigma_t,
+                "base_scales": base_scales,
+                "transport_gates": transport_gates,
+                "state_bias": state_bias,
+            },
+            device=device,
+            dtype=dtype,
+            transition_idx=transition_idx,
+        )
+        operator = kernels.permute(0, 3, 1, 4, 2).reshape(batch_size, self.state_dim, self.state_dim)
+        row_mass = operator.abs().sum(dim=-1, keepdim=True).clamp_min(1.0)
+        operator = operator / row_mass
+        eye = torch.eye(self.state_dim, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1, -1)
+        time_params = self._get_time_params(transition_idx[:, None])
+        damping_t = time_params["damping"][:, 0].to(dtype=dtype)
+        q_proc_t = time_params["q_proc"][:, 0].to(dtype=dtype)
+        r_obs_t = time_params["r_obs"][:, 0].to(dtype=dtype)
+        survival_t = 1.0 - self.dt * damping_t if apply_damping else torch.ones_like(damping_t)
+        transport_target = survival_t[:, None, None] * operator
+        row_gates = self._state_transport_gates(transport_gates)[:, :, None]
+        A = eye + row_gates * (transport_target - eye)
+        state_var_from_sigma = self._sigma_to_state_noise_diag(sigma_t, transport_gates, dtype=dtype)
+        q_iso = q_proc_t[:, None, None].square() * eye
+        q_adv = torch.diag_embed(self.q_adv_scale.to(dtype=dtype) * state_var_from_sigma)
+        Q = q_iso + q_adv
+        return {
+            "A": A,
+            "Q": Q,
+            "state_bias": state_bias,
+            "coords": coords,
+            "kernels": kernels,
+            "operator": operator,
+            "transport_target": transport_target,
+            "row_gates": row_gates,
+            "mu": mu_t,
+            "mu_pairs": mu_pairs,
+            "sigma": sigma_t,
+            "sigma_blocks": sigma_blocks,
+            "base_scales": base_scales,
+            "transport_gates": transport_gates,
+            "state_var_from_sigma": state_var_from_sigma,
+            "damping_t": damping_t,
+            "q_proc_t": q_proc_t,
+            "r_obs_t": r_obs_t,
+            "transition_idx": transition_idx,
+        }
 
     def _dynamics_at_t(self, dynamics_seq, t, batch_size, device, dtype):
         if dynamics_seq is None:

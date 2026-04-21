@@ -33,7 +33,7 @@ def test_build_dynamics_sequence_chunked_matches_stepwise():
         assert torch.allclose(got[key], expected[key], atol=1e-6), key
 
 
-def test_deterministic_prediction_nll_matches_sequence_nll():
+def test_deterministic_prediction_nll_uses_sigma_induced_variance():
     torch.manual_seed(0)
     model = IDEStateSpaceModel(num_sites=3, total_steps=8, param_window=2)
 
@@ -58,20 +58,25 @@ def test_deterministic_prediction_nll_matches_sequence_nll():
             start_idx=start_idx,
             apply_damping=True,
         )
-        expected = model.deterministic_sequence_nll(
-            z_seq=z_seq,
-            site_lon=site_lon,
-            site_lat=site_lat,
+        base = _deterministic_prediction_nll(
+            raw_ide=model,
+            preds=preds.reshape(preds.shape[0], preds.shape[1], model.state_dim),
+            target=z_seq[:, 1:].reshape(z_seq.shape[0], z_seq.shape[1] - 1, model.state_dim),
             dynamics_seq=dynamics_seq,
             start_idx=start_idx,
-            apply_damping=True,
+            dtype=z_seq.dtype,
         )
+        larger_sigma = dict(dynamics_seq)
+        larger_sigma["sigma"] = 0.50 * torch.eye(4).reshape(1, 1, 4, 4).expand(2, 4, -1, -1)
         got = _deterministic_prediction_nll(
             raw_ide=model,
             preds=preds.reshape(preds.shape[0], preds.shape[1], model.state_dim),
             target=z_seq[:, 1:].reshape(z_seq.shape[0], z_seq.shape[1] - 1, model.state_dim),
+            dynamics_seq=larger_sigma,
             start_idx=start_idx,
             dtype=z_seq.dtype,
         )
 
-    assert torch.allclose(got, expected, atol=1e-6)
+    assert torch.isfinite(base)
+    assert torch.isfinite(got)
+    assert not torch.allclose(got, base)

@@ -3,6 +3,8 @@ import math
 import torch
 import torch.distributed as dist
 
+from src.models.ide_state_space import project_lon_lat
+
 
 def move_batch_to_device(batch, device):
     return {k: v.to(device) for k, v in batch.items()}
@@ -148,6 +150,48 @@ def sigma_offdiag_summary(dynamics_seq):
     return float(offdiag_mass.mean().detach().cpu())
 
 
+def sigma_cross_reg_summary(dynamics_seq):
+    sigma_cross = dynamics_seq["sigma"][..., :2, 2:]
+    return float(sigma_cross.square().mean().detach().cpu())
+
+
+def _sigma_state_var_mean(raw_ide, dynamics_seq):
+    sigma_seq = dynamics_seq["sigma"]
+    gates_seq = dynamics_seq["transport_gates"]
+    state_var = []
+    for t in range(sigma_seq.shape[1]):
+        state_var.append(raw_ide._sigma_to_state_noise_diag(sigma_seq[:, t], gates_seq[:, t], dtype=sigma_seq.dtype))
+    sigma_state_var = torch.stack(state_var, dim=1)
+    return float(sigma_state_var.mean().detach().cpu())
+
+
+def _advection_metric_names():
+    return [
+        "loss",
+        "one_step_mse",
+        "rollout_mse",
+        "step_nll",
+        "noise_reg",
+        "smoothness",
+        "transport_reg",
+        "state_bias_reg",
+        "sigma_cross_reg",
+        "asym_loss",
+        "sigma_mean",
+        "sigma_trace",
+        "sigma_diag_min",
+        "sigma_offdiag_mean",
+        "sigma_state_var_mean",
+        "mu_norm",
+        "mu_abs_mean",
+        "base_scale_mean",
+        "base_scale_anisotropy",
+        "transport_gate_mean",
+        "state_bias_abs_mean",
+        "q_adv_mean",
+    ]
+
+
 def _aligned_inputs(batch, seq_len, mean_model=None):
     z_full = batch["z_seq_full"]
     nwp_full = batch["nwp_seq_full"]
@@ -197,22 +241,61 @@ def _prediction_mse(pred, target):
     return (pred - target).square().mean()
 
 
-def _deterministic_prediction_nll(raw_ide, preds, target, start_idx, dtype):
+def _deterministic_prediction_nll(raw_ide, preds, target, dynamics_seq, start_idx, dtype):
     _, steps_minus_one, _ = target.shape
     next_obs_idx = raw_ide._time_indices(start_idx + 1, steps_minus_one)
     trans_idx = raw_ide._time_indices(start_idx, steps_minus_one)
 
     q_proc = raw_ide._gather_scalar(raw_ide.q_proc_series, trans_idx).to(dtype=dtype)
     r_obs = raw_ide._gather_scalar(raw_ide.r_obs_series, next_obs_idx).to(dtype=dtype)
-    variance = (q_proc.square() + r_obs.square()).clamp_min(1e-6)
+    sigma_seq = dynamics_seq["sigma"]
+    gates_seq = dynamics_seq["transport_gates"]
+    sigma_state_var = []
+    for t in range(steps_minus_one):
+        sigma_state_var.append(
+            raw_ide._sigma_to_state_noise_diag(
+                sigma_seq[:, t],
+                gates_seq[:, t],
+                dtype=dtype,
+            )
+        )
+    sigma_state_var = torch.stack(sigma_state_var, dim=1)
+    variance = (
+        q_proc[:, :, None].square()
+        + r_obs[:, :, None].square()
+        + raw_ide.nll_sigma_scale.to(dtype=dtype) * sigma_state_var
+    ).clamp_min(1e-6)
 
     residual = target - preds
     nll = 0.5 * (
-        residual.square() / variance[:, :, None]
-        + torch.log(variance)[:, :, None]
+        residual.square() / variance
+        + torch.log(variance)
         + math.log(2.0 * math.pi)
     )
     return nll.sum(dim=-1).mean()
+
+
+def _directional_asymmetry_loss(pred_next, target_next, site_lon, site_lat, dynamics_seq):
+    residual = target_next - pred_next
+    mu = dynamics_seq["mu"]
+    mu_pairs = mu.reshape(mu.shape[0], mu.shape[1], 2, 2)
+    mean_dir = mu_pairs.mean(dim=2)
+
+    coords = project_lon_lat(site_lon, site_lat)
+    h = coords[:, :, None, :] - coords[:, None, :, :]
+    dir_unit = mean_dir / mean_dir.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    proj = (h[:, None] * dir_unit[:, :, None, None, :]).sum(dim=-1)
+    downwind_mask = proj > 0
+    upwind_mask = proj < 0
+
+    r = residual[..., 0]
+    emp_cov = r[:, :, :, None] * r[:, :, None, :]
+
+    downwind_vals = emp_cov.masked_select(downwind_mask)
+    upwind_vals = emp_cov.masked_select(upwind_mask)
+    if downwind_vals.numel() == 0 or upwind_vals.numel() == 0:
+        return emp_cov.new_tensor(0.0)
+    return (downwind_vals.mean() - upwind_vals.mean()).square()
 
 
 def _advection_prediction_loss(
@@ -230,6 +313,8 @@ def _advection_prediction_loss(
     noise_reg_weight,
     transport_reg_weight,
     state_bias_reg_weight,
+    asymmetry_weight,
+    sigma_cross_reg_weight,
 ):
     raw_ide = unwrap_model(ide_model)
     dtype = z_seq.dtype
@@ -256,6 +341,7 @@ def _advection_prediction_loss(
             raw_ide=raw_ide,
             preds=pred_next.reshape(pred_next.shape[0], pred_next.shape[1], raw_ide.state_dim),
             target=z_seq[:, 1:].reshape(z_seq.shape[0], z_seq.shape[1] - 1, raw_ide.state_dim),
+            dynamics_seq=dynamics_seq,
             start_idx=start_idx,
             dtype=dtype,
         )
@@ -281,15 +367,27 @@ def _advection_prediction_loss(
     smoothness = dynamics_smoothness_penalty(dynamics_seq)
     transport_reg = dynamics_seq["transport_gates"].square().mean()
     state_bias_reg = dynamics_seq["state_bias"].square().mean()
+    sigma_cross_reg = dynamics_seq["sigma"][..., :2, 2:].square().mean()
+    asym_loss = z_seq.new_tensor(0.0)
+    if pred_next is not None and asymmetry_weight > 0.0:
+        asym_loss = _directional_asymmetry_loss(
+            pred_next=pred_next,
+            target_next=z_seq[:, 1:],
+            site_lon=site_lon,
+            site_lat=site_lat,
+            dynamics_seq=dynamics_seq,
+        )
     noise_reg = raw_ide.noise_regularization()
     loss = (
         one_step_weight * one_step
         + rollout_weight * rollout
         + step_nll_weight * step_nll
+        + asymmetry_weight * asym_loss
         + noise_reg_weight * noise_reg
         + smoothness_weight * smoothness
         + transport_reg_weight * transport_reg
         + state_bias_reg_weight * state_bias_reg
+        + sigma_cross_reg_weight * sigma_cross_reg
     )
     return loss, {
         "loss": float(loss.detach().cpu()),
@@ -300,16 +398,20 @@ def _advection_prediction_loss(
         "smoothness": float(smoothness.detach().cpu()),
         "transport_reg": float(transport_reg.detach().cpu()),
         "state_bias_reg": float(state_bias_reg.detach().cpu()),
+        "sigma_cross_reg": float(sigma_cross_reg.detach().cpu()),
+        "asym_loss": float(asym_loss.detach().cpu()),
         "sigma_mean": sigma_summary(dynamics_seq),
         "sigma_trace": sigma_trace_summary(dynamics_seq),
         "sigma_diag_min": sigma_diag_min_summary(dynamics_seq),
         "sigma_offdiag_mean": sigma_offdiag_summary(dynamics_seq),
+        "sigma_state_var_mean": _sigma_state_var_mean(raw_ide, dynamics_seq),
         "mu_norm": mu_norm_summary(dynamics_seq),
         "mu_abs_mean": mu_abs_summary(dynamics_seq),
         "base_scale_mean": base_scale_summary(dynamics_seq),
         "base_scale_anisotropy": base_scale_anisotropy_summary(dynamics_seq),
         "transport_gate_mean": transport_gate_summary(dynamics_seq),
         "state_bias_abs_mean": state_bias_summary(dynamics_seq),
+        "q_adv_mean": float(raw_ide.q_adv_scale.detach().cpu()),
     }
 
 
@@ -426,30 +528,13 @@ def train_advection_one_epoch(
     noise_reg_weight=1e-4,
     transport_reg_weight=1e-2,
     state_bias_reg_weight=1e-3,
+    asymmetry_weight=0.01,
+    sigma_cross_reg_weight=1e-4,
 ):
     mean_model.train()
     ide_model.eval()
 
-    metrics = {
-        "loss": [],
-        "one_step_mse": [],
-        "rollout_mse": [],
-        "step_nll": [],
-        "noise_reg": [],
-        "smoothness": [],
-        "transport_reg": [],
-        "state_bias_reg": [],
-        "sigma_mean": [],
-        "sigma_trace": [],
-        "sigma_diag_min": [],
-        "sigma_offdiag_mean": [],
-        "mu_norm": [],
-        "mu_abs_mean": [],
-        "base_scale_mean": [],
-        "base_scale_anisotropy": [],
-        "transport_gate_mean": [],
-        "state_bias_abs_mean": [],
-    }
+    metrics = {key: [] for key in _advection_metric_names()}
 
     for step, batch in enumerate(loader):
         if max_steps is not None and step >= max_steps:
@@ -474,6 +559,8 @@ def train_advection_one_epoch(
             noise_reg_weight=noise_reg_weight,
             transport_reg_weight=transport_reg_weight,
             state_bias_reg_weight=state_bias_reg_weight,
+            asymmetry_weight=asymmetry_weight,
+            sigma_cross_reg_weight=sigma_cross_reg_weight,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(mean_model.parameters(), 1.0)
@@ -503,30 +590,13 @@ def eval_advection(
     noise_reg_weight=1e-4,
     transport_reg_weight=1e-2,
     state_bias_reg_weight=1e-3,
+    asymmetry_weight=0.01,
+    sigma_cross_reg_weight=1e-4,
 ):
     mean_model.eval()
     ide_model.eval()
 
-    metrics = {
-        "loss": [],
-        "one_step_mse": [],
-        "rollout_mse": [],
-        "step_nll": [],
-        "noise_reg": [],
-        "smoothness": [],
-        "transport_reg": [],
-        "state_bias_reg": [],
-        "sigma_mean": [],
-        "sigma_trace": [],
-        "sigma_diag_min": [],
-        "sigma_offdiag_mean": [],
-        "mu_norm": [],
-        "mu_abs_mean": [],
-        "base_scale_mean": [],
-        "base_scale_anisotropy": [],
-        "transport_gate_mean": [],
-        "state_bias_abs_mean": [],
-    }
+    metrics = {key: [] for key in _advection_metric_names()}
 
     for step, batch in enumerate(loader):
         if max_steps is not None and step >= max_steps:
@@ -550,6 +620,8 @@ def eval_advection(
             noise_reg_weight=noise_reg_weight,
             transport_reg_weight=transport_reg_weight,
             state_bias_reg_weight=state_bias_reg_weight,
+            asymmetry_weight=asymmetry_weight,
+            sigma_cross_reg_weight=sigma_cross_reg_weight,
         )
         for key in metrics:
             metrics[key].append(stats[key])
@@ -575,29 +647,12 @@ def train_joint_one_epoch(
     noise_reg_weight=1e-4,
     transport_reg_weight=1e-2,
     state_bias_reg_weight=1e-3,
+    asymmetry_weight=0.01,
+    sigma_cross_reg_weight=1e-4,
 ):
     mean_model.train()
     ide_model.train()
-    metrics = {
-        "loss": [],
-        "one_step_mse": [],
-        "rollout_mse": [],
-        "step_nll": [],
-        "noise_reg": [],
-        "smoothness": [],
-        "transport_reg": [],
-        "state_bias_reg": [],
-        "sigma_mean": [],
-        "sigma_trace": [],
-        "sigma_diag_min": [],
-        "sigma_offdiag_mean": [],
-        "mu_norm": [],
-        "mu_abs_mean": [],
-        "base_scale_mean": [],
-        "base_scale_anisotropy": [],
-        "transport_gate_mean": [],
-        "state_bias_abs_mean": [],
-    }
+    metrics = {key: [] for key in _advection_metric_names()}
 
     for step, batch in enumerate(loader):
         if max_steps is not None and step >= max_steps:
@@ -623,6 +678,8 @@ def train_joint_one_epoch(
             noise_reg_weight=noise_reg_weight,
             transport_reg_weight=transport_reg_weight,
             state_bias_reg_weight=state_bias_reg_weight,
+            asymmetry_weight=asymmetry_weight,
+            sigma_cross_reg_weight=sigma_cross_reg_weight,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(mean_model.parameters(), 1.0)
@@ -654,29 +711,12 @@ def eval_joint(
     noise_reg_weight=1e-4,
     transport_reg_weight=1e-2,
     state_bias_reg_weight=1e-3,
+    asymmetry_weight=0.01,
+    sigma_cross_reg_weight=1e-4,
 ):
     mean_model.eval()
     ide_model.eval()
-    metrics = {
-        "loss": [],
-        "one_step_mse": [],
-        "rollout_mse": [],
-        "step_nll": [],
-        "noise_reg": [],
-        "smoothness": [],
-        "transport_reg": [],
-        "state_bias_reg": [],
-        "sigma_mean": [],
-        "sigma_trace": [],
-        "sigma_diag_min": [],
-        "sigma_offdiag_mean": [],
-        "mu_norm": [],
-        "mu_abs_mean": [],
-        "base_scale_mean": [],
-        "base_scale_anisotropy": [],
-        "transport_gate_mean": [],
-        "state_bias_abs_mean": [],
-    }
+    metrics = {key: [] for key in _advection_metric_names()}
 
     for step, batch in enumerate(loader):
         if max_steps is not None and step >= max_steps:
@@ -699,6 +739,8 @@ def eval_joint(
             noise_reg_weight=noise_reg_weight,
             transport_reg_weight=transport_reg_weight,
             state_bias_reg_weight=state_bias_reg_weight,
+            asymmetry_weight=asymmetry_weight,
+            sigma_cross_reg_weight=sigma_cross_reg_weight,
         )
         for key in metrics:
             metrics[key].append(stats[key])

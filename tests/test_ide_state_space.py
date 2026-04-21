@@ -294,8 +294,10 @@ def test_advection_mean_net_free_mode_outputs_direct_pair_advections():
 def test_advection_mean_net_can_anchor_mu_and_share_global_sigma():
     model = AdvectionMeanNet(mu_mode="anchored", sigma_mode="global", mu_scale=0.5, init_global_sigma_diag=0.15)
     with torch.no_grad():
-        model.mu_head.weight.zero_()
-        model.mu_head.bias.zero_()
+        model.mu_alpha_head.weight.zero_()
+        model.mu_alpha_head.bias.zero_()
+        model.mu_bias_head.weight.zero_()
+        model.mu_bias_head.bias.zero_()
 
     x_seq = torch.randn(2, 4, 6, 8, 8)
     x_seq[:, -1, 2] = 3.0
@@ -305,13 +307,20 @@ def test_advection_mean_net_can_anchor_mu_and_share_global_sigma():
 
     assert out["mu"].shape == (2, 4)
     assert out["mu_pairs"].shape == (2, 2, 2)
-    assert out["mu_coeff_matrix"].shape == (2, 4, 2)
+    assert out["mu_coeff_matrix"].shape == (2, 2, 2)
+    assert out["mu_alpha"].shape == (2, 2, 2)
+    assert out["mu_bias"].shape == (2, 2, 2)
     assert torch.allclose(out["wind_anchor"], torch.tensor([[3.0, -2.0], [3.0, -2.0]]), atol=1e-6)
-    assert torch.allclose(out["mu"], torch.zeros_like(out["mu"]), atol=1e-6)
+    expected_mu = torch.tensor([[3.0, -2.0, 3.0, -2.0], [3.0, -2.0, 3.0, -2.0]])
+    assert torch.allclose(out["mu"], expected_mu, atol=1e-6)
     assert torch.allclose(out["sigma"][0], out["sigma"][1], atol=1e-6)
     assert torch.all(torch.linalg.eigvalsh(out["sigma"]) > 0)
-    assert not any(param.requires_grad for param in model.chol_head.parameters())
-    assert model.global_chol_params.requires_grad
+    assert not any(param.requires_grad for param in model.sigma11_head.parameters())
+    assert not any(param.requires_grad for param in model.sigma22_head.parameters())
+    assert not any(param.requires_grad for param in model.sigma12_head.parameters())
+    assert model.global_sigma11_params.requires_grad
+    assert model.global_sigma22_params.requires_grad
+    assert model.global_sigma12_params.requires_grad
 
 
 def test_advection_mean_net_all12_uses_140m_uv_anchor_indices():
