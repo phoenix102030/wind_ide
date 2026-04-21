@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data.aligned_measurement_nwp import (
     apply_bundle_normalization,
+    bundle_to_shared_tensors,
     build_aligned_bundle,
     fit_bundle_normalization,
     get_nwp_uv_channel_indices,
@@ -355,16 +356,8 @@ def should_auto_spawn(cfg):
     return requested > 1
 
 
-def run_training(cfg, local_rank=None, world_size=1, master_port=None):
-    distributed = world_size > 1
-    if distributed:
-        setup_process_group(local_rank=local_rank, world_size=world_size, master_port=master_port)
-
-    seed = int(cfg.get("seed", 42))
-    set_seed(seed)
-    device = auto_device(cfg.get("device", None), local_rank=local_rank if distributed else None)
-    num_workers = int(cfg.get("num_workers", 0))
-
+def prepare_training_bundle(cfg):
+    cfg = dict(cfg)
     meas_file = str(Path(cfg["measurement_file"]).expanduser().resolve())
     nwp_file = str(Path(cfg["nwp_file"]).expanduser().resolve())
     seq_len = int(cfg.get("seq_len", 4))
@@ -373,7 +366,6 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
 
     cfg["nwp_input_mode"] = str(cfg.get("nwp_input_mode", "uv6")).lower()
     raw_bundle = build_aligned_bundle(meas_file, nwp_file, nwp_channel_mode=cfg["nwp_input_mode"])
-    cfg = dict(cfg)
     cfg["ide_total_steps"] = int(raw_bundle.z_meas.shape[0])
     cfg["num_sites"] = int(raw_bundle.z_meas.shape[1])
     cfg["nwp_in_channels"] = int(raw_bundle.nwp_uv.shape[1])
@@ -384,6 +376,47 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     cfg["normalize_nwp"] = bool(cfg.get("normalize_nwp", True))
     cfg["mu_mode"] = str(cfg.get("mu_mode", "anchored")).lower()
     cfg["sigma_mode"] = str(cfg.get("sigma_mode", "network")).lower()
+
+    raw_ml_ds = MLMuDataset(raw_bundle, seq_len=seq_len, chunk_len=chunk_len)
+    _, _, raw_ml_split_info = contiguous_time_split(raw_ml_ds, val_fraction=val_fraction)
+
+    bundle = raw_bundle
+    if cfg["normalize_z"] or cfg["normalize_nwp"]:
+        norm_train_stop = raw_ml_split_info["split_time"]
+        norm_stats = fit_bundle_normalization(raw_bundle, end_time=norm_train_stop)
+        cfg["normalization"] = norm_stats.to_config_dict()
+        bundle = apply_bundle_normalization(
+            raw_bundle,
+            norm_stats,
+            normalize_z_values=cfg["normalize_z"],
+            normalize_nwp_values=cfg["normalize_nwp"],
+        )
+        cfg["normalization_summary"] = {
+            "fit_until_t": int(norm_train_stop),
+            "z_std_mean": float(norm_stats.z_std.mean()),
+            "nwp_std_mean": float(norm_stats.nwp_std.mean()),
+        }
+    else:
+        cfg["normalization"] = None
+        cfg["normalization_summary"] = None
+
+    return cfg, bundle
+
+
+def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded_bundle=None):
+    distributed = world_size > 1
+    if distributed:
+        setup_process_group(local_rank=local_rank, world_size=world_size, master_port=master_port)
+
+    seed = int(cfg.get("seed", 42))
+    set_seed(seed)
+    device = auto_device(cfg.get("device", None), local_rank=local_rank if distributed else None)
+    num_workers = int(cfg.get("num_workers", 0))
+
+    seq_len = int(cfg.get("seq_len", 4))
+    chunk_len = int(cfg.get("chunk_len", 16))
+    val_fraction = float(cfg.get("val_fraction", 0.2))
+    cfg = dict(cfg)
     batch_size = int(cfg.get("batch_size", cfg.get("ml_batch_size", 16)))
     mean_lr = float(cfg.get("mean_lr", cfg.get("ml_lr", 1e-3)))
     ide_lr = float(cfg.get("ide_lr", cfg.get("joint_ide_lr", cfg.get("stat_lr", 1e-4))))
@@ -456,29 +489,17 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         if cfg["mu_mode"] == "free":
             print("[warning] mu_mode=free bypasses the PDF's anchored alpha*bias advection design.")
 
-    raw_ml_ds = MLMuDataset(raw_bundle, seq_len=seq_len, chunk_len=chunk_len)
-    _, _, raw_ml_split_info = contiguous_time_split(raw_ml_ds, val_fraction=val_fraction)
-
-    bundle = raw_bundle
-    if cfg["normalize_z"] or cfg["normalize_nwp"]:
-        norm_train_stop = raw_ml_split_info["split_time"]
-        norm_stats = fit_bundle_normalization(raw_bundle, end_time=norm_train_stop)
-        cfg["normalization"] = norm_stats.to_config_dict()
-        bundle = apply_bundle_normalization(
-            raw_bundle,
-            norm_stats,
-            normalize_z_values=cfg["normalize_z"],
-            normalize_nwp_values=cfg["normalize_nwp"],
-        )
-        if is_main_process():
-            print(
-                "[normalization] "
-                f"fit_until_t={norm_train_stop} "
-                f"z_std_mean={float(norm_stats.z_std.mean()):.4f} "
-                f"nwp_std_mean={float(norm_stats.nwp_std.mean()):.4f}"
-            )
+    if preloaded_bundle is None:
+        cfg, bundle = prepare_training_bundle(cfg)
     else:
-        cfg["normalization"] = None
+        bundle = preloaded_bundle
+    if is_main_process() and cfg.get("normalization_summary") is not None:
+        print(
+            "[normalization] "
+            f"fit_until_t={cfg['normalization_summary']['fit_until_t']} "
+            f"z_std_mean={cfg['normalization_summary']['z_std_mean']:.4f} "
+            f"nwp_std_mean={cfg['normalization_summary']['nwp_std_mean']:.4f}"
+        )
 
     ml_ds = MLMuDataset(bundle, seq_len=seq_len, chunk_len=chunk_len)
     ml_train_ds, ml_val_ds, ml_split_info = contiguous_time_split(ml_ds, val_fraction=val_fraction)
@@ -573,7 +594,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     )
 
     mean_model = AdvectionMeanNet(
-        in_channels=cfg.get("nwp_in_channels", raw_bundle.nwp_uv.shape[1]),
+        in_channels=cfg.get("nwp_in_channels", bundle.nwp_uv.shape[1]),
         hidden_dim=cfg.get("hidden_dim", 32),
         embed_dim=cfg.get("embed_dim", 32),
         num_heads=cfg.get("num_heads", 4),
@@ -592,7 +613,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
         init_base_scale_perp=cfg.get("init_base_scale_perp", 1.0),
         base_scale_min=cfg.get("base_scale_min", 0.15),
         base_scale_max=cfg.get("base_scale_max", 2.5),
-        num_sites=cfg.get("num_sites", raw_bundle.z_meas.shape[1]),
+        num_sites=cfg.get("num_sites", bundle.z_meas.shape[1]),
         init_transport_gate=cfg.get("init_transport_gate", 0.05),
         transport_gate_max=cfg.get("transport_gate_max", 0.35),
         state_bias_scale=cfg.get("state_bias_scale", 1.0),
@@ -722,8 +743,14 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None):
     cleanup_process_group()
 
 
-def main_worker(local_rank, world_size, cfg, master_port):
-    run_training(cfg=cfg, local_rank=local_rank, world_size=world_size, master_port=master_port)
+def main_worker(local_rank, world_size, cfg, master_port, preloaded_bundle):
+    run_training(
+        cfg=cfg,
+        local_rank=local_rank,
+        world_size=world_size,
+        master_port=master_port,
+        preloaded_bundle=preloaded_bundle,
+    )
 
 
 def main():
@@ -732,8 +759,10 @@ def main():
     if should_auto_spawn(cfg):
         world_size = min(int(cfg.get("num_gpus", torch.cuda.device_count())), torch.cuda.device_count())
         master_port = int(cfg.get("ddp_port", find_free_port()))
+        prepared_cfg, prepared_bundle = prepare_training_bundle(cfg)
+        shared_bundle = bundle_to_shared_tensors(prepared_bundle)
         print(f"Launching offline training with DDP on {world_size} GPUs (port={master_port})")
-        mp.spawn(main_worker, args=(world_size, cfg, master_port), nprocs=world_size, join=True)
+        mp.spawn(main_worker, args=(world_size, prepared_cfg, master_port, shared_bundle), nprocs=world_size, join=True)
         return
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))

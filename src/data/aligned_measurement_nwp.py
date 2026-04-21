@@ -49,12 +49,12 @@ NWP_CHANNELS_BY_MODE = {
 
 @dataclass
 class AlignedDataBundle:
-    z_meas: np.ndarray      # [T, 3, 2]
-    meas_lat: np.ndarray    # [3]
-    meas_lon: np.ndarray    # [3]
-    nwp_uv: np.ndarray      # [T, C, Y, X]
-    nwp_lat: np.ndarray     # [Y, X]
-    nwp_lon: np.ndarray     # [Y, X]
+    z_meas: np.ndarray | torch.Tensor      # [T, 3, 2]
+    meas_lat: np.ndarray | torch.Tensor    # [3]
+    meas_lon: np.ndarray | torch.Tensor    # [3]
+    nwp_uv: np.ndarray | torch.Tensor      # [T, C, Y, X]
+    nwp_lat: np.ndarray | torch.Tensor     # [Y, X]
+    nwp_lon: np.ndarray | torch.Tensor     # [Y, X]
 
 
 @dataclass
@@ -179,6 +179,24 @@ def apply_bundle_normalization(bundle: AlignedDataBundle, stats: NormalizationSt
     )
 
 
+def bundle_to_shared_tensors(bundle: AlignedDataBundle):
+    def convert(array):
+        if torch.is_tensor(array):
+            tensor = array.detach().clone().float()
+        else:
+            tensor = torch.from_numpy(np.asarray(array)).float()
+        return tensor.share_memory_()
+
+    return AlignedDataBundle(
+        z_meas=convert(bundle.z_meas),
+        meas_lat=convert(bundle.meas_lat),
+        meas_lon=convert(bundle.meas_lon),
+        nwp_uv=convert(bundle.nwp_uv),
+        nwp_lat=convert(bundle.nwp_lat),
+        nwp_lon=convert(bundle.nwp_lon),
+    )
+
+
 def load_measurement_140m(meas_file):
     data = load_mat_auto(meas_file)
     ws_uv = np.asarray(data["Ws_uv"]).astype(np.float32)
@@ -266,11 +284,25 @@ class IDEBaselineDataset(Dataset):
     def __getitem__(self, i):
         start = self.valid[i]
         z = self.bundle.z_meas[start:start + self.chunk_len + 1]
+        if not torch.is_tensor(z):
+            z = torch.from_numpy(z).float()
+        else:
+            z = z.float()
+        site_lat = self.bundle.meas_lat
+        site_lon = self.bundle.meas_lon
+        if not torch.is_tensor(site_lat):
+            site_lat = torch.from_numpy(site_lat).float()
+        else:
+            site_lat = site_lat.float()
+        if not torch.is_tensor(site_lon):
+            site_lon = torch.from_numpy(site_lon).float()
+        else:
+            site_lon = site_lon.float()
 
         return {
-            "z_seq_full": torch.from_numpy(z).float(),        # [chunk_len+1, 3, 2]
-            "site_lat": torch.from_numpy(self.bundle.meas_lat).float(),
-            "site_lon": torch.from_numpy(self.bundle.meas_lon).float(),
+            "z_seq_full": z,        # [chunk_len+1, 3, 2]
+            "site_lat": site_lat,
+            "site_lon": site_lon,
             "time_idx_start": torch.tensor(start, dtype=torch.long),
         }
 
@@ -314,11 +346,29 @@ class MLMuDataset(Dataset):
 
         z = self.bundle.z_meas[start:end]        # [seq_len+chunk_len, 3, 2]
         x = self.bundle.nwp_uv[start:end - 1]    # [seq_len+chunk_len-1, 6, Y, X]
+        if not torch.is_tensor(z):
+            z = torch.from_numpy(z).float()
+        else:
+            z = z.float()
+        if not torch.is_tensor(x):
+            x = torch.from_numpy(x).float()
+        else:
+            x = x.float()
+        site_lat = self.bundle.meas_lat
+        site_lon = self.bundle.meas_lon
+        if not torch.is_tensor(site_lat):
+            site_lat = torch.from_numpy(site_lat).float()
+        else:
+            site_lat = site_lat.float()
+        if not torch.is_tensor(site_lon):
+            site_lon = torch.from_numpy(site_lon).float()
+        else:
+            site_lon = site_lon.float()
 
         return {
-            "z_seq_full": torch.from_numpy(z).float(),
-            "nwp_seq_full": torch.from_numpy(x).float(),
-            "site_lat": torch.from_numpy(self.bundle.meas_lat).float(),
-            "site_lon": torch.from_numpy(self.bundle.meas_lon).float(),
+            "z_seq_full": z,
+            "nwp_seq_full": x,
+            "site_lat": site_lat,
+            "site_lon": site_lon,
             "time_idx_start": torch.tensor(start, dtype=torch.long),
         }
