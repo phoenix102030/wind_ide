@@ -183,6 +183,14 @@ class AdvectionMeanNet(nn.Module):
         return positions
 
     def _configure_parameter_usage(self):
+        mu_head_trainable = self.mu_mode == "free"
+        for param in self.mu_head.parameters():
+            param.requires_grad_(mu_head_trainable)
+        for param in self.mu_alpha_head.parameters():
+            param.requires_grad_(self.mu_mode == "anchored")
+        for param in self.mu_bias_head.parameters():
+            param.requires_grad_(self.mu_mode == "anchored")
+
         sigma_head_trainable = self.sigma_mode == "network"
         for layer in (self.sigma11_head, self.sigma22_head, self.sigma12_head):
             for param in layer.parameters():
