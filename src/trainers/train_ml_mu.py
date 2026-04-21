@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.distributed as dist
 
@@ -22,7 +24,7 @@ def reduce_metric_means(metrics, device):
     return reduced
 
 
-def build_dynamics_sequence(mean_model, nwp_seq_full, seq_len, start_at=None):
+def build_dynamics_sequence(mean_model, nwp_seq_full, seq_len, start_at=None, window_batch_size=8):
     """
     nwp_seq_full: [B, seq_len+chunk_len-1, 6, Y, X]
     returns:
@@ -34,18 +36,43 @@ def build_dynamics_sequence(mean_model, nwp_seq_full, seq_len, start_at=None):
     if start_at is None:
         start_at = seq_len - 1
 
-    outputs = []
-    for end_t in range(start_at, nwp_seq_full.shape[1]):
-        x = nwp_seq_full[:, end_t - seq_len + 1:end_t + 1]
-        outputs.append(mean_model(x))
+    total_frames = nwp_seq_full.shape[1]
+    first_start = start_at - seq_len + 1
+    if first_start < 0:
+        raise ValueError(f"Need start_at >= seq_len - 1, got start_at={start_at}, seq_len={seq_len}")
+    if total_frames < seq_len:
+        raise ValueError(f"Need at least seq_len={seq_len} NWP frames, got {total_frames}")
 
-    return {
-        "mu": torch.stack([out["mu"] for out in outputs], dim=1),
-        "base_scales": torch.stack([out["base_scales"] for out in outputs], dim=1),
-        "transport_gates": torch.stack([out["transport_gates"] for out in outputs], dim=1),
-        "state_bias": torch.stack([out["state_bias"] for out in outputs], dim=1),
-        "sigma": torch.stack([out["sigma"] for out in outputs], dim=1),
-    }
+    window_starts = torch.arange(
+        first_start,
+        total_frames - seq_len + 1,
+        device=nwp_seq_full.device,
+        dtype=torch.long,
+    )
+    num_windows = int(window_starts.numel())
+    if num_windows <= 0:
+        raise ValueError("No valid NWP windows available to build the dynamics sequence.")
+
+    if window_batch_size is None or int(window_batch_size) <= 0:
+        window_batch_size = num_windows
+    window_batch_size = min(int(window_batch_size), num_windows)
+
+    batch_size = nwp_seq_full.shape[0]
+    offsets = torch.arange(seq_len, device=nwp_seq_full.device, dtype=torch.long)
+    keys = ("mu", "base_scales", "transport_gates", "state_bias", "sigma")
+    stacked = {key: [] for key in keys}
+
+    for chunk_start in range(0, num_windows, window_batch_size):
+        starts_chunk = window_starts[chunk_start:chunk_start + window_batch_size]
+        gather_idx = starts_chunk[:, None] + offsets[None, :]
+        x = nwp_seq_full[:, gather_idx]
+        x = x.reshape(batch_size * starts_chunk.shape[0], *x.shape[2:])
+        out = mean_model(x)
+        for key in keys:
+            value = out[key]
+            stacked[key].append(value.reshape(batch_size, starts_chunk.shape[0], *value.shape[1:]))
+
+    return {key: torch.cat(parts, dim=1) for key, parts in stacked.items()}
 
 
 def zero_dynamics_sequence(batch_size, chunk_len, device, dtype, state_dim=6):
@@ -170,6 +197,24 @@ def _prediction_mse(pred, target):
     return (pred - target).square().mean()
 
 
+def _deterministic_prediction_nll(raw_ide, preds, target, start_idx, dtype):
+    _, steps_minus_one, _ = target.shape
+    next_obs_idx = raw_ide._time_indices(start_idx + 1, steps_minus_one)
+    trans_idx = raw_ide._time_indices(start_idx, steps_minus_one)
+
+    q_proc = raw_ide._gather_scalar(raw_ide.q_proc_series, trans_idx).to(dtype=dtype)
+    r_obs = raw_ide._gather_scalar(raw_ide.r_obs_series, next_obs_idx).to(dtype=dtype)
+    variance = (q_proc.square() + r_obs.square()).clamp_min(1e-6)
+
+    residual = target - preds
+    nll = 0.5 * (
+        residual.square() / variance[:, :, None]
+        + torch.log(variance)[:, :, None]
+        + math.log(2.0 * math.pi)
+    )
+    return nll.sum(dim=-1).mean()
+
+
 def _advection_prediction_loss(
     ide_model,
     z_seq,
@@ -187,12 +232,14 @@ def _advection_prediction_loss(
     state_bias_reg_weight,
 ):
     raw_ide = unwrap_model(ide_model)
+    dtype = z_seq.dtype
 
     if z_seq.shape[1] < 2:
         raise ValueError("Advection supervision requires at least two observations per window.")
 
     one_step = z_seq.new_tensor(0.0)
-    if one_step_weight > 0.0:
+    pred_next = None
+    if one_step_weight > 0.0 or step_nll_weight > 0.0:
         pred_next = raw_ide.deterministic_predict_sequence(
             z_seq=z_seq,
             site_lon=site_lon,
@@ -201,16 +248,16 @@ def _advection_prediction_loss(
             start_idx=start_idx,
             apply_damping=True,
         )
+    if one_step_weight > 0.0:
         one_step = _prediction_mse(pred_next, z_seq[:, 1:])
     step_nll = z_seq.new_tensor(0.0)
     if step_nll_weight > 0.0:
-        step_nll = raw_ide.deterministic_sequence_nll(
-            z_seq=z_seq,
-            site_lon=site_lon,
-            site_lat=site_lat,
-            dynamics_seq=dynamics_seq,
+        step_nll = _deterministic_prediction_nll(
+            raw_ide=raw_ide,
+            preds=pred_next.reshape(pred_next.shape[0], pred_next.shape[1], raw_ide.state_dim),
+            target=z_seq[:, 1:].reshape(z_seq.shape[0], z_seq.shape[1] - 1, raw_ide.state_dim),
             start_idx=start_idx,
-            apply_damping=True,
+            dtype=dtype,
         )
 
     steps = z_seq.shape[1]
