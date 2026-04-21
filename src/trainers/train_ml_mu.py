@@ -165,18 +165,47 @@ def _sigma_state_var_mean(raw_ide, dynamics_seq):
     return float(sigma_state_var.mean().detach().cpu())
 
 
+def _transport_floor_penalty(dynamics_seq, min_transport_gate):
+    if min_transport_gate <= 0.0:
+        return dynamics_seq["transport_gates"].new_tensor(0.0)
+    shortfall = torch.relu(float(min_transport_gate) - dynamics_seq["transport_gates"])
+    return shortfall.mean()
+
+
+def _sigma_floor_penalty(dynamics_seq, min_sigma_diag):
+    if min_sigma_diag <= 0.0:
+        return dynamics_seq["sigma"].new_tensor(0.0)
+    diag = dynamics_seq["sigma"].diagonal(dim1=-2, dim2=-1)
+    shortfall = torch.relu(float(min_sigma_diag) - diag)
+    return shortfall.mean()
+
+
+def _scale_floor_penalty(raw_ide, min_q_adv_scale, min_nll_sigma_scale):
+    penalty = raw_ide.q_adv_scale.new_tensor(0.0)
+    if min_q_adv_scale > 0.0:
+        penalty = penalty + torch.relu(float(min_q_adv_scale) - raw_ide.q_adv_scale)
+    if min_nll_sigma_scale > 0.0:
+        penalty = penalty + torch.relu(float(min_nll_sigma_scale) - raw_ide.nll_sigma_scale)
+    return penalty
+
+
 def _advection_metric_names():
     return [
         "loss",
+        "prob_nll",
         "one_step_mse",
         "rollout_mse",
         "step_nll",
         "noise_reg",
         "smoothness",
         "transport_reg",
+        "transport_floor_pen",
         "state_bias_reg",
         "sigma_cross_reg",
+        "sigma_floor_pen",
+        "scale_floor_pen",
         "asym_loss",
+        "asym_active_frac",
         "sigma_mean",
         "sigma_trace",
         "sigma_diag_min",
@@ -189,6 +218,7 @@ def _advection_metric_names():
         "transport_gate_mean",
         "state_bias_abs_mean",
         "q_adv_mean",
+        "nll_sigma_scale_mean",
     ]
 
 
@@ -285,17 +315,21 @@ def _directional_asymmetry_loss(pred_next, target_next, site_lon, site_lat, dyna
     h = coords[:, :, None, :] - coords[:, None, :, :]
     dir_unit = mean_dir / mean_dir.norm(dim=-1, keepdim=True).clamp_min(1e-6)
     proj = (h[:, None] * dir_unit[:, :, None, None, :]).sum(dim=-1)
-    downwind_mask = proj > 0
-    upwind_mask = proj < 0
+    num_sites = coords.shape[1]
+    pair_mask = ~torch.eye(num_sites, device=coords.device, dtype=torch.bool)[None, None]
+    downwind_mask = (proj > 1e-6) & pair_mask
+    upwind_mask = (proj < -1e-6) & pair_mask
 
-    r = residual[..., 0]
-    emp_cov = r[:, :, :, None] * r[:, :, None, :]
+    emp_cov = torch.einsum("btsc,btuc->btsu", residual, residual) / residual.shape[-1]
 
     downwind_vals = emp_cov.masked_select(downwind_mask)
     upwind_vals = emp_cov.masked_select(upwind_mask)
     if downwind_vals.numel() == 0 or upwind_vals.numel() == 0:
-        return emp_cov.new_tensor(0.0)
-    return (downwind_vals.mean() - upwind_vals.mean()).square()
+        return emp_cov.new_tensor(0.0), 0.0
+
+    asym = (downwind_vals.abs().mean() - upwind_vals.abs().mean()).abs()
+    active_frac = float((downwind_mask | upwind_mask).float().mean().detach().cpu())
+    return asym, active_frac
 
 
 def _advection_prediction_loss(
@@ -310,17 +344,35 @@ def _advection_prediction_loss(
     rollout_weight,
     rollout_history,
     step_nll_weight,
+    prob_nll_weight,
     noise_reg_weight,
     transport_reg_weight,
+    transport_floor_weight,
+    min_transport_gate,
     state_bias_reg_weight,
     asymmetry_weight,
     sigma_cross_reg_weight,
+    sigma_floor_weight,
+    min_sigma_diag,
+    scale_floor_weight,
+    min_q_adv_scale,
+    min_nll_sigma_scale,
 ):
     raw_ide = unwrap_model(ide_model)
     dtype = z_seq.dtype
 
     if z_seq.shape[1] < 2:
         raise ValueError("Advection supervision requires at least two observations per window.")
+
+    prob_nll = z_seq.new_tensor(0.0)
+    if prob_nll_weight > 0.0:
+        prob_nll = ide_model(
+            z_seq=z_seq,
+            site_lon=site_lon,
+            site_lat=site_lat,
+            dynamics_seq=dynamics_seq,
+            start_idx=start_idx,
+        )
 
     one_step = z_seq.new_tensor(0.0)
     pred_next = None
@@ -366,11 +418,15 @@ def _advection_prediction_loss(
 
     smoothness = dynamics_smoothness_penalty(dynamics_seq)
     transport_reg = dynamics_seq["transport_gates"].square().mean()
+    transport_floor_pen = _transport_floor_penalty(dynamics_seq, min_transport_gate)
     state_bias_reg = dynamics_seq["state_bias"].square().mean()
     sigma_cross_reg = dynamics_seq["sigma"][..., :2, 2:].square().mean()
+    sigma_floor_pen = _sigma_floor_penalty(dynamics_seq, min_sigma_diag)
+    scale_floor_pen = _scale_floor_penalty(raw_ide, min_q_adv_scale, min_nll_sigma_scale)
     asym_loss = z_seq.new_tensor(0.0)
+    asym_active_frac = 0.0
     if pred_next is not None and asymmetry_weight > 0.0:
-        asym_loss = _directional_asymmetry_loss(
+        asym_loss, asym_active_frac = _directional_asymmetry_loss(
             pred_next=pred_next,
             target_next=z_seq[:, 1:],
             site_lon=site_lon,
@@ -379,27 +435,36 @@ def _advection_prediction_loss(
         )
     noise_reg = raw_ide.noise_regularization()
     loss = (
-        one_step_weight * one_step
+        prob_nll_weight * prob_nll
+        + one_step_weight * one_step
         + rollout_weight * rollout
         + step_nll_weight * step_nll
         + asymmetry_weight * asym_loss
         + noise_reg_weight * noise_reg
         + smoothness_weight * smoothness
         + transport_reg_weight * transport_reg
+        + transport_floor_weight * transport_floor_pen
         + state_bias_reg_weight * state_bias_reg
         + sigma_cross_reg_weight * sigma_cross_reg
+        + sigma_floor_weight * sigma_floor_pen
+        + scale_floor_weight * scale_floor_pen
     )
     return loss, {
         "loss": float(loss.detach().cpu()),
+        "prob_nll": float(prob_nll.detach().cpu()),
         "one_step_mse": float(one_step.detach().cpu()),
         "rollout_mse": float(rollout.detach().cpu()),
         "step_nll": float(step_nll.detach().cpu()),
         "noise_reg": float(noise_reg.detach().cpu()),
         "smoothness": float(smoothness.detach().cpu()),
         "transport_reg": float(transport_reg.detach().cpu()),
+        "transport_floor_pen": float(transport_floor_pen.detach().cpu()),
         "state_bias_reg": float(state_bias_reg.detach().cpu()),
         "sigma_cross_reg": float(sigma_cross_reg.detach().cpu()),
+        "sigma_floor_pen": float(sigma_floor_pen.detach().cpu()),
+        "scale_floor_pen": float(scale_floor_pen.detach().cpu()),
         "asym_loss": float(asym_loss.detach().cpu()),
+        "asym_active_frac": float(asym_active_frac),
         "sigma_mean": sigma_summary(dynamics_seq),
         "sigma_trace": sigma_trace_summary(dynamics_seq),
         "sigma_diag_min": sigma_diag_min_summary(dynamics_seq),
@@ -412,6 +477,7 @@ def _advection_prediction_loss(
         "transport_gate_mean": transport_gate_summary(dynamics_seq),
         "state_bias_abs_mean": state_bias_summary(dynamics_seq),
         "q_adv_mean": float(raw_ide.q_adv_scale.detach().cpu()),
+        "nll_sigma_scale_mean": float(raw_ide.nll_sigma_scale.detach().cpu()),
     }
 
 
@@ -525,11 +591,19 @@ def train_advection_one_epoch(
     rollout_weight=1.0,
     rollout_history=6,
     step_nll_weight=0.1,
+    prob_nll_weight=1.0,
     noise_reg_weight=1e-4,
     transport_reg_weight=1e-2,
+    transport_floor_weight=0.0,
+    min_transport_gate=0.0,
     state_bias_reg_weight=1e-3,
     asymmetry_weight=0.01,
     sigma_cross_reg_weight=1e-4,
+    sigma_floor_weight=0.0,
+    min_sigma_diag=0.0,
+    scale_floor_weight=0.0,
+    min_q_adv_scale=0.0,
+    min_nll_sigma_scale=0.0,
 ):
     mean_model.train()
     ide_model.eval()
@@ -556,11 +630,19 @@ def train_advection_one_epoch(
             rollout_weight=rollout_weight,
             rollout_history=rollout_history,
             step_nll_weight=step_nll_weight,
+            prob_nll_weight=prob_nll_weight,
             noise_reg_weight=noise_reg_weight,
             transport_reg_weight=transport_reg_weight,
+            transport_floor_weight=transport_floor_weight,
+            min_transport_gate=min_transport_gate,
             state_bias_reg_weight=state_bias_reg_weight,
             asymmetry_weight=asymmetry_weight,
             sigma_cross_reg_weight=sigma_cross_reg_weight,
+            sigma_floor_weight=sigma_floor_weight,
+            min_sigma_diag=min_sigma_diag,
+            scale_floor_weight=scale_floor_weight,
+            min_q_adv_scale=min_q_adv_scale,
+            min_nll_sigma_scale=min_nll_sigma_scale,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(mean_model.parameters(), 1.0)
@@ -587,11 +669,19 @@ def eval_advection(
     rollout_weight=1.0,
     rollout_history=6,
     step_nll_weight=0.1,
+    prob_nll_weight=1.0,
     noise_reg_weight=1e-4,
     transport_reg_weight=1e-2,
+    transport_floor_weight=0.0,
+    min_transport_gate=0.0,
     state_bias_reg_weight=1e-3,
     asymmetry_weight=0.01,
     sigma_cross_reg_weight=1e-4,
+    sigma_floor_weight=0.0,
+    min_sigma_diag=0.0,
+    scale_floor_weight=0.0,
+    min_q_adv_scale=0.0,
+    min_nll_sigma_scale=0.0,
 ):
     mean_model.eval()
     ide_model.eval()
@@ -617,11 +707,19 @@ def eval_advection(
             rollout_weight=rollout_weight,
             rollout_history=rollout_history,
             step_nll_weight=step_nll_weight,
+            prob_nll_weight=prob_nll_weight,
             noise_reg_weight=noise_reg_weight,
             transport_reg_weight=transport_reg_weight,
+            transport_floor_weight=transport_floor_weight,
+            min_transport_gate=min_transport_gate,
             state_bias_reg_weight=state_bias_reg_weight,
             asymmetry_weight=asymmetry_weight,
             sigma_cross_reg_weight=sigma_cross_reg_weight,
+            sigma_floor_weight=sigma_floor_weight,
+            min_sigma_diag=min_sigma_diag,
+            scale_floor_weight=scale_floor_weight,
+            min_q_adv_scale=min_q_adv_scale,
+            min_nll_sigma_scale=min_nll_sigma_scale,
         )
         for key in metrics:
             metrics[key].append(stats[key])
@@ -644,11 +742,19 @@ def train_joint_one_epoch(
     rollout_weight=1.0,
     rollout_history=6,
     step_nll_weight=0.1,
+    prob_nll_weight=1.0,
     noise_reg_weight=1e-4,
     transport_reg_weight=1e-2,
+    transport_floor_weight=0.0,
+    min_transport_gate=0.0,
     state_bias_reg_weight=1e-3,
     asymmetry_weight=0.01,
     sigma_cross_reg_weight=1e-4,
+    sigma_floor_weight=0.0,
+    min_sigma_diag=0.0,
+    scale_floor_weight=0.0,
+    min_q_adv_scale=0.0,
+    min_nll_sigma_scale=0.0,
 ):
     mean_model.train()
     ide_model.train()
@@ -675,11 +781,19 @@ def train_joint_one_epoch(
             rollout_weight=rollout_weight,
             rollout_history=rollout_history,
             step_nll_weight=step_nll_weight,
+            prob_nll_weight=prob_nll_weight,
             noise_reg_weight=noise_reg_weight,
             transport_reg_weight=transport_reg_weight,
+            transport_floor_weight=transport_floor_weight,
+            min_transport_gate=min_transport_gate,
             state_bias_reg_weight=state_bias_reg_weight,
             asymmetry_weight=asymmetry_weight,
             sigma_cross_reg_weight=sigma_cross_reg_weight,
+            sigma_floor_weight=sigma_floor_weight,
+            min_sigma_diag=min_sigma_diag,
+            scale_floor_weight=scale_floor_weight,
+            min_q_adv_scale=min_q_adv_scale,
+            min_nll_sigma_scale=min_nll_sigma_scale,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(mean_model.parameters(), 1.0)
@@ -708,11 +822,19 @@ def eval_joint(
     rollout_weight=1.0,
     rollout_history=6,
     step_nll_weight=0.1,
+    prob_nll_weight=1.0,
     noise_reg_weight=1e-4,
     transport_reg_weight=1e-2,
+    transport_floor_weight=0.0,
+    min_transport_gate=0.0,
     state_bias_reg_weight=1e-3,
     asymmetry_weight=0.01,
     sigma_cross_reg_weight=1e-4,
+    sigma_floor_weight=0.0,
+    min_sigma_diag=0.0,
+    scale_floor_weight=0.0,
+    min_q_adv_scale=0.0,
+    min_nll_sigma_scale=0.0,
 ):
     mean_model.eval()
     ide_model.eval()
@@ -736,11 +858,19 @@ def eval_joint(
             rollout_weight=rollout_weight,
             rollout_history=rollout_history,
             step_nll_weight=step_nll_weight,
+            prob_nll_weight=prob_nll_weight,
             noise_reg_weight=noise_reg_weight,
             transport_reg_weight=transport_reg_weight,
+            transport_floor_weight=transport_floor_weight,
+            min_transport_gate=min_transport_gate,
             state_bias_reg_weight=state_bias_reg_weight,
             asymmetry_weight=asymmetry_weight,
             sigma_cross_reg_weight=sigma_cross_reg_weight,
+            sigma_floor_weight=sigma_floor_weight,
+            min_sigma_diag=min_sigma_diag,
+            scale_floor_weight=scale_floor_weight,
+            min_q_adv_scale=min_q_adv_scale,
+            min_nll_sigma_scale=min_nll_sigma_scale,
         )
         for key in metrics:
             metrics[key].append(stats[key])

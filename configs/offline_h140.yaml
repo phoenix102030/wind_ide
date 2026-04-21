@@ -49,16 +49,24 @@ damping_min: 0.02
 damping_max: 0.5
 
 # Forecast objective weights.
-adv_one_step_weight: 1.0
-adv_rollout_weight: 1.0
+adv_one_step_weight: 0.25
+adv_rollout_weight: 0.25
 adv_history_len: 6
-step_nll_weight: 0.5
+step_nll_weight: 0.1
+prob_nll_weight: 1.0
 asymmetry_weight: 0.01
 noise_reg_weight: 0.0001
 smoothness_weight: 0.001
-transport_reg_weight: 0.0001
+transport_reg_weight: 0.0
+transport_floor_weight: 0.5
+min_transport_gate: 0.03
 state_bias_reg_weight: 0.00001
 sigma_cross_reg_weight: 0.0001
+sigma_floor_weight: 0.5
+min_sigma_diag: 0.02
+scale_floor_weight: 0.25
+min_q_adv_scale: 0.1
+min_nll_sigma_scale: 0.1
 
 # Advection network capacity.
 hidden_dim: 32
@@ -88,7 +96,10 @@ init_transport_gate: 0.05
 transport_gate_max: 0.35
 state_bias_scale: 1.0
 gate_warmup_fraction: 0.2
-force_gate_value: 0.8
+force_gate_start_value: 0.25
+force_gate_end_value: 0.10
+gate_floor_fraction: 0.2
+gate_floor_value: 0.05
 save_transition_dump: true
 transition_dump_split: val
 transition_dump_every: 1

@@ -172,6 +172,8 @@ class AdvectionMeanNet(nn.Module):
         self.global_sigma22_params = nn.Parameter(global_sigma_diag_init.clone())
         self.global_sigma12_params = nn.Parameter(torch.zeros(4, dtype=torch.float32))
         self.force_gate_value = None
+        self.force_gate_mix = None
+        self.gate_floor_value = None
         self._configure_parameter_usage()
 
     def _diag_param_positions(self):
@@ -429,9 +431,16 @@ class AdvectionMeanNet(nn.Module):
         state_bias = self._predict_state_bias(h)
         if self.training and self.force_gate_value is not None:
             forced_gates = torch.full_like(transport_gates, float(self.force_gate_value))
-            # Keep the warmup forward value fixed while preserving a gradient path
-            # through the transport-gate head so DDP does not treat it as unused.
-            transport_gates = transport_gates + (forced_gates - transport_gates).detach()
+            mix = 1.0 if self.force_gate_mix is None else float(self.force_gate_mix)
+            mix = min(max(mix, 0.0), 1.0)
+            target_gates = (1.0 - mix) * transport_gates + mix * forced_gates
+            # Keep the warmup forward value on the scheduled path while
+            # preserving gradients through the transport-gate head.
+            transport_gates = transport_gates + (target_gates - transport_gates).detach()
+        if self.training and self.gate_floor_value is not None:
+            floor_gates = torch.full_like(transport_gates, float(self.gate_floor_value))
+            floored = torch.maximum(transport_gates, floor_gates)
+            transport_gates = transport_gates + (floored - transport_gates).detach()
 
         if self.sigma_mode == "global":
             raw11 = self.global_sigma11_params.unsqueeze(0).expand(batch_size, -1)

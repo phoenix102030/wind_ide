@@ -452,15 +452,26 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
         print(f"adv_one_step_weight={cfg.get('adv_one_step_weight', 0.25)}")
         print(f"adv_rollout_weight={cfg.get('adv_rollout_weight', 1.0)}")
         print(f"step_nll_weight={cfg.get('step_nll_weight', 0.1)}")
+        print(f"prob_nll_weight={cfg.get('prob_nll_weight', 1.0)}")
         print(f"asymmetry_weight={cfg.get('asymmetry_weight', 0.01)}")
         print(f"transport_reg_weight={cfg.get('transport_reg_weight', 1e-2)}")
+        print(f"transport_floor_weight={cfg.get('transport_floor_weight', 0.0)}")
+        print(f"min_transport_gate={cfg.get('min_transport_gate', 0.0)}")
         print(f"state_bias_reg_weight={cfg.get('state_bias_reg_weight', 1e-3)}")
         print(f"sigma_cross_reg_weight={cfg.get('sigma_cross_reg_weight', 1e-4)}")
+        print(f"sigma_floor_weight={cfg.get('sigma_floor_weight', 0.0)}")
+        print(f"min_sigma_diag={cfg.get('min_sigma_diag', 0.0)}")
+        print(f"scale_floor_weight={cfg.get('scale_floor_weight', 0.0)}")
+        print(f"min_q_adv_scale={cfg.get('min_q_adv_scale', 0.0)}")
+        print(f"min_nll_sigma_scale={cfg.get('min_nll_sigma_scale', 0.0)}")
         print(f"init_transport_gate={cfg.get('init_transport_gate', 0.05)}")
         print(f"transport_gate_max={cfg.get('transport_gate_max', 0.35)}")
         print(f"state_bias_scale={cfg.get('state_bias_scale', 1.0)}")
         print(f"gate_warmup_fraction={cfg.get('gate_warmup_fraction', 0.2)}")
-        print(f"force_gate_value={cfg.get('force_gate_value', 0.8)}")
+        print(f"force_gate_start_value={cfg.get('force_gate_start_value', cfg.get('force_gate_value', 0.2))}")
+        print(f"force_gate_end_value={cfg.get('force_gate_end_value', cfg.get('gate_floor_value', 0.05))}")
+        print(f"gate_floor_fraction={cfg.get('gate_floor_fraction', 0.2)}")
+        print(f"gate_floor_value={cfg.get('gate_floor_value', 0.05)}")
         print(f"save_transition_dump={cfg.get('save_transition_dump', True)}")
         print(f"transition_dump_split={cfg.get('transition_dump_split', 'val')}")
         print(f"transition_dump_every={cfg.get('transition_dump_every', 1)}")
@@ -636,7 +647,13 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
 
     best_offline_val = float("inf")
     warmup_epochs = max(int(round(joint_epochs * float(cfg.get("gate_warmup_fraction", 0.2)))), 0)
-    force_gate_value = cfg.get("force_gate_value", 0.8)
+    transport_gate_cap = float(cfg.get("transport_gate_max", 0.35))
+    force_gate_start_value = float(cfg.get("force_gate_start_value", cfg.get("force_gate_value", 0.2)))
+    force_gate_end_value = float(cfg.get("force_gate_end_value", cfg.get("gate_floor_value", 0.05)))
+    force_gate_start_value = min(max(force_gate_start_value, 0.0), transport_gate_cap)
+    force_gate_end_value = min(max(force_gate_end_value, 0.0), transport_gate_cap)
+    gate_floor_epochs = max(int(round(joint_epochs * float(cfg.get("gate_floor_fraction", 0.2)))), 0)
+    gate_floor_value = float(cfg.get("gate_floor_value", 0.05))
     dump_every = max(int(cfg.get("transition_dump_every", 1)), 1)
     dump_enabled = bool(cfg.get("save_transition_dump", True))
     dump_split = str(cfg.get("transition_dump_split", "val")).lower()
@@ -645,7 +662,32 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
         if ml_train_sampler is not None:
             ml_train_sampler.set_epoch(epoch)
         raw_mean = unwrap_model(mean_model)
-        raw_mean.force_gate_value = float(force_gate_value) if epoch < warmup_epochs else None
+        in_warmup = epoch < warmup_epochs
+        if in_warmup:
+            if warmup_epochs > 1:
+                warmup_progress = epoch / float(warmup_epochs - 1)
+            else:
+                warmup_progress = 0.0
+            scheduled_force_gate = (
+                (1.0 - warmup_progress) * force_gate_start_value
+                + warmup_progress * force_gate_end_value
+            )
+            raw_mean.force_gate_value = float(scheduled_force_gate)
+        else:
+            raw_mean.force_gate_value = None
+        if in_warmup and warmup_epochs > 1:
+            raw_mean.force_gate_mix = max(0.0, 1.0 - (epoch / float(warmup_epochs - 1)))
+        elif in_warmup:
+            raw_mean.force_gate_mix = 1.0
+        else:
+            raw_mean.force_gate_mix = None
+        if epoch < warmup_epochs:
+            raw_mean.gate_floor_value = None
+        elif gate_floor_epochs > 0 and epoch < warmup_epochs + gate_floor_epochs:
+            decay_progress = (epoch - warmup_epochs) / max(gate_floor_epochs, 1)
+            raw_mean.gate_floor_value = gate_floor_value * max(0.0, 1.0 - decay_progress)
+        else:
+            raw_mean.gate_floor_value = None
 
         tr = train_joint_one_epoch(
             mean_model=mean_model,
@@ -660,13 +702,23 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
             rollout_weight=cfg.get("adv_rollout_weight", 1.0),
             rollout_history=cfg.get("adv_history_len", 6),
             step_nll_weight=cfg.get("step_nll_weight", 0.1),
+            prob_nll_weight=cfg.get("prob_nll_weight", 1.0),
             noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
             transport_reg_weight=cfg.get("transport_reg_weight", 1e-2),
+            transport_floor_weight=cfg.get("transport_floor_weight", 0.0),
+            min_transport_gate=cfg.get("min_transport_gate", 0.0),
             state_bias_reg_weight=cfg.get("state_bias_reg_weight", 1e-3),
             asymmetry_weight=cfg.get("asymmetry_weight", 0.01),
             sigma_cross_reg_weight=cfg.get("sigma_cross_reg_weight", 1e-4),
+            sigma_floor_weight=cfg.get("sigma_floor_weight", 0.0),
+            min_sigma_diag=cfg.get("min_sigma_diag", 0.0),
+            scale_floor_weight=cfg.get("scale_floor_weight", 0.0),
+            min_q_adv_scale=cfg.get("min_q_adv_scale", 0.0),
+            min_nll_sigma_scale=cfg.get("min_nll_sigma_scale", 0.0),
         )
         raw_mean.force_gate_value = None
+        raw_mean.force_gate_mix = None
+        raw_mean.gate_floor_value = None
         va = eval_joint(
             mean_model=mean_model,
             ide_model=ide_model,
@@ -679,11 +731,19 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
             rollout_weight=cfg.get("adv_rollout_weight", 1.0),
             rollout_history=cfg.get("adv_history_len", 6),
             step_nll_weight=cfg.get("step_nll_weight", 0.1),
+            prob_nll_weight=cfg.get("prob_nll_weight", 1.0),
             noise_reg_weight=cfg.get("noise_reg_weight", 1e-4),
             transport_reg_weight=cfg.get("transport_reg_weight", 1e-2),
+            transport_floor_weight=cfg.get("transport_floor_weight", 0.0),
+            min_transport_gate=cfg.get("min_transport_gate", 0.0),
             state_bias_reg_weight=cfg.get("state_bias_reg_weight", 1e-3),
             asymmetry_weight=cfg.get("asymmetry_weight", 0.01),
             sigma_cross_reg_weight=cfg.get("sigma_cross_reg_weight", 1e-4),
+            sigma_floor_weight=cfg.get("sigma_floor_weight", 0.0),
+            min_sigma_diag=cfg.get("min_sigma_diag", 0.0),
+            scale_floor_weight=cfg.get("scale_floor_weight", 0.0),
+            min_q_adv_scale=cfg.get("min_q_adv_scale", 0.0),
+            min_nll_sigma_scale=cfg.get("min_nll_sigma_scale", 0.0),
         )
 
         raw_ide = unwrap_model(ide_model)
@@ -691,6 +751,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
             print(
                 f"[OFFLINE-JOINT][epoch {epoch}] "
                 f"train={tr['loss']:.6f} val={va['loss']:.6f} "
+                f"train_prob={tr['prob_nll']:.6f} val_prob={va['prob_nll']:.6f} "
                 f"train_roll={tr['rollout_mse']:.6f} val_roll={va['rollout_mse']:.6f} "
                 f"train_step={tr['one_step_mse']:.6f} val_step={va['one_step_mse']:.6f} "
                 f"train_nll={tr['step_nll']:.6f} val_nll={va['step_nll']:.6f} "
@@ -703,18 +764,25 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
                 f"transport={tr['transport_gate_mean']:.6f} "
                 f"bias_abs={tr['state_bias_abs_mean']:.6f} "
                 f"transport_reg={tr['transport_reg']:.6f} "
+                f"transport_floor_pen={tr['transport_floor_pen']:.6f} "
                 f"bias_reg={tr['state_bias_reg']:.6f} "
                 f"sigma_cross_reg={tr['sigma_cross_reg']:.6f} "
+                f"sigma_floor_pen={tr['sigma_floor_pen']:.6f} "
+                f"scale_floor_pen={tr['scale_floor_pen']:.6f} "
                 f"asym={tr['asym_loss']:.6f} "
                 f"damping={float(raw_ide.damping.detach().cpu()):.6f} "
                 f"q_proc={float(raw_ide.q_proc.detach().cpu()):.6f} "
                 f"r_obs={float(raw_ide.r_obs.detach().cpu()):.6f} "
                 f"q_adv_mean={tr['q_adv_mean']:.6f} "
+                f"nll_sigma_scale={tr['nll_sigma_scale_mean']:.6f} "
                 f"sigma_mean={tr['sigma_mean']:.6f} "
                 f"sigma_trace={tr['sigma_trace']:.6f} "
                 f"sigma_diag_min={tr['sigma_diag_min']:.6f} "
                 f"sigma_state_var_mean={tr['sigma_state_var_mean']:.6f} "
-                f"gate_override={float(force_gate_value) if epoch < warmup_epochs else -1.0:.2f}"
+                f"asym_active={tr['asym_active_frac']:.6f} "
+                f"gate_override={float(raw_mean.force_gate_value) if raw_mean.force_gate_value is not None else -1.0:.2f} "
+                f"gate_mix={float(raw_mean.force_gate_mix) if raw_mean.force_gate_mix is not None else -1.0:.4f} "
+                f"gate_floor={float(raw_mean.gate_floor_value) if raw_mean.gate_floor_value is not None else -1.0:.4f}"
             )
             save_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
             if va["loss"] < best_offline_val:
