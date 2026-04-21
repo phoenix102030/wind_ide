@@ -4,7 +4,7 @@ out_dir: outputs/offline_140m_01
 
 device: cuda
 seed: 42
-num_gpus: 2
+num_gpus: 4
 num_workers: 0
 
 normalize_z: true
@@ -23,7 +23,7 @@ ide_param_mode: global
 ide_param_window: 4
 
 # Joint training controls.
-batch_size: 128
+batch_size: 64
 epochs: 30
 max_steps: 100
 mean_lr: 0.001

@@ -428,7 +428,10 @@ class AdvectionMeanNet(nn.Module):
         transport_gates = self._predict_transport_gates(h)
         state_bias = self._predict_state_bias(h)
         if self.training and self.force_gate_value is not None:
-            transport_gates = torch.full_like(transport_gates, float(self.force_gate_value))
+            forced_gates = torch.full_like(transport_gates, float(self.force_gate_value))
+            # Keep the warmup forward value fixed while preserving a gradient path
+            # through the transport-gate head so DDP does not treat it as unused.
+            transport_gates = transport_gates + (forced_gates - transport_gates).detach()
 
         if self.sigma_mode == "global":
             raw11 = self.global_sigma11_params.unsqueeze(0).expand(batch_size, -1)
