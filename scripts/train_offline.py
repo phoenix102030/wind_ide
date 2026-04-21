@@ -662,6 +662,9 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
         if ml_train_sampler is not None:
             ml_train_sampler.set_epoch(epoch)
         raw_mean = unwrap_model(mean_model)
+        current_gate_override = None
+        current_gate_mix = None
+        current_gate_floor = None
         in_warmup = epoch < warmup_epochs
         if in_warmup:
             if warmup_epochs > 1:
@@ -673,6 +676,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
                 + warmup_progress * force_gate_end_value
             )
             raw_mean.force_gate_value = float(scheduled_force_gate)
+            current_gate_override = float(scheduled_force_gate)
         else:
             raw_mean.force_gate_value = None
         if in_warmup and warmup_epochs > 1:
@@ -681,6 +685,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
             raw_mean.force_gate_mix = 1.0
         else:
             raw_mean.force_gate_mix = None
+        current_gate_mix = None if raw_mean.force_gate_mix is None else float(raw_mean.force_gate_mix)
         if epoch < warmup_epochs:
             raw_mean.gate_floor_value = None
         elif gate_floor_epochs > 0 and epoch < warmup_epochs + gate_floor_epochs:
@@ -688,6 +693,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
             raw_mean.gate_floor_value = gate_floor_value * max(0.0, 1.0 - decay_progress)
         else:
             raw_mean.gate_floor_value = None
+        current_gate_floor = None if raw_mean.gate_floor_value is None else float(raw_mean.gate_floor_value)
 
         tr = train_joint_one_epoch(
             mean_model=mean_model,
@@ -764,12 +770,12 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
                 f"transport={tr['transport_gate_mean']:.6f} "
                 f"bias_abs={tr['state_bias_abs_mean']:.6f} "
                 f"transport_reg={tr['transport_reg']:.6f} "
-                f"transport_floor_pen={tr['transport_floor_pen']:.6f} "
+                f"transport_floor_pen={tr['transport_floor_pen']:.3e} "
                 f"bias_reg={tr['state_bias_reg']:.6f} "
-                f"sigma_cross_reg={tr['sigma_cross_reg']:.6f} "
-                f"sigma_floor_pen={tr['sigma_floor_pen']:.6f} "
-                f"scale_floor_pen={tr['scale_floor_pen']:.6f} "
-                f"asym={tr['asym_loss']:.6f} "
+                f"sigma_cross_reg={tr['sigma_cross_reg']:.3e} "
+                f"sigma_floor_pen={tr['sigma_floor_pen']:.3e} "
+                f"scale_floor_pen={tr['scale_floor_pen']:.3e} "
+                f"asym={tr['asym_loss']:.3e} "
                 f"damping={float(raw_ide.damping.detach().cpu()):.6f} "
                 f"q_proc={float(raw_ide.q_proc.detach().cpu()):.6f} "
                 f"r_obs={float(raw_ide.r_obs.detach().cpu()):.6f} "
@@ -777,12 +783,12 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
                 f"nll_sigma_scale={tr['nll_sigma_scale_mean']:.6f} "
                 f"sigma_mean={tr['sigma_mean']:.6f} "
                 f"sigma_trace={tr['sigma_trace']:.6f} "
-                f"sigma_diag_min={tr['sigma_diag_min']:.6f} "
+                f"sigma_diag_min={tr['sigma_diag_min']:.3e} "
                 f"sigma_state_var_mean={tr['sigma_state_var_mean']:.6f} "
                 f"asym_active={tr['asym_active_frac']:.6f} "
-                f"gate_override={float(raw_mean.force_gate_value) if raw_mean.force_gate_value is not None else -1.0:.2f} "
-                f"gate_mix={float(raw_mean.force_gate_mix) if raw_mean.force_gate_mix is not None else -1.0:.4f} "
-                f"gate_floor={float(raw_mean.gate_floor_value) if raw_mean.gate_floor_value is not None else -1.0:.4f}"
+                f"gate_override={current_gate_override if current_gate_override is not None else -1.0:.2f} "
+                f"gate_mix={current_gate_mix if current_gate_mix is not None else -1.0:.4f} "
+                f"gate_floor={current_gate_floor if current_gate_floor is not None else -1.0:.4f}"
             )
             save_offline_pair_checkpoints(out_dir, mean_model, ide_model, cfg)
             if va["loss"] < best_offline_val:
