@@ -170,6 +170,7 @@ def reconstruct_models(ckpt, device):
         total_steps=cfg.get("ide_total_steps", 1),
         param_window=cfg.get("ide_param_window", 4),
         param_mode=cfg.get("ide_param_mode", "absolute"),
+        transition_mode=cfg.get("transition_mode", "persistence_residual"),
         init_log_ell_par=cfg.get("init_log_ell_par", 0.5),
         init_log_ell_perp=cfg.get("init_log_ell_perp", 0.0),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),

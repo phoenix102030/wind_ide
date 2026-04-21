@@ -53,6 +53,7 @@ class IDEStateSpaceModel(nn.Module):
         total_steps=1,
         param_window=1,
         param_mode="absolute",
+        transition_mode="transport_first",
         init_log_ell_par=0.5,
         init_log_ell_perp=0.0,
         init_log_q_proc=-2.0,
@@ -80,6 +81,11 @@ class IDEStateSpaceModel(nn.Module):
         self.param_mode = str(param_mode).lower()
         if self.param_mode not in {"absolute", "global"}:
             raise ValueError(f"Unsupported param_mode={param_mode!r}; expected 'absolute' or 'global'.")
+        self.transition_mode = str(transition_mode).lower()
+        if self.transition_mode not in {"transport_first", "persistence_residual"}:
+            raise ValueError(
+                f"Unsupported transition_mode={transition_mode!r}; expected 'transport_first' or 'persistence_residual'."
+            )
         self.num_knots = 1 if self.param_mode == "global" else math.ceil(self.total_steps / self.param_window)
         self.q_proc_min = max(float(q_proc_min), 1e-6)
         self.q_proc_max = max(float(q_proc_max), self.q_proc_min)
@@ -412,6 +418,21 @@ class IDEStateSpaceModel(nn.Module):
     def _state_transport_gates(self, transport_gates):
         return transport_gates.repeat(1, self.num_sites)
 
+    def _assemble_state_transition(self, operator, transport_gates, survival_t, eye):
+        transport_target = survival_t[:, None, None] * operator
+        row_gates = self._state_transport_gates(transport_gates)[:, :, None]
+
+        if self.transition_mode == "persistence_residual":
+            A = eye + row_gates * (transport_target - eye)
+            local_transport = torch.diag_embed(torch.diagonal(transport_target, dim1=-2, dim2=-1))
+            nonlocal_transport = transport_target - local_transport
+            return A, transport_target, row_gates, local_transport, nonlocal_transport
+
+        local_transport = torch.diag_embed(torch.diagonal(transport_target, dim1=-2, dim2=-1))
+        nonlocal_transport = transport_target - local_transport
+        A = local_transport + row_gates * nonlocal_transport
+        return A, transport_target, row_gates, local_transport, nonlocal_transport
+
     def _split_mu_pairs(self, mu):
         return mu.reshape(mu.shape[0], self.num_advections, self.advection_dim)
 
@@ -642,11 +663,13 @@ class IDEStateSpaceModel(nn.Module):
         damping_t = time_params["damping"][:, 0].to(dtype=dtype)
         q_proc_t = time_params["q_proc"][:, 0].to(dtype=dtype)
 
-        # Keep persistence as the trunk: when transport_gates=0 the transition is exactly identity.
         survival_t = 1.0 - self.dt * damping_t if apply_damping else torch.ones_like(damping_t)
-        transport_target = survival_t[:, None, None] * operator
-        row_gates = self._state_transport_gates(transport_gates)[:, :, None]
-        A = eye + row_gates * (transport_target - eye)
+        A, _, _, _, _ = self._assemble_state_transition(
+            operator=operator,
+            transport_gates=transport_gates,
+            survival_t=survival_t,
+            eye=eye,
+        )
         q_iso = q_proc_t[:, None, None].square() * eye
         state_var_from_sigma = self._sigma_to_state_noise_diag(sigma_t, transport_gates, dtype=dtype)
         q_adv = torch.diag_embed(self.q_adv_scale.to(dtype=dtype) * state_var_from_sigma)
@@ -689,9 +712,12 @@ class IDEStateSpaceModel(nn.Module):
         q_proc_t = time_params["q_proc"][:, 0].to(dtype=dtype)
         r_obs_t = time_params["r_obs"][:, 0].to(dtype=dtype)
         survival_t = 1.0 - self.dt * damping_t if apply_damping else torch.ones_like(damping_t)
-        transport_target = survival_t[:, None, None] * operator
-        row_gates = self._state_transport_gates(transport_gates)[:, :, None]
-        A = eye + row_gates * (transport_target - eye)
+        A, transport_target, row_gates, local_transport, nonlocal_transport = self._assemble_state_transition(
+            operator=operator,
+            transport_gates=transport_gates,
+            survival_t=survival_t,
+            eye=eye,
+        )
         state_var_from_sigma = self._sigma_to_state_noise_diag(sigma_t, transport_gates, dtype=dtype)
         q_iso = q_proc_t[:, None, None].square() * eye
         q_adv = torch.diag_embed(self.q_adv_scale.to(dtype=dtype) * state_var_from_sigma)
@@ -705,6 +731,9 @@ class IDEStateSpaceModel(nn.Module):
             "operator": operator,
             "transport_target": transport_target,
             "row_gates": row_gates,
+            "local_transport": local_transport,
+            "nonlocal_transport": nonlocal_transport,
+            "transition_mode": self.transition_mode,
             "mu": mu_t,
             "mu_pairs": mu_pairs,
             "sigma": sigma_t,

@@ -376,6 +376,7 @@ def prepare_training_bundle(cfg):
     cfg["normalize_nwp"] = bool(cfg.get("normalize_nwp", True))
     cfg["mu_mode"] = str(cfg.get("mu_mode", "anchored")).lower()
     cfg["sigma_mode"] = str(cfg.get("sigma_mode", "network")).lower()
+    cfg["transition_mode"] = str(cfg.get("transition_mode", "transport_first")).lower()
 
     raw_ml_ds = MLMuDataset(raw_bundle, seq_len=seq_len, chunk_len=chunk_len)
     _, _, raw_ml_split_info = contiguous_time_split(raw_ml_ds, val_fraction=val_fraction)
@@ -447,6 +448,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
         print(f"normalize_nwp={cfg['normalize_nwp']}")
         print(f"mu_mode={cfg['mu_mode']}")
         print(f"sigma_mode={cfg['sigma_mode']}")
+        print(f"transition_mode={cfg['transition_mode']}")
         print(f"nwp_input_mode={cfg['nwp_input_mode']}")
         print(f"adv_history_len={cfg.get('adv_history_len', 6)}")
         print(f"adv_one_step_weight={cfg.get('adv_one_step_weight', 0.25)}")
@@ -496,6 +498,11 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
             print(
                 "[warning] sigma_mode=global keeps the joint 4x4 advection covariance fixed over time, "
                 "so NWP cannot modulate pairwise kernel shape through Sigma_t."
+            )
+        if cfg["transition_mode"] == "persistence_residual":
+            print(
+                "[warning] transition_mode=persistence_residual keeps identity/persistence as the trunk; "
+                "use transition_mode=transport_first for the theorem-driven transport model."
             )
         if cfg["mu_mode"] == "free":
             print("[warning] mu_mode=free bypasses the PDF's anchored alpha*bias advection design.")
@@ -554,6 +561,7 @@ def run_training(cfg, local_rank=None, world_size=1, master_port=None, preloaded
         total_steps=cfg.get("ide_total_steps", 1),
         param_window=cfg.get("ide_param_window", 12),
         param_mode=cfg.get("ide_param_mode", "absolute"),
+        transition_mode=cfg.get("transition_mode", "transport_first"),
         init_log_ell_par=cfg.get("init_log_ell_par", 0.5),
         init_log_ell_perp=cfg.get("init_log_ell_perp", 0.0),
         init_log_q_proc=cfg.get("init_log_q_proc", -2.0),

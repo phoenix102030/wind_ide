@@ -21,6 +21,7 @@ chunk_len: 24
 # Piecewise-constant IDE parameter sharing over absolute time.
 ide_param_mode: global
 ide_param_window: 4
+transition_mode: transport_first
 
 # Joint training controls.
 batch_size: 64
@@ -58,8 +59,8 @@ asymmetry_weight: 0.01
 noise_reg_weight: 0.0001
 smoothness_weight: 0.001
 transport_reg_weight: 0.0
-transport_floor_weight: 0.5
-min_transport_gate: 0.03
+transport_floor_weight: 0.25
+min_transport_gate: 0.15
 state_bias_reg_weight: 0.00001
 sigma_cross_reg_weight: 0.0001
 sigma_floor_weight: 0.5
@@ -91,15 +92,16 @@ init_base_scale_perp: 1.0
 base_scale_min: 0.15
 base_scale_max: 2.5
 
-# Keep the model close to persistence unless transport helps.
-init_transport_gate: 0.05
-transport_gate_max: 0.35
+# Use theorem-driven transport as the propagation trunk; the gate only modulates
+# the nonlocal transport component instead of blending back to identity.
+init_transport_gate: 1.0
+transport_gate_max: 1.0
 state_bias_scale: 1.0
 gate_warmup_fraction: 0.2
-force_gate_start_value: 0.25
-force_gate_end_value: 0.10
+force_gate_start_value: 1.0
+force_gate_end_value: 0.7
 gate_floor_fraction: 0.2
-gate_floor_value: 0.05
+gate_floor_value: 0.15
 save_transition_dump: true
 transition_dump_split: val
 transition_dump_every: 1

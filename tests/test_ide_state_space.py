@@ -93,6 +93,7 @@ def test_transition_matrix_respects_site_component_state_order():
         dt=1.0,
         total_steps=4,
         param_window=1,
+        transition_mode="transport_first",
         damping_min=1e-6,
         damping_max=1.0,
     )
@@ -121,9 +122,10 @@ def test_transition_matrix_respects_site_component_state_order():
     operator = kernels.permute(0, 3, 1, 4, 2).reshape(1, model.state_dim, model.state_dim)
     operator = operator / operator.abs().sum(dim=-1, keepdim=True).clamp_min(1.0)
     transport_target = (1.0 - model.dt * damping)[:, None, None] * operator
-    eye = torch.eye(model.state_dim, dtype=site_lon.dtype).unsqueeze(0)
+    local_transport = torch.diag_embed(torch.diagonal(transport_target, dim1=-2, dim2=-1))
+    nonlocal_transport = transport_target - local_transport
     row_gates = torch.tensor([[0.25, 0.75, 0.25, 0.75, 0.25, 0.75]], dtype=site_lon.dtype).unsqueeze(-1)
-    expected = eye + row_gates * (transport_target - eye)
+    expected = local_transport + row_gates * nonlocal_transport
 
     assert torch.allclose(A, expected)
     assert torch.allclose(b, torch.zeros_like(b))
@@ -198,8 +200,8 @@ def test_transition_matrix_can_skip_damping_for_open_loop_forecast():
     assert torch.allclose(propagated, ones, atol=1e-5)
 
 
-def test_zero_transport_gates_reduce_transition_to_identity():
-    model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=4, param_window=1)
+def test_zero_transport_gates_leave_local_transport_under_transport_first_mode():
+    model = IDEStateSpaceModel(num_sites=3, dt=1.0, total_steps=4, param_window=1, transition_mode="transport_first")
     site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
     site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
 
@@ -217,9 +219,39 @@ def test_zero_transport_gates_reduce_transition_to_identity():
         dtype=site_lon.dtype,
     )
 
+    expected = torch.diag_embed(torch.diagonal(A, dim1=-2, dim2=-1))
+    assert torch.allclose(A, expected, atol=1e-6)
+    assert not torch.allclose(A, torch.eye(model.state_dim, dtype=site_lon.dtype).unsqueeze(0), atol=1e-6)
+    assert torch.allclose(b, torch.zeros_like(b))
+
+
+def test_zero_transport_gates_reduce_transition_to_identity_in_legacy_mode():
+    model = IDEStateSpaceModel(
+        num_sites=3,
+        dt=1.0,
+        total_steps=4,
+        param_window=1,
+        transition_mode="persistence_residual",
+    )
+    site_lon = torch.tensor([120.0, 120.1, 120.2]).unsqueeze(0)
+    site_lat = torch.tensor([30.0, 30.1, 30.2]).unsqueeze(0)
+
+    A, _, _ = model.build_transition_matrix(
+        site_lon=site_lon,
+        site_lat=site_lat,
+        dynamics_t={
+            "mu": torch.tensor([[0.8, -0.1, 0.3, 0.5]], dtype=site_lon.dtype),
+            "base_scales": torch.full((1, 2), 2.0, dtype=site_lon.dtype),
+            "transport_gates": torch.zeros(1, 2, dtype=site_lon.dtype),
+            "sigma": 0.2 * torch.eye(4, dtype=site_lon.dtype).unsqueeze(0),
+        },
+        transition_idx=torch.tensor([0]),
+        device=site_lon.device,
+        dtype=site_lon.dtype,
+    )
+
     eye = torch.eye(model.state_dim, dtype=site_lon.dtype).unsqueeze(0)
     assert torch.allclose(A, eye, atol=1e-6)
-    assert torch.allclose(b, torch.zeros_like(b))
 
 
 def test_component_kernels_remain_finite_for_large_joint_sigma():
