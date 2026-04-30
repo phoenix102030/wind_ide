@@ -12,6 +12,8 @@ img_size: 40
 in_channels: 6
 hidden_dim: 64
 output_dim: 18
+mu_scale_init: 10.0
+component_mixing_floor: 0.01
 network_type: cnn_transformer
 transformer_d_model: 128
 transformer_nhead: 4
@@ -22,12 +24,12 @@ transformer_causal: true
 transformer_max_len: 4096
 
 nwp_channel_names:
-  - u100
-  - v100
-  - u140
-  - v140
-  - u180
-  - v180
+- u100
+- v100
+- u140
+- v140
+- u180
+- v180
 
 dt: 1.0
 dt_seconds: 600.0
@@ -38,11 +40,11 @@ learnable_gamma: false
 row_normalize: true
 use_spectral_scaling: false
 spectral_radius: 0.98
-kernel_jitter: 1.0e-5
-kalman_jitter: 1.0e-5
-ell_init: 1.0
-ell_min: 0.05
-ell_max: 10.0
+kernel_jitter: 1e-5
+kalman_jitter: 1e-5
+ell_init: 80.0
+ell_min: 5.0
+ell_max: 300.0
 
 q_init: 0.2
 r_init: 0.2
@@ -52,11 +54,11 @@ rolling_window_size: 24
 batch_size: 1
 steps_per_epoch: 50
 
-lr_cnn: 1.0e-4
-lr_heads: 5.0e-4
-lr_kernel: 1.0e-3
-lr_qr: 1.0e-3
-weight_decay: 1.0e-4
+lr_cnn: 2e-5
+lr_heads: 1e-4
+lr_kernel: 5e-4
+lr_qr: 5e-4
+weight_decay: 1e-4
 grad_clip: 1.0
 
 lambda_adv: 0.1
@@ -65,14 +67,14 @@ lambda_reg: 0.0001
 lambda_anchor: 0.01
 
 offline_epochs_pretrain_adv: 20
-offline_epochs_kf: 30
+offline_epochs_kf: 10
 offline_epochs_finetune: 20
 
 online_window_size: 168
 online_update_every: 6
 online_steps: 10
 
-checkpoint_dir: checkpoints
+checkpoint_dir: outputs/cnn_transformer_new
 offline_checkpoint_name: vector_mide_offline_cuda.pt
 last_offline_checkpoint_name: vector_mide_offline_cuda_last.pt
 online_checkpoint_name: vector_mide_online_cuda.pt
@@ -86,9 +88,9 @@ data:
   online_nwp_path: data/nwp/data_grid_online.mat
   use_measurement_station_coords: true
   station_grid_indices:
-    - [18, 18]
-    - [20, 20]
-    - [22, 22]
+  - [ 18, 18 ]
+  - [ 20, 20 ]
+  - [ 22, 22 ]
   advection_label_mode: simple
   patch_radius: 2
   standardize_x: true

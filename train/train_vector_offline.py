@@ -75,6 +75,8 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         n_sites=int(config["n_dim"]),
         in_channels=int(config["in_channels"]),
         hidden_dim=int(config.get("hidden_dim", 64)),
+        mu_scale_init=float(config.get("mu_scale_init", 1.0)),
+        component_mixing_floor=float(config.get("component_mixing_floor", 0.0)),
         network_type=str(config.get("network_type", "cnn_transformer")),
         transformer_d_model=int(config.get("transformer_d_model", 128)),
         transformer_nhead=int(config.get("transformer_nhead", 4)),

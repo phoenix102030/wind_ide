@@ -100,6 +100,7 @@ class VectorAdvectionNet(nn.Module):
         output_dim: int = 18,
         mu_scale_init: float = 1.0,
         chol_jitter: float = 1.0e-4,
+        component_mixing_floor: float = 0.0,
         network_type: str = "cnn_transformer",
         transformer_d_model: int = 128,
         transformer_nhead: int = 4,
@@ -116,9 +117,12 @@ class VectorAdvectionNet(nn.Module):
             raise ValueError("network_type must be 'cnn' or 'cnn_transformer'")
         if transformer_d_model % transformer_nhead != 0:
             raise ValueError("transformer_d_model must be divisible by transformer_nhead")
+        if not 0.0 <= component_mixing_floor < 0.5:
+            raise ValueError("component_mixing_floor must be in [0, 0.5)")
 
         self.network_type = network_type
         self.transformer_causal = transformer_causal
+        self.component_mixing_floor = component_mixing_floor
         self.backbone = ConvBackbone(in_channels=in_channels, hidden_dim=hidden_dim)
         self.attention = ChannelSpatialAttention(hidden_dim=hidden_dim)
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -215,6 +219,8 @@ class VectorAdvectionNet(nn.Module):
         )
         A_logits = raw_A.reshape(-1, 2, 2)
         A = torch.softmax(A_logits, dim=-1)
+        if self.component_mixing_floor > 0.0:
+            A = self.component_mixing_floor + (1.0 - 2.0 * self.component_mixing_floor) * A
 
         return {
             "raw": raw,

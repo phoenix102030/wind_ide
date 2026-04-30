@@ -207,6 +207,8 @@ class VectorMIDE(nn.Module):
         n_sites: int = 3,
         in_channels: int = 6,
         hidden_dim: int = 64,
+        mu_scale_init: float = 1.0,
+        component_mixing_floor: float = 0.0,
         network_type: str = "cnn_transformer",
         transformer_d_model: int = 128,
         transformer_nhead: int = 4,
@@ -234,6 +236,8 @@ class VectorMIDE(nn.Module):
         self.net = VectorAdvectionNet(
             in_channels=in_channels,
             hidden_dim=hidden_dim,
+            mu_scale_init=mu_scale_init,
+            component_mixing_floor=component_mixing_floor,
             network_type=network_type,
             transformer_d_model=transformer_d_model,
             transformer_nhead=transformer_nhead,
