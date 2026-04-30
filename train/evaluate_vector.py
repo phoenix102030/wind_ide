@@ -80,6 +80,48 @@ def tensor_metrics(pred: torch.Tensor, target: torch.Tensor, skip_first: bool = 
     }
 
 
+def transition_diagnostics(M: np.ndarray, A: np.ndarray, ell: np.ndarray, coords: np.ndarray) -> dict[str, Any]:
+    eye = np.eye(M.shape[-1], dtype=np.float32)
+    finite = np.isfinite(M).all(axis=(1, 2))
+    M_finite = M[finite]
+    if M_finite.size == 0:
+        return {}
+
+    offdiag_mask = ~np.eye(M.shape[-1], dtype=bool)
+    diag_vals = np.diagonal(M_finite, axis1=1, axis2=2)
+    offdiag_vals = M_finite[:, offdiag_mask]
+    residual = M_finite - eye
+    site_dist = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
+
+    return {
+        "transition_diag_mean": float(np.nanmean(diag_vals)),
+        "transition_diag_min": float(np.nanmin(diag_vals)),
+        "transition_diag_max": float(np.nanmax(diag_vals)),
+        "transition_offdiag_mean": float(np.nanmean(offdiag_vals)),
+        "transition_offdiag_max": float(np.nanmax(offdiag_vals)),
+        "transition_mean_abs_M_minus_I": float(np.nanmean(np.abs(residual))),
+        "transition_max_abs_M_minus_I": float(np.nanmax(np.abs(residual))),
+        "transition_rowsum_min": float(np.nanmin(np.nansum(M_finite, axis=2))),
+        "transition_rowsum_max": float(np.nanmax(np.nansum(M_finite, axis=2))),
+        "A_mean": {
+            name: float(value)
+            for name, value in zip(A_NAMES, np.nanmean(A.reshape(A.shape[0], 4), axis=0))
+        },
+        "A_min": {
+            name: float(value)
+            for name, value in zip(A_NAMES, np.nanmin(A.reshape(A.shape[0], 4), axis=0))
+        },
+        "A_max": {
+            name: float(value)
+            for name, value in zip(A_NAMES, np.nanmax(A.reshape(A.shape[0], 4), axis=0))
+        },
+        "ell": ell.tolist(),
+        "station_distance_km": site_dist.tolist(),
+        "station_distance_nonzero_min_km": float(site_dist[site_dist > 0].min()),
+        "station_distance_nonzero_max_km": float(site_dist.max()),
+    }
+
+
 def persistence_forecast(z: torch.Tensor) -> torch.Tensor:
     pred = z.clone()
     pred[1:] = z[:-1]
@@ -175,6 +217,7 @@ def evaluate(
         "model": model_metrics,
         "persistence_baseline": baseline_metrics,
         "model_vs_persistence_improvement": improvement,
+        "diagnostics": transition_diagnostics(M_np, A_np, ell, data["coords"]),
         "eval_window_size": eval_window_size,
         "eval_stride": eval_stride,
     }
@@ -275,14 +318,26 @@ def _line_plot(path: Path, values: np.ndarray, labels: list[str], title: str, yl
     plt.close(fig)
 
 
-def _heatmap(path: Path, matrix: np.ndarray, title: str, xlabels: list[str], ylabels: list[str]) -> None:
+def _heatmap(
+    path: Path,
+    matrix: np.ndarray,
+    title: str,
+    xlabels: list[str],
+    ylabels: list[str],
+    cmap: str = "viridis",
+    center_zero: bool = False,
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(matrix, cmap="viridis")
+    kwargs = {}
+    if center_zero:
+        limit = float(np.nanmax(np.abs(matrix)))
+        kwargs = {"vmin": -limit, "vmax": limit}
+    im = ax.imshow(matrix, cmap=cmap, **kwargs)
     ax.set_title(title)
     ax.set_xticks(np.arange(len(xlabels)))
     ax.set_yticks(np.arange(len(ylabels)))
@@ -316,7 +371,12 @@ def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: i
     _line_plot(plots_dir / "transition_row_sums.png", np.nansum(artifacts["transition_matrices"], axis=2), STATE_NAMES, "Transition matrix row sums", "row sum", max_points)
 
     M_mean = np.nanmean(artifacts["transition_matrices"], axis=0)
+    identity = np.eye(M_mean.shape[0], dtype=M_mean.dtype)
+    M_minus_I = M_mean - identity
+    M_log_mean = np.nanmean(np.log10(np.clip(artifacts["transition_matrices"], 1.0e-12, None)), axis=0)
     _heatmap(plots_dir / "transition_matrix_mean.png", M_mean, "Mean transition matrix M", STATE_NAMES, STATE_NAMES)
+    _heatmap(plots_dir / "transition_matrix_mean_minus_identity.png", M_minus_I, "Mean transition matrix M - I", STATE_NAMES, STATE_NAMES, cmap="coolwarm", center_zero=True)
+    _heatmap(plots_dir / "transition_matrix_log10_mean.png", M_log_mean, "Mean log10 transition matrix", STATE_NAMES, STATE_NAMES)
     _heatmap(plots_dir / "kernel_lengthscale_ell.png", artifacts["ell"], "Kernel lengthscales ell", ["U source", "V source"], ["U target", "V target"])
     _heatmap(plots_dir / "process_covariance_Q.png", artifacts["Q"], "Process covariance Q", STATE_NAMES, STATE_NAMES)
     _heatmap(plots_dir / "observation_covariance_R.png", artifacts["R"], "Observation covariance R", STATE_NAMES, STATE_NAMES)
@@ -346,6 +406,33 @@ def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: i
     if frames:
         frames[0].save(
             plots_dir / "transition_matrix.gif",
+            save_all=True,
+            append_images=frames[1:],
+            duration=140,
+            loop=0,
+        )
+
+    frames = []
+    residual = M - np.eye(M.shape[-1], dtype=M.dtype)
+    vmax_resid = float(np.nanpercentile(np.abs(residual[frame_indices]), 99))
+    vmax_resid = max(vmax_resid, 1.0e-8)
+    for t in frame_indices:
+        fig, ax = plt.subplots(figsize=(6, 5.5))
+        im = ax.imshow(residual[t], cmap="coolwarm", vmin=-vmax_resid, vmax=vmax_resid)
+        ax.set_title(f"Transition residual M - I, t={int(t)}")
+        ax.set_xticks(np.arange(len(STATE_NAMES)))
+        ax.set_yticks(np.arange(len(STATE_NAMES)))
+        ax.set_xticklabels(STATE_NAMES, rotation=45, ha="right", fontsize=7)
+        ax.set_yticklabels(STATE_NAMES, fontsize=7)
+        fig.colorbar(im, ax=ax, shrink=0.8)
+        fig.tight_layout()
+        fig.canvas.draw()
+        rgba = np.asarray(fig.canvas.buffer_rgba())
+        frames.append(Image.fromarray(rgba).convert("P", palette=Image.ADAPTIVE))
+        plt.close(fig)
+    if frames:
+        frames[0].save(
+            plots_dir / "transition_matrix_minus_identity.gif",
             save_all=True,
             append_images=frames[1:],
             duration=140,
