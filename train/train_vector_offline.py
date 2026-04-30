@@ -143,6 +143,98 @@ def sample_window(
     return x, z, v_star
 
 
+def slice_arrays(
+    arrays: dict[str, np.ndarray | None],
+    start: int,
+    end: int,
+) -> dict[str, np.ndarray | None]:
+    return {
+        key: value[start:end] if value is not None else None
+        for key, value in arrays.items()
+    }
+
+
+def make_fixed_validation_starts(
+    n_time: int,
+    window_size: int,
+    num_windows: int,
+) -> list[int]:
+    if n_time <= 0:
+        return []
+    if n_time <= window_size:
+        return [0]
+    max_start = n_time - window_size
+    count = max(1, min(num_windows, max_start + 1))
+    return np.linspace(0, max_start, count).round().astype(int).tolist()
+
+
+def split_train_validation(
+    arrays: dict[str, np.ndarray | None],
+    config: dict[str, Any],
+) -> tuple[dict[str, np.ndarray | None], dict[str, np.ndarray | None] | None, list[int]]:
+    if not bool(config.get("validation_enabled", True)):
+        return arrays, None, []
+
+    n_time = int(arrays["X"].shape[0])
+    window_size = int(config.get("validation_window_size") or config.get("window_size", 1008))
+    val_fraction = float(config.get("validation_fraction", 0.15))
+    val_min_windows = int(config.get("validation_min_windows", 2))
+    val_num_windows = int(config.get("validation_num_windows", 8))
+
+    min_val_len = min(n_time, max(window_size, val_min_windows * window_size))
+    val_len = max(min_val_len, int(round(n_time * val_fraction)))
+    val_len = min(val_len, n_time)
+    train_end = max(0, n_time - val_len)
+
+    # Keep enough training data for at least one window. For tiny --limit runs,
+    # validation uses the same short sequence rather than making training empty.
+    if train_end < min(window_size, n_time):
+        return arrays, arrays, make_fixed_validation_starts(n_time, window_size, val_num_windows)
+
+    train_arrays = slice_arrays(arrays, 0, train_end)
+    val_arrays = slice_arrays(arrays, train_end, n_time)
+    starts = make_fixed_validation_starts(val_arrays["X"].shape[0], window_size, val_num_windows)
+    return train_arrays, val_arrays, starts
+
+
+def validation_losses(
+    model: VectorMIDE,
+    val_arrays: dict[str, np.ndarray | None],
+    val_starts: list[int],
+    coords: torch.Tensor,
+    config: dict[str, Any],
+    device: torch.device,
+) -> dict[str, float]:
+    if not val_arrays or not val_starts:
+        return {}
+
+    model.eval()
+    window_size = int(config.get("validation_window_size") or config.get("window_size", 1008))
+    sums: dict[str, float] = {}
+    with torch.no_grad():
+        for start in val_starts:
+            end = min(start + window_size, val_arrays["X"].shape[0])
+            x = torch.from_numpy(val_arrays["X"][start:end]).to(device)
+            z = torch.from_numpy(val_arrays["Z"][start:end]).to(device)
+            v_star_np = val_arrays.get("V_star")
+            v_star = torch.from_numpy(v_star_np[start:end]).to(device) if v_star_np is not None else None
+            losses = model.training_losses(
+                x=x,
+                z=z,
+                coords=coords,
+                v_star=v_star,
+                lambda_adv=float(config.get("lambda_adv", 0.1)),
+                lambda_smooth=float(config.get("lambda_smooth", 0.001)),
+                lambda_reg=float(config.get("lambda_reg", 0.0001)),
+            )
+            for key, value in losses.items():
+                if key.startswith("loss"):
+                    sums[f"val_{key}"] = sums.get(f"val_{key}", 0.0) + float(value.detach().cpu())
+
+    denom = max(len(val_starts), 1)
+    return {key: value / denom for key, value in sums.items()}
+
+
 def run_epoch(
     model: VectorMIDE,
     arrays: dict[str, np.ndarray | None],
@@ -254,6 +346,15 @@ def main() -> None:
     data = load_vector_dataset(config, split="offline", time_limit=args.limit)
 
     arrays = {"X": data["X"], "Z": data["Z"], "V_star": data["V_star"]}
+    train_arrays, val_arrays, val_starts = split_train_validation(arrays, config)
+    if val_arrays is not None:
+        print(
+            "Validation enabled: "
+            f"train_T={train_arrays['X'].shape[0]}, "
+            f"val_T={val_arrays['X'].shape[0]}, "
+            f"val_windows={len(val_starts)}, "
+            f"val_every={int(config.get('validation_every_epochs', 5))} epoch(s)"
+        )
     coords = torch.from_numpy(data["coords"]).to(device)
     model = build_model(config).to(device)
     optimizer = build_optimizer(model, config)
@@ -272,7 +373,8 @@ def main() -> None:
     ]
     active_stages = [stage for stage, epochs in schedule if epochs > 0]
     monitor_stage = str(config.get("checkpoint_stage", active_stages[-1] if active_stages else "joint"))
-    monitor_metric = str(config.get("checkpoint_metric", "loss_kf"))
+    monitor_metric = str(config.get("checkpoint_metric", "val_loss_kf"))
+    validation_every = int(config.get("validation_every_epochs", 5))
     ckpt_dir = Path(config.get("checkpoint_dir", "checkpoints"))
     best_ckpt_path = ckpt_dir / config.get("offline_checkpoint_name", "vector_mide_offline.pt")
     last_ckpt_path = ckpt_dir / config.get(
@@ -285,12 +387,19 @@ def main() -> None:
 
     for stage, epochs in schedule:
         for epoch in range(epochs):
-            metrics = run_epoch(model, arrays, coords, optimizer, config, stage, device)
+            metrics = run_epoch(model, train_arrays, coords, optimizer, config, stage, device)
+            if (
+                val_arrays is not None
+                and stage == monitor_stage
+                and validation_every > 0
+                and ((epoch + 1) % validation_every == 0 or epoch + 1 == epochs)
+            ):
+                metrics.update(validation_losses(model, val_arrays, val_starts, coords, config, device))
             print(f"{stage} epoch {epoch + 1}/{epochs}: {metrics}")
             record = {"stage": stage, "epoch": epoch + 1, "epochs": epochs, **metrics}
             history.append(record)
 
-            if stage == monitor_stage:
+            if stage == monitor_stage and monitor_metric in metrics:
                 score = checkpoint_score(metrics, monitor_metric)
                 if score < best_score:
                     best_score = score

@@ -90,7 +90,14 @@ offline_checkpoint_name: vector_mide_offline.pt
 last_offline_checkpoint_name: vector_mide_offline_last.pt
 online_checkpoint_name: vector_mide_online.pt
 checkpoint_stage: joint
-checkpoint_metric: loss_kf
+checkpoint_metric: val_loss_kf
+
+validation_enabled: true
+validation_fraction: 0.15
+validation_window_size: null
+validation_num_windows: 8
+validation_min_windows: 2
+validation_every_epochs: 5
 
 data:
   offline_measurement_path: data/measurement/wv_h100_180_offline.mat

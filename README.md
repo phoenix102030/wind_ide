@@ -87,7 +87,21 @@ Key files:
 Offline training saves the best checkpoint during the configured monitor stage
 to `offline_checkpoint_name` and the final epoch checkpoint to
 `last_offline_checkpoint_name`. By default, the best checkpoint is selected from
-the joint finetuning stage using `loss_kf`.
+the joint finetuning stage using fixed validation-window `val_loss_kf`.
+
+Validation is configurable in YAML:
+
+```yaml
+validation_enabled: true
+validation_fraction: 0.15
+validation_window_size: null
+validation_num_windows: 8
+validation_every_epochs: 5
+checkpoint_metric: val_loss_kf
+```
+
+The validation segment is taken from the tail of the offline split, while
+training windows are sampled from the preceding segment.
 
 ## Neural Encoder
 
