@@ -206,6 +206,14 @@ class VectorMIDE(nn.Module):
         n_sites: int = 3,
         in_channels: int = 6,
         hidden_dim: int = 64,
+        network_type: str = "cnn_transformer",
+        transformer_d_model: int = 128,
+        transformer_nhead: int = 4,
+        transformer_layers: int = 2,
+        transformer_dim_feedforward: int = 256,
+        transformer_dropout: float = 0.1,
+        transformer_causal: bool = True,
+        transformer_max_len: int = 4096,
         dt: float = 1.0,
         gamma: float = 0.0,
         row_normalize: bool = True,
@@ -222,7 +230,18 @@ class VectorMIDE(nn.Module):
         super().__init__()
         self.n_sites = n_sites
         self.state_dim = 2 * n_sites
-        self.net = VectorAdvectionNet(in_channels=in_channels, hidden_dim=hidden_dim)
+        self.net = VectorAdvectionNet(
+            in_channels=in_channels,
+            hidden_dim=hidden_dim,
+            network_type=network_type,
+            transformer_d_model=transformer_d_model,
+            transformer_nhead=transformer_nhead,
+            transformer_layers=transformer_layers,
+            transformer_dim_feedforward=transformer_dim_feedforward,
+            transformer_dropout=transformer_dropout,
+            transformer_causal=transformer_causal,
+            transformer_max_len=transformer_max_len,
+        )
         self.kernel = VectorLagrangianKernel(
             n_dim=n_sites,
             dt=dt,

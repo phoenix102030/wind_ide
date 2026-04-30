@@ -33,9 +33,9 @@ def build_lower_cholesky(raw: Tensor, dim: int, jitter: float = 1.0e-4) -> Tenso
     out_shape = raw.shape[:-1] + (dim, dim)
     L = raw.new_zeros(out_shape)
     tril_i, tril_j = torch.tril_indices(dim, dim, device=raw.device)
-    L[..., tril_i, tril_j] = raw
-    diag = torch.diagonal(L, dim1=-2, dim2=-1)
-    diag.copy_(F.softplus(diag) + jitter)
+    is_diag = (tril_i == tril_j).to(device=raw.device)
+    values = torch.where(is_diag, F.softplus(raw) + jitter, raw)
+    L[..., tril_i, tril_j] = values
     return L
 
 

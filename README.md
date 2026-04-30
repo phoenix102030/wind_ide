@@ -52,6 +52,22 @@ python train/train_vector_offline.py --config yml_files/VectorMIDE.yaml --device
 then MPS, then CPU. Set `allow_device_fallback: false` when you want the script
 to fail loudly if the requested backend is unavailable.
 
+## Neural Encoder
+
+The default encoder is now:
+
+```text
+NWP maps [T,C,H,W]
+  -> CNN spatial encoder
+  -> temporal Transformer encoder
+  -> separate mu / Cholesky / A heads
+```
+
+Use `network_type: cnn_transformer` for the temporal model or `network_type:
+cnn` for the older independent-map baseline. `transformer_causal: true` keeps
+the encoder online-safe by preventing each time step from attending to future
+NWP maps.
+
 ## Data
 
 The current `data/` folder is expected to contain:

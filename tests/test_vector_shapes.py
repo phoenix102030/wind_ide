@@ -10,7 +10,15 @@ from model.vector_kernel import VectorLagrangianKernel
 def test_advection_net_shapes_and_constraints():
     T = 5
     x = torch.randn(T, 6, 40, 40)
-    net = VectorAdvectionNet(in_channels=6, hidden_dim=32)
+    net = VectorAdvectionNet(
+        in_channels=6,
+        hidden_dim=32,
+        network_type="cnn_transformer",
+        transformer_d_model=32,
+        transformer_nhead=4,
+        transformer_layers=1,
+        transformer_dim_feedforward=64,
+    )
     out = net(x)
 
     assert out["mu"].shape == (T, 4)
@@ -19,6 +27,15 @@ def test_advection_net_shapes_and_constraints():
     assert out["A"].shape == (T, 2, 2)
     assert torch.allclose(out["A"].sum(dim=-1), torch.ones(T, 2), atol=1.0e-5)
     assert torch.all(torch.linalg.eigvalsh(out["Sigma"]) > 0)
+
+
+def test_advection_net_cnn_mode_still_works():
+    x = torch.randn(3, 6, 40, 40)
+    net = VectorAdvectionNet(in_channels=6, hidden_dim=32, network_type="cnn")
+    out = net(x)
+
+    assert out["mu"].shape == (3, 4)
+    assert out["A"].shape == (3, 2, 2)
 
 
 def test_vector_kernel_transition_shape_and_row_sums():

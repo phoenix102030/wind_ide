@@ -20,6 +20,18 @@ in_channels: 6
 hidden_dim: 64
 output_dim: 18
 
+# Neural advection encoder:
+# - cnn: each NWP map is encoded independently
+# - cnn_transformer: CNN spatial features followed by temporal Transformer
+network_type: cnn_transformer
+transformer_d_model: 128
+transformer_nhead: 4
+transformer_layers: 2
+transformer_dim_feedforward: 256
+transformer_dropout: 0.1
+transformer_causal: true
+transformer_max_len: 4096
+
 nwp_channel_names:
   - u100
   - v100
