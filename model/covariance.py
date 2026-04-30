@@ -51,8 +51,22 @@ def add_jitter(matrix: Tensor, jitter: float) -> Tensor:
     return matrix + jitter * eye
 
 
+def _mps_cpu_linalg(matrix: Tensor) -> bool:
+    return matrix.device.type == "mps"
+
+
+def safe_cholesky(matrix: Tensor) -> Tensor:
+    """Cholesky with CPU execution for MPS backend gaps."""
+    if _mps_cpu_linalg(matrix):
+        return torch.linalg.cholesky(matrix.cpu()).to(device=matrix.device, dtype=matrix.dtype)
+    return torch.linalg.cholesky(matrix)
+
+
 def solve_linear_system(matrix: Tensor, rhs: Tensor) -> Tensor:
     """Solve ``matrix @ x = rhs`` with a CPU fallback for backend gaps."""
+    if _mps_cpu_linalg(matrix):
+        result = torch.linalg.solve(matrix.cpu(), rhs.cpu())
+        return result.to(device=matrix.device, dtype=matrix.dtype)
     try:
         return torch.linalg.solve(matrix, rhs)
     except NotImplementedError:
@@ -67,7 +81,7 @@ def cholesky_logdet_quad(cov: Tensor, residual: Tensor, jitter: float = 1.0e-5) 
     trailing size equal to ``cov.shape[-1]``.
     """
     cov = add_jitter(cov, jitter)
-    L = torch.linalg.cholesky(cov)
+    L = safe_cholesky(cov)
     rhs = residual.unsqueeze(-1)
     alpha = solve_linear_system(cov, rhs).squeeze(-1)
     quad = (residual * alpha).sum(dim=-1)

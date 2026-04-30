@@ -5,7 +5,7 @@ import math
 import torch
 from torch import Tensor, nn
 
-from .covariance import solve_linear_system
+from .covariance import safe_cholesky, solve_linear_system
 
 
 def _logit(value: float) -> float:
@@ -101,7 +101,7 @@ class VectorLagrangianKernel(nn.Module):
                 shift = B @ mu
                 D = ell[i, j].pow(2) * eye2 + 2.0 * B @ Sigma @ B.T
                 D = D + self.jitter * eye2
-                L = torch.linalg.cholesky(D)
+                L = safe_cholesky(D)
 
                 H_prime = H - shift.view(1, 1, 2)
                 flat = H_prime.reshape(-1, 2)

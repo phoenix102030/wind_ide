@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import sys
 from pathlib import Path
@@ -218,6 +219,19 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
+def checkpoint_name_with_suffix(filename: str, suffix: str) -> str:
+    path = Path(filename)
+    return f"{path.stem}{suffix}{path.suffix or '.pt'}"
+
+
+def checkpoint_score(metrics: dict[str, float], monitor: str) -> float:
+    if monitor in metrics:
+        return float(metrics[monitor])
+    if "loss_kf" in metrics:
+        return float(metrics["loss_kf"])
+    return float(metrics["loss"])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train VectorMIDE offline.")
     parser.add_argument("--config", default="yml_files/VectorMIDE.yaml")
@@ -254,15 +268,58 @@ def main() -> None:
         ("kf", int(config.get("offline_epochs_kf", 0))),
         ("joint", int(config.get("offline_epochs_finetune", 0))),
     ]
+    active_stages = [stage for stage, epochs in schedule if epochs > 0]
+    monitor_stage = str(config.get("checkpoint_stage", active_stages[-1] if active_stages else "joint"))
+    monitor_metric = str(config.get("checkpoint_metric", "loss_kf"))
+    ckpt_dir = Path(config.get("checkpoint_dir", "checkpoints"))
+    best_ckpt_path = ckpt_dir / config.get("offline_checkpoint_name", "vector_mide_offline.pt")
+    last_ckpt_path = ckpt_dir / config.get(
+        "last_offline_checkpoint_name",
+        checkpoint_name_with_suffix(best_ckpt_path.name, "_last"),
+    )
+    history: list[dict[str, Any]] = []
+    best_score = math.inf
+    best_info: dict[str, Any] | None = None
+
     for stage, epochs in schedule:
         for epoch in range(epochs):
             metrics = run_epoch(model, arrays, coords, optimizer, config, stage, device)
             print(f"{stage} epoch {epoch + 1}/{epochs}: {metrics}")
+            record = {"stage": stage, "epoch": epoch + 1, "epochs": epochs, **metrics}
+            history.append(record)
 
-    ckpt_dir = Path(config.get("checkpoint_dir", "checkpoints"))
-    ckpt_path = ckpt_dir / config.get("offline_checkpoint_name", "vector_mide_offline.pt")
-    save_checkpoint(model, config, ckpt_path)
-    print(f"Saved checkpoint to {ckpt_path}")
+            if stage == monitor_stage:
+                score = checkpoint_score(metrics, monitor_metric)
+                if score < best_score:
+                    best_score = score
+                    best_info = {
+                        "stage": stage,
+                        "epoch": epoch + 1,
+                        "score": score,
+                        "monitor_metric": monitor_metric,
+                        "metrics": metrics,
+                    }
+                    save_checkpoint(
+                        model,
+                        config,
+                        best_ckpt_path,
+                        extra={"best": best_info, "history": history},
+                    )
+                    print(
+                        f"Saved best checkpoint to {best_ckpt_path} "
+                        f"({monitor_stage}/{monitor_metric}={score:.6g})"
+                    )
+
+    save_checkpoint(
+        model,
+        config,
+        last_ckpt_path,
+        extra={"best": best_info, "history": history},
+    )
+    if best_info is None:
+        save_checkpoint(model, config, best_ckpt_path, extra={"history": history})
+        print(f"Saved checkpoint to {best_ckpt_path}")
+    print(f"Saved last checkpoint to {last_ckpt_path}")
 
 
 if __name__ == "__main__":

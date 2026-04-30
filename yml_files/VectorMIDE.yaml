@@ -85,7 +85,10 @@ online_steps: 10
 
 checkpoint_dir: checkpoints
 offline_checkpoint_name: vector_mide_offline.pt
+last_offline_checkpoint_name: vector_mide_offline_last.pt
 online_checkpoint_name: vector_mide_online.pt
+checkpoint_stage: joint
+checkpoint_metric: loss_kf
 
 data:
   offline_measurement_path: data/measurement/wv_h100_180_offline.mat

@@ -47,10 +47,10 @@ ell_max: 10.0
 q_init: 0.2
 r_init: 0.2
 
-window_size: 1008
+window_size: 128
 rolling_window_size: 24
 batch_size: 1
-steps_per_epoch: 50
+steps_per_epoch: 5
 
 lr_cnn: 1.0e-4
 lr_heads: 5.0e-4
@@ -64,9 +64,9 @@ lambda_smooth: 0.001
 lambda_reg: 0.0001
 lambda_anchor: 0.01
 
-offline_epochs_pretrain_adv: 20
-offline_epochs_kf: 30
-offline_epochs_finetune: 20
+offline_epochs_pretrain_adv: 2
+offline_epochs_kf: 1
+offline_epochs_finetune: 1
 
 online_window_size: 168
 online_update_every: 6
@@ -74,7 +74,10 @@ online_steps: 10
 
 checkpoint_dir: checkpoints
 offline_checkpoint_name: vector_mide_offline_mps.pt
+last_offline_checkpoint_name: vector_mide_offline_mps_last.pt
 online_checkpoint_name: vector_mide_online_mps.pt
+checkpoint_stage: joint
+checkpoint_metric: loss_kf
 
 data:
   offline_measurement_path: data/measurement/wv_h100_180_offline.mat

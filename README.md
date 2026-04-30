@@ -52,6 +52,43 @@ python train/train_vector_offline.py --config yml_files/VectorMIDE.yaml --device
 then MPS, then CPU. Set `allow_device_fallback: false` when you want the script
 to fail loudly if the requested backend is unavailable.
 
+## Evaluation
+
+After training, evaluate one-step Kalman forecasts against held-out or online
+observations:
+
+```bash
+python train/evaluate_vector.py \
+  --config yml_files/VectorMIDE_cuda.yaml \
+  --checkpoint checkpoints/vector_mide_offline_cuda.pt \
+  --split online
+```
+
+The script reports RMSE/MAE overall, separately for U and V, per station and
+component, Kalman NLL per observation, and a persistence baseline where
+``Z_hat[t] = Z[t-1]``.
+
+Evaluation artifacts are saved by default under:
+
+```text
+outputs/evaluation/<checkpoint-name>_<split>/
+```
+
+Key files:
+
+- `results.json`: metrics and metadata.
+- `forecasts.npz`: target, model prediction, persistence prediction.
+- `transition_matrices.npz`: all evaluated transition matrices `M[t,6,6]`.
+- `advection_parameters.npz`: `mu`, `Sigma`, `A`, `ell`, `Q`, `R`, station coordinates.
+- `time_parameters.csv`: flattened time-series parameters for quick inspection.
+- `plots/transition_matrix.gif`: animated transition matrix over sampled times.
+- `plots/*.png`: parameter time-series and heatmaps.
+
+Offline training saves the best checkpoint during the configured monitor stage
+to `offline_checkpoint_name` and the final epoch checkpoint to
+`last_offline_checkpoint_name`. By default, the best checkpoint is selected from
+the joint finetuning stage using `loss_kf`.
+
 ## Neural Encoder
 
 The default encoder is now:

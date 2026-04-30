@@ -10,6 +10,7 @@ from .covariance import (
     QRParameters,
     advection_nll_loss,
     l2_regularization,
+    safe_cholesky,
     solve_linear_system,
     smoothness_loss,
 )
@@ -110,7 +111,7 @@ class VectorDSTM(nn.Module):
                 F_t = H_t @ pred_cov @ H_t.T + R_t
                 d_t = F_t.shape[0]
                 F_t = F_t + self.jitter * torch.eye(d_t, device=device, dtype=dtype)
-                L_t = torch.linalg.cholesky(F_t)
+                L_t = safe_cholesky(F_t)
                 alpha = solve_linear_system(F_t, innovation.unsqueeze(-1)).squeeze(-1)
                 quad = innovation @ alpha
                 logdet = 2.0 * torch.log(torch.diagonal(L_t)).sum()
