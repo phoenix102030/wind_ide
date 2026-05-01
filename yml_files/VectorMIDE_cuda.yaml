@@ -53,6 +53,7 @@ window_size: 1008
 rolling_window_size: 24
 batch_size: 1
 steps_per_epoch: 50
+forecast_horizon: 12
 
 lr_cnn: 2e-5
 lr_heads: 1e-4

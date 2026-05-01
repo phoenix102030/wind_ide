@@ -35,12 +35,21 @@ def load_config(path: str | Path) -> dict[str, Any]:
         return yaml.safe_load(handle)
 
 
-def tensor_metrics(pred: torch.Tensor, target: torch.Tensor, skip_first: bool = True) -> dict[str, Any]:
-    if skip_first:
-        pred = pred[1:]
-        target = target[1:]
+def tensor_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    skip_initial: int = 1,
+    valid_mask: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    if skip_initial > 0:
+        pred = pred[skip_initial:]
+        target = target[skip_initial:]
+        if valid_mask is not None:
+            valid_mask = valid_mask[skip_initial:]
 
     mask = torch.isfinite(target) & torch.isfinite(pred)
+    if valid_mask is not None:
+        mask = mask & valid_mask
     err = pred - target
     safe_err = torch.where(mask, err, torch.zeros_like(err))
     count = mask.sum(dim=0).clamp_min(1)
@@ -122,11 +131,63 @@ def transition_diagnostics(M: np.ndarray, A: np.ndarray, ell: np.ndarray, coords
     }
 
 
-def persistence_forecast(z: torch.Tensor) -> torch.Tensor:
-    pred = z.clone()
-    pred[1:] = z[:-1]
-    pred[0] = z[0]
+def persistence_forecast(z: torch.Tensor, horizon: int = 1) -> torch.Tensor:
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1")
+    pred = torch.full_like(z, torch.nan)
+    if horizon < z.shape[0]:
+        pred[horizon:] = z[:-horizon]
     return pred
+
+
+def paired_forecast_metrics(
+    pred: torch.Tensor,
+    baseline: torch.Tensor,
+    target: torch.Tensor,
+    skip_initial: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    common_mask = torch.isfinite(pred) & torch.isfinite(baseline) & torch.isfinite(target)
+    return (
+        tensor_metrics(pred, target, skip_initial=skip_initial, valid_mask=common_mask),
+        tensor_metrics(baseline, target, skip_initial=skip_initial, valid_mask=common_mask),
+    )
+
+
+def metric_improvement(model_metrics: dict[str, Any], baseline_metrics: dict[str, Any]) -> dict[str, float]:
+    return {
+        "rmse_percent": 100.0
+        * (baseline_metrics["rmse"] - model_metrics["rmse"])
+        / max(baseline_metrics["rmse"], 1.0e-12),
+        "mae_percent": 100.0
+        * (baseline_metrics["mae"] - model_metrics["mae"])
+        / max(baseline_metrics["mae"], 1.0e-12),
+    }
+
+
+def multi_horizon_forecasts(
+    model: torch.nn.Module,
+    filter_means: torch.Tensor,
+    filter_covs: torch.Tensor,
+    M_seq: torch.Tensor,
+    max_horizon: int,
+) -> torch.Tensor:
+    if max_horizon < 1:
+        raise ValueError("max_horizon must be >= 1")
+
+    T, state_dim = filter_means.shape
+    predictions = filter_means.new_full((max_horizon, T, state_dim), torch.nan)
+    for origin in range(T - 1):
+        horizon = min(max_horizon, T - origin - 1)
+        if horizon <= 0:
+            continue
+        future = model.dstm.torch_multi_step_forecast(
+            filter_mean=filter_means[origin],
+            filter_cov=filter_covs[origin],
+            future_M_seq=M_seq[origin + 1 : origin + horizon + 1],
+        )
+        for step in range(horizon):
+            predictions[step, origin + step + 1] = future["means"][step]
+    return predictions
 
 
 def evaluate(
@@ -135,21 +196,18 @@ def evaluate(
     device: torch.device,
     eval_window_size: int,
     eval_stride: int | None = None,
+    forecast_horizon: int = 1,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     coords = torch.from_numpy(data["coords"]).to(device)
     T = int(data["X"].shape[0])
     if eval_stride is None:
         eval_stride = eval_window_size
 
-    pred_sum = np.zeros_like(data["Z"], dtype=np.float64)
-    pred_counts = np.zeros((T, 1), dtype=np.float64)
     M_sum = np.zeros((T, 6, 6), dtype=np.float64)
     mu_sum = np.zeros((T, 4), dtype=np.float64)
     sigma_sum = np.zeros((T, 4, 4), dtype=np.float64)
     A_sum = np.zeros((T, 2, 2), dtype=np.float64)
     param_counts = np.zeros((T, 1), dtype=np.float64)
-    nll_sum = 0.0
-    obs_count = 0.0
 
     model.eval()
     with torch.no_grad():
@@ -159,28 +217,13 @@ def evaluate(
             if end <= start:
                 continue
             x_chunk = torch.from_numpy(data["X"][start:end]).to(device)
-            z_chunk = torch.from_numpy(data["Z"][start:end]).to(device)
             outputs = model(x_chunk, coords)
-            kf = model.dstm.kalman_filter(
-                z=z_chunk,
-                M_seq=outputs["M"],
-                reduction="sum",
-                return_history=True,
-            )
-            pred_chunk = kf["pred_means"].detach().cpu().numpy()
-            pred_sum[start:end] += pred_chunk
-            pred_counts[start:end] += 1.0
             M_sum[start:end] += outputs["M"].detach().cpu().numpy()
             mu_sum[start:end] += outputs["mu"].detach().cpu().numpy()
             sigma_sum[start:end] += outputs["Sigma"].detach().cpu().numpy()
             A_sum[start:end] += outputs["A"].detach().cpu().numpy()
             param_counts[start:end] += 1.0
-            nll_sum += float(kf["nll_sum"].detach().cpu())
-            obs_count += float(kf["obs_count"].detach().cpu())
 
-    pred_np = np.full_like(data["Z"], np.nan, dtype=np.float32)
-    valid_pred = pred_counts[:, 0] > 0.0
-    pred_np[valid_pred] = (pred_sum[valid_pred] / pred_counts[valid_pred]).astype(np.float32)
     valid_params = param_counts[:, 0] > 0.0
     M_np = np.full((T, 6, 6), np.nan, dtype=np.float32)
     mu_np = np.full((T, 4), np.nan, dtype=np.float32)
@@ -192,19 +235,70 @@ def evaluate(
     sigma_np[valid_params] = (sigma_sum[valid_params] / counts[:, :, None]).astype(np.float32)
     A_np[valid_params] = (A_sum[valid_params] / counts[:, :, None]).astype(np.float32)
 
-    pred = torch.from_numpy(pred_np).to(device)
+    if not np.isfinite(M_np).all():
+        missing = int((~np.isfinite(M_np).all(axis=(1, 2))).sum())
+        raise ValueError(f"Transition matrices are missing for {missing} time steps; reduce eval stride.")
+
     z = torch.from_numpy(data["Z"]).to(device)
-    baseline = persistence_forecast(z)
-    model_metrics = tensor_metrics(pred, z)
-    baseline_metrics = tensor_metrics(baseline, z)
-    improvement = {
-        "rmse_percent": 100.0
-        * (baseline_metrics["rmse"] - model_metrics["rmse"])
-        / max(baseline_metrics["rmse"], 1.0e-12),
-        "mae_percent": 100.0
-        * (baseline_metrics["mae"] - model_metrics["mae"])
-        / max(baseline_metrics["mae"], 1.0e-12),
-    }
+    M_torch = torch.from_numpy(M_np).to(device)
+    with torch.no_grad():
+        kf = model.dstm.kalman_filter(
+            z=z,
+            M_seq=M_torch,
+            reduction="sum",
+            return_history=True,
+        )
+        pred = kf["pred_means"]
+        pred_np = pred.detach().cpu().numpy().astype(np.float32, copy=False)
+        multi_pred = multi_horizon_forecasts(
+            model=model,
+            filter_means=kf["filter_means"],
+            filter_covs=kf["filter_covs"],
+            M_seq=M_torch,
+            max_horizon=forecast_horizon,
+        )
+
+    baseline = persistence_forecast(z, horizon=1)
+    model_metrics, baseline_metrics = paired_forecast_metrics(
+        pred,
+        baseline,
+        z,
+        skip_initial=1,
+    )
+    improvement = metric_improvement(model_metrics, baseline_metrics)
+
+    multi_step: dict[str, Any] = {}
+    multi_baselines = []
+    multi_pred_np = multi_pred.detach().cpu().numpy().astype(np.float32, copy=False)
+    rmse_curve = np.full((forecast_horizon, 2), np.nan, dtype=np.float32)
+    mae_curve = np.full((forecast_horizon, 2), np.nan, dtype=np.float32)
+    for horizon in range(1, forecast_horizon + 1):
+        horizon_pred = multi_pred[horizon - 1]
+        horizon_baseline = persistence_forecast(z, horizon=horizon)
+        horizon_model_metrics, horizon_baseline_metrics = paired_forecast_metrics(
+            horizon_pred,
+            horizon_baseline,
+            z,
+            skip_initial=horizon,
+        )
+        multi_baselines.append(horizon_baseline.detach().cpu().numpy().astype(np.float32, copy=False))
+        rmse_curve[horizon - 1] = [
+            horizon_model_metrics["rmse"],
+            horizon_baseline_metrics["rmse"],
+        ]
+        mae_curve[horizon - 1] = [
+            horizon_model_metrics["mae"],
+            horizon_baseline_metrics["mae"],
+        ]
+        multi_step[str(horizon)] = {
+            "model": horizon_model_metrics,
+            "persistence_baseline": horizon_baseline_metrics,
+            "model_vs_persistence_improvement": metric_improvement(
+                horizon_model_metrics,
+                horizon_baseline_metrics,
+            ),
+        }
+    multi_baseline_np = np.stack(multi_baselines, axis=0)
 
     with torch.no_grad():
         ell = model.kernel.get_ell().detach().cpu().numpy()
@@ -213,10 +307,13 @@ def evaluate(
         R = model.dstm.observation_covariance().detach().cpu().numpy()
 
     results = {
-        "kalman_nll_per_observation": nll_sum / max(obs_count, 1.0),
+        "kalman_nll_per_observation": float(kf["nll_sum"].detach().cpu())
+        / max(float(kf["obs_count"].detach().cpu()), 1.0),
         "model": model_metrics,
         "persistence_baseline": baseline_metrics,
         "model_vs_persistence_improvement": improvement,
+        "forecast_horizon": forecast_horizon,
+        "multi_step": multi_step,
         "diagnostics": transition_diagnostics(M_np, A_np, ell, data["coords"]),
         "eval_window_size": eval_window_size,
         "eval_stride": eval_stride,
@@ -225,6 +322,11 @@ def evaluate(
         "target": data["Z"].astype(np.float32, copy=False),
         "prediction": pred_np,
         "persistence_prediction": baseline.detach().cpu().numpy().astype(np.float32, copy=False),
+        "multi_step_prediction": multi_pred_np,
+        "multi_step_persistence_prediction": multi_baseline_np,
+        "multi_step_rmse_curve": rmse_curve,
+        "multi_step_mae_curve": mae_curve,
+        "horizons": np.arange(1, forecast_horizon + 1, dtype=np.int32),
         "transition_matrices": M_np,
         "mu": mu_np,
         "Sigma": sigma_np,
@@ -256,7 +358,17 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
         target=artifacts["target"],
         prediction=artifacts["prediction"],
         persistence_prediction=artifacts["persistence_prediction"],
+        multi_step_prediction=artifacts["multi_step_prediction"],
+        multi_step_persistence_prediction=artifacts["multi_step_persistence_prediction"],
+        horizons=artifacts["horizons"],
         state_names=np.asarray(STATE_NAMES),
+    )
+    np.savez_compressed(
+        output_dir / "multi_step_metrics.npz",
+        horizons=artifacts["horizons"],
+        rmse_curve=artifacts["multi_step_rmse_curve"],
+        mae_curve=artifacts["multi_step_mae_curve"],
+        curve_columns=np.asarray(["model", "persistence"]),
     )
     np.savez_compressed(
         output_dir / "transition_matrices.npz",
@@ -349,6 +461,25 @@ def _heatmap(
     plt.close(fig)
 
 
+def _horizon_plot(path: Path, horizons: np.ndarray, values: np.ndarray, title: str, ylabel: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(horizons, values[:, 0], marker="o", linewidth=1.8, label="model")
+    ax.plot(horizons, values[:, 1], marker="o", linewidth=1.8, label="persistence")
+    ax.set_title(title)
+    ax.set_xlabel("forecast horizon")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: int, max_gif_frames: int) -> None:
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -369,6 +500,8 @@ def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: i
     _line_plot(plots_dir / "advection_sigma_diag.png", artifacts["Sigma_diag"], ["var_Ux", "var_Uy", "var_Vx", "var_Vy"], "Advection covariance diagonal", "variance", max_points)
     _line_plot(plots_dir / "mixing_A.png", artifacts["A"].reshape(artifacts["A"].shape[0], 4), A_NAMES, "Component mixing matrix A", "weight", max_points)
     _line_plot(plots_dir / "transition_row_sums.png", np.nansum(artifacts["transition_matrices"], axis=2), STATE_NAMES, "Transition matrix row sums", "row sum", max_points)
+    _horizon_plot(plots_dir / "multi_step_rmse.png", artifacts["horizons"], artifacts["multi_step_rmse_curve"], "Multi-step RMSE", "RMSE")
+    _horizon_plot(plots_dir / "multi_step_mae.png", artifacts["horizons"], artifacts["multi_step_mae_curve"], "Multi-step MAE", "MAE")
 
     M_mean = np.nanmean(artifacts["transition_matrices"], axis=0)
     identity = np.eye(M_mean.shape[0], dtype=M_mean.dtype)
@@ -449,6 +582,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--eval-window-size", type=int, default=None)
     parser.add_argument("--eval-stride", type=int, default=None)
+    parser.add_argument("--forecast-horizon", type=int, default=None, help="Evaluate forecasts from 1 to this horizon.")
     parser.add_argument("--output-dir", default=None, help="Directory for JSON, arrays, plots, and GIF.")
     parser.add_argument("--output", default=None, help="Optional JSON output path.")
     parser.add_argument("--no-plots", action="store_true", help="Skip PNG/GIF plot generation.")
@@ -485,12 +619,18 @@ def main() -> None:
             )
         )
     data = load_vector_dataset(config, split=args.split, time_limit=args.limit)
+    forecast_horizon = args.forecast_horizon
+    if forecast_horizon is None:
+        forecast_horizon = int(config.get("forecast_horizon", 1))
+    if forecast_horizon < 1:
+        raise ValueError("--forecast-horizon must be >= 1")
     results, artifacts = evaluate(
         model,
         data,
         device,
         eval_window_size=eval_window_size,
         eval_stride=args.eval_stride,
+        forecast_horizon=forecast_horizon,
     )
     results["split"] = args.split
     results["checkpoint"] = str(ckpt_path)

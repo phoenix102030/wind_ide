@@ -61,12 +61,15 @@ observations:
 python train/evaluate_vector.py \
   --config yml_files/VectorMIDE_cuda.yaml \
   --checkpoint checkpoints/vector_mide_offline_cuda.pt \
-  --split online
+  --split online \
+  --forecast-horizon 12
 ```
 
 The script reports RMSE/MAE overall, separately for U and V, per station and
 component, Kalman NLL per observation, and a persistence baseline where
-``Z_hat[t] = Z[t-1]``.
+``Z_hat[t] = Z[t-1]``. It also reports multi-step forecasts from horizon 1 to
+`forecast_horizon`; for horizon `h`, the model filters through time `t` and
+then forecasts `t+h` without using observations from `t+1 ... t+h`.
 
 Evaluation artifacts are saved by default under:
 
@@ -78,6 +81,7 @@ Key files:
 
 - `results.json`: metrics and metadata.
 - `forecasts.npz`: target, model prediction, persistence prediction.
+- `multi_step_metrics.npz`: RMSE/MAE curves for model vs persistence by horizon.
 - `transition_matrices.npz`: all evaluated transition matrices `M[t,6,6]`.
 - `advection_parameters.npz`: `mu`, `Sigma`, `A`, `ell`, `Q`, `R`, station coordinates.
 - `time_parameters.csv`: flattened time-series parameters for quick inspection.

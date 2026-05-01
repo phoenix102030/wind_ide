@@ -64,6 +64,7 @@ window_size: 1008
 rolling_window_size: 24
 batch_size: 1
 steps_per_epoch: 50
+forecast_horizon: 12
 
 lr_cnn: 1.0e-4
 lr_heads: 5.0e-4
