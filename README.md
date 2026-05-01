@@ -103,6 +103,36 @@ checkpoint_metric: val_loss_kf
 The validation segment is taken from the tail of the offline split, while
 training windows are sampled from the preceding segment.
 
+## Online Adaptation
+
+Online adaptation starts from an offline checkpoint and updates only the
+adaptation-sensitive parameters by default: neural output heads, `Q/R`, and
+optionally `ell`.
+
+```bash
+python train/train_vector_online.py \
+  --config yml_files/VectorMIDE_cuda.yaml \
+  --checkpoint outputs/cnn_transformer_new/vector_mide_offline_cuda.pt
+```
+
+The script saves two checkpoints:
+
+- `online_checkpoint_name`: best online checkpoint selected by validation loss.
+- `last_online_checkpoint_name`: final adapted checkpoint after the last update.
+
+Online validation uses the future window immediately after each adapted training
+window, so it is a model-selection signal rather than a strict deployment
+metric. The interval and monitor are configurable:
+
+```yaml
+online_validation_window_size: 168
+online_validation_every_updates: 10
+online_validation_gap: 0
+online_checkpoint_metric: val_loss_kf
+online_early_stop_patience: 0
+online_min_delta: 0.0
+```
+
 ## Neural Encoder
 
 The default encoder is now:

@@ -84,11 +84,18 @@ offline_epochs_finetune: 20
 online_window_size: 168
 online_update_every: 6
 online_steps: 10
+online_validation_window_size: 168
+online_validation_every_updates: 10
+online_validation_gap: 0
+online_checkpoint_metric: val_loss_kf
+online_early_stop_patience: 0
+online_min_delta: 0.0
 
 checkpoint_dir: checkpoints
 offline_checkpoint_name: vector_mide_offline.pt
 last_offline_checkpoint_name: vector_mide_offline_last.pt
 online_checkpoint_name: vector_mide_online.pt
+last_online_checkpoint_name: vector_mide_online_last.pt
 checkpoint_stage: joint
 checkpoint_metric: val_loss_kf
 
