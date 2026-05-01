@@ -91,7 +91,7 @@ Key files:
 Offline training saves the best checkpoint during the configured monitor stage
 to `offline_checkpoint_name` and the final epoch checkpoint to
 `last_offline_checkpoint_name`. By default, the best checkpoint is selected from
-the joint finetuning stage using fixed validation-window `val_loss_kf`.
+the joint finetuning stage using fixed validation-window `val_loss_forecast`.
 
 Validation is configurable in YAML:
 
@@ -101,11 +101,26 @@ validation_fraction: 0.15
 validation_window_size: null
 validation_num_windows: 8
 validation_every_epochs: 5
-checkpoint_metric: val_loss_kf
+checkpoint_metric: val_loss_forecast
 ```
 
 The validation segment is taken from the tail of the offline split, while
 training windows are sampled from the preceding segment.
+
+For multi-step forecasting experiments, the joint stage can add a direct
+forecast loss from filtered state at time `t` to future observations:
+
+```yaml
+lambda_multistep: 0.2
+multistep_horizons: [3, 6, 12]
+multistep_max_origins: 256
+multistep_stages: [joint]
+checkpoint_metric: val_loss_forecast
+```
+
+`loss_forecast` is `loss_kf + lambda_multistep * loss_multistep`, so checkpoint
+selection stays focused on Kalman fit plus multi-step forecast quality, without
+including auxiliary advection or regularization terms.
 
 ## Online Adaptation
 
@@ -132,7 +147,7 @@ metric. The interval and monitor are configurable:
 online_validation_window_size: 168
 online_validation_every_updates: 10
 online_validation_gap: 0
-online_checkpoint_metric: val_loss_kf
+online_checkpoint_metric: val_loss_forecast
 online_early_stop_patience: 0
 online_min_delta: 0.0
 ```

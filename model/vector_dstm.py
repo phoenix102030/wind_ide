@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -277,6 +277,53 @@ class VectorMIDE(nn.Module):
         outputs = self.forward(x, coords)
         return self.dstm.kalman_nll(z=z, M_seq=outputs["M"], H=H)
 
+    def multi_step_forecast_loss(
+        self,
+        z: Tensor,
+        M_seq: Tensor,
+        filter_means: Tensor,
+        horizons: Sequence[int],
+        H: Optional[Tensor] = None,
+        max_origins: int = 0,
+    ) -> Tensor:
+        """Masked MSE for forecasts rolled forward from filtered states."""
+        if not horizons:
+            return z.new_tensor(0.0)
+
+        T = z.shape[0]
+        H_full = H.to(device=z.device, dtype=z.dtype) if H is not None else None
+        losses = []
+        for horizon in horizons:
+            h = int(horizon)
+            if h < 1 or h >= T:
+                continue
+
+            n_origins = T - h
+            if max_origins > 0 and n_origins > max_origins:
+                origin_idx = torch.linspace(
+                    0,
+                    n_origins - 1,
+                    max_origins,
+                    device=z.device,
+                ).round().long().unique()
+            else:
+                origin_idx = torch.arange(n_origins, device=z.device)
+
+            mean = filter_means[origin_idx]
+            for step in range(1, h + 1):
+                M_batch = M_seq[origin_idx + step].to(device=z.device, dtype=z.dtype)
+                mean = torch.bmm(M_batch, mean.unsqueeze(-1)).squeeze(-1)
+
+            pred = mean if H_full is None else mean @ H_full.T
+            target = z[origin_idx + h]
+            mask = torch.isfinite(pred) & torch.isfinite(target)
+            if mask.any():
+                losses.append((pred[mask] - target[mask]).pow(2).mean())
+
+        if not losses:
+            return z.new_tensor(0.0)
+        return torch.stack(losses).mean()
+
     def training_losses(
         self,
         x: Tensor,
@@ -287,9 +334,31 @@ class VectorMIDE(nn.Module):
         lambda_adv: float = 0.1,
         lambda_smooth: float = 0.001,
         lambda_reg: float = 0.0001,
+        lambda_multistep: float = 0.0,
+        multistep_horizons: Optional[Sequence[int]] = None,
+        multistep_max_origins: int = 0,
     ) -> dict[str, Tensor]:
         outputs = self.forward(x, coords)
-        loss_kf = self.dstm.kalman_nll(z=z, M_seq=outputs["M"], H=H)
+        use_multistep = lambda_multistep > 0.0 and bool(multistep_horizons)
+        if use_multistep:
+            kf = self.dstm.kalman_filter(
+                z=z,
+                M_seq=outputs["M"],
+                H=H,
+                return_history=True,
+            )
+            loss_kf = kf["loss"]
+            loss_multistep = self.multi_step_forecast_loss(
+                z=z,
+                M_seq=outputs["M"],
+                filter_means=kf["filter_means"],
+                horizons=multistep_horizons or (),
+                H=H,
+                max_origins=multistep_max_origins,
+            )
+        else:
+            loss_kf = self.dstm.kalman_nll(z=z, M_seq=outputs["M"], H=H)
+            loss_multistep = loss_kf.new_tensor(0.0)
         loss_adv = advection_nll_loss(v_star, outputs["mu"], outputs["Sigma"])
         loss_smooth = smoothness_loss(outputs["mu"], outputs["A"])
         reg_params = list(self.kernel.parameters()) + list(self.qr_params.parameters())
@@ -299,12 +368,16 @@ class VectorMIDE(nn.Module):
             + lambda_adv * loss_adv
             + lambda_smooth * loss_smooth
             + lambda_reg * loss_reg
+            + lambda_multistep * loss_multistep
         )
+        loss_forecast = loss_kf + lambda_multistep * loss_multistep
         return {
             "loss": total,
+            "loss_forecast": loss_forecast,
             "loss_kf": loss_kf,
             "loss_adv": loss_adv,
             "loss_smooth": loss_smooth,
             "loss_reg": loss_reg,
+            "loss_multistep": loss_multistep,
             **outputs,
         }

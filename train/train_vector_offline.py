@@ -197,6 +197,33 @@ def split_train_validation(
     return train_arrays, val_arrays, starts
 
 
+def multistep_horizons(config: dict[str, Any]) -> list[int]:
+    raw = config.get("multistep_horizons", [3, 6, 12])
+    if isinstance(raw, str):
+        raw = [item.strip() for item in raw.split(",") if item.strip()]
+    return [int(item) for item in raw]
+
+
+def lambda_multistep_for_stage(config: dict[str, Any], stage: str) -> float:
+    stages = config.get("multistep_stages", ["joint"])
+    if isinstance(stages, str):
+        stages = [item.strip() for item in stages.split(",") if item.strip()]
+    if stage not in stages:
+        return 0.0
+    return float(config.get("lambda_multistep", 0.0))
+
+
+def training_loss_kwargs(config: dict[str, Any], stage: str) -> dict[str, Any]:
+    return {
+        "lambda_adv": float(config.get("lambda_adv", 0.1)),
+        "lambda_smooth": float(config.get("lambda_smooth", 0.001)),
+        "lambda_reg": float(config.get("lambda_reg", 0.0001)),
+        "lambda_multistep": lambda_multistep_for_stage(config, stage),
+        "multistep_horizons": multistep_horizons(config),
+        "multistep_max_origins": int(config.get("multistep_max_origins", 256)),
+    }
+
+
 def validation_losses(
     model: VectorMIDE,
     val_arrays: dict[str, np.ndarray | None],
@@ -223,9 +250,7 @@ def validation_losses(
                 z=z,
                 coords=coords,
                 v_star=v_star,
-                lambda_adv=float(config.get("lambda_adv", 0.1)),
-                lambda_smooth=float(config.get("lambda_smooth", 0.001)),
-                lambda_reg=float(config.get("lambda_reg", 0.0001)),
+                **training_loss_kwargs(config, "joint"),
             )
             for key, value in losses.items():
                 if key.startswith("loss"):
@@ -272,6 +297,9 @@ def run_epoch(
                 lambda_adv=0.0,
                 lambda_smooth=0.0,
                 lambda_reg=float(config.get("lambda_reg", 0.0001)),
+                lambda_multistep=lambda_multistep_for_stage(config, stage),
+                multistep_horizons=multistep_horizons(config),
+                multistep_max_origins=int(config.get("multistep_max_origins", 256)),
             )
             loss = losses["loss"]
         elif stage == "joint":
@@ -280,9 +308,7 @@ def run_epoch(
                 z=z,
                 coords=coords,
                 v_star=v_star,
-                lambda_adv=float(config.get("lambda_adv", 0.1)),
-                lambda_smooth=float(config.get("lambda_smooth", 0.001)),
-                lambda_reg=float(config.get("lambda_reg", 0.0001)),
+                **training_loss_kwargs(config, stage),
             )
             loss = losses["loss"]
         else:
@@ -362,7 +388,13 @@ def main() -> None:
     if args.dry_run:
         x, z, v_star = sample_window(arrays, min(16, arrays["X"].shape[0]), device)
         with torch.enable_grad():
-            losses = model.training_losses(x=x, z=z, coords=coords, v_star=v_star)
+            losses = model.training_losses(
+                x=x,
+                z=z,
+                coords=coords,
+                v_star=v_star,
+                **training_loss_kwargs(config, "joint"),
+            )
         print({key: float(value.detach().cpu()) for key, value in losses.items() if key.startswith("loss")})
         return
 

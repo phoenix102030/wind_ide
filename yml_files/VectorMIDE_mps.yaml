@@ -65,6 +65,10 @@ grad_clip: 1.0
 lambda_adv: 0.1
 lambda_smooth: 0.001
 lambda_reg: 0.0001
+lambda_multistep: 0.2
+multistep_horizons: [3, 6, 12]
+multistep_max_origins: 64
+multistep_stages: [joint]
 lambda_anchor: 0.01
 
 offline_epochs_pretrain_adv: 2
@@ -77,7 +81,7 @@ online_steps: 10
 online_validation_window_size: 168
 online_validation_every_updates: 5
 online_validation_gap: 0
-online_checkpoint_metric: val_loss_kf
+online_checkpoint_metric: val_loss_forecast
 online_early_stop_patience: 0
 online_min_delta: 0.0
 
@@ -87,7 +91,7 @@ last_offline_checkpoint_name: vector_mide_offline_mps_last.pt
 online_checkpoint_name: vector_mide_online_mps.pt
 last_online_checkpoint_name: vector_mide_online_mps_last.pt
 checkpoint_stage: joint
-checkpoint_metric: val_loss_kf
+checkpoint_metric: val_loss_forecast
 
 validation_enabled: true
 validation_fraction: 0.15

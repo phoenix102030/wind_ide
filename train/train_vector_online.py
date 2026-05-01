@@ -23,6 +23,7 @@ from train.train_vector_offline import (
     resolve_device,
     save_checkpoint,
     set_seed,
+    training_loss_kwargs,
 )
 
 
@@ -101,9 +102,7 @@ def evaluate_window_loss(
             z=z,
             coords=coords,
             v_star=v_star,
-            lambda_adv=float(config.get("lambda_adv", 0.1)),
-            lambda_smooth=float(config.get("lambda_smooth", 0.001)),
-            lambda_reg=float(config.get("lambda_reg", 0.0001)),
+            **training_loss_kwargs(config, "online"),
         )
     return {
         f"val_{key}": float(value.detach().cpu())
@@ -192,9 +191,7 @@ def main() -> None:
                 z=z,
                 coords=coords,
                 v_star=v_star,
-                lambda_adv=float(config.get("lambda_adv", 0.1)),
-                lambda_smooth=float(config.get("lambda_smooth", 0.001)),
-                lambda_reg=float(config.get("lambda_reg", 0.0001)),
+                **training_loss_kwargs(config, "online"),
             )
             current = trainable_named_parameters(model)
             loss = losses["loss"] + lambda_anchor * anchor_loss(current, anchor)
@@ -207,10 +204,12 @@ def main() -> None:
             "train_start": start,
             "end": end,
             "loss": float(losses["loss"].detach().cpu()),
+            "loss_forecast": float(losses["loss_forecast"].detach().cpu()),
             "loss_kf": float(losses["loss_kf"].detach().cpu()),
             "loss_adv": float(losses["loss_adv"].detach().cpu()),
             "loss_smooth": float(losses["loss_smooth"].detach().cpu()),
             "loss_reg": float(losses["loss_reg"].detach().cpu()),
+            "loss_multistep": float(losses["loss_multistep"].detach().cpu()),
         }
 
         should_validate = online_val_every > 0 and (
