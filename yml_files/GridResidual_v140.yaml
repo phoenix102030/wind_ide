@@ -1,0 +1,66 @@
+experiment_type: GridResidualAnalysis
+seed: 123
+
+device: auto
+allow_device_fallback: true
+
+nwp_channel_names:
+  - u100
+  - v100
+  - u140
+  - v140
+  - u180
+  - v180
+
+data:
+  offline_measurement_path: data/measurement/wv_h100_180_offline.mat
+  offline_nwp_path: data/nwp/data_grid_offline.mat
+  online_measurement_path: data/measurement/wv_h100_180_online.mat
+  online_nwp_path: data/nwp/data_grid_online.mat
+  target_component: v
+  target_channel: v140
+  dt_seconds: 600.0
+  use_measurement_station_coords: true
+  standardize_x: true
+  distance_scale_km: null
+
+features:
+  use_coords: true
+  use_station_residual_broadcast: true
+  use_distance_features: true
+  use_advection_alignment: true
+  use_advective_weight: true
+  advective_length_scale_km: 120.0
+
+model:
+  hidden_dim: 64
+  num_blocks: 5
+  dropout: 0.05
+  max_residual: 30.0
+
+loss:
+  lambda_smooth: 0.05
+  lambda_prior: 0.01
+  lambda_time: 0.0
+  lambda_adv: 0.0
+  distance_weighted_prior: true
+
+train:
+  window_size: 1
+  batch_size: 16
+  steps_per_epoch: 100
+  epochs: 100
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  checkpoint_dir: checkpoints
+  checkpoint_name: grid_residual_v140.pt
+  last_checkpoint_name: grid_residual_v140_last.pt
+  checkpoint_metric: val_loss_obs
+
+validation:
+  enabled: true
+  fraction: 0.15
+  min_windows: 64
+  num_windows: 256
+  every_epochs: 1

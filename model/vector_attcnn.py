@@ -10,6 +10,17 @@ import torch.nn.functional as F
 from .covariance import covariance_from_cholesky_raw, inverse_softplus
 
 
+def _logit(value: float) -> float:
+    value = min(max(value, 1.0e-6), 1.0 - 1.0e-6)
+    return math.log(value / (1.0 - value))
+
+
+def _bounded_logit(value: float, lower: float, upper: float) -> float:
+    if not lower < upper:
+        raise ValueError("Require lower < upper for bounded scalar output")
+    return _logit((value - lower) / (upper - lower))
+
+
 def build_cholesky_4x4(raw: Tensor, jitter: float = 1.0e-4) -> Tensor:
     """Build a 4x4 lower Cholesky factor from 10 raw parameters."""
     L, _ = covariance_from_cholesky_raw(raw, dim=4, jitter=jitter)
@@ -109,12 +120,27 @@ class VectorAdvectionNet(nn.Module):
         transformer_dropout: float = 0.1,
         transformer_causal: bool = True,
         transformer_max_len: int = 4096,
+        component_specific_mu: bool = False,
+        advection_mode: str = "component",
+        deformation_scale: float = 0.3,
+        transition_kernel_weight: bool = False,
+        transition_kernel_weight_init: float = 1.0,
+        transition_kernel_weight_min: float = 0.0,
+        transition_kernel_weight_max: float = 1.0,
+        transition_residual_decay: bool = False,
+        transition_residual_decay_init: float = 1.0,
+        transition_residual_decay_min: float = 0.0,
+        transition_residual_decay_max: float = 1.0,
+        transition_control_dim: int = 0,
+        transition_control_scale: float = 0.0,
     ) -> None:
         super().__init__()
         if output_dim != 18:
             raise ValueError("VectorAdvectionNet expects output_dim=18")
         if network_type not in {"cnn", "cnn_transformer"}:
             raise ValueError("network_type must be 'cnn' or 'cnn_transformer'")
+        if advection_mode not in {"component", "shared_flow_deformation"}:
+            raise ValueError("advection_mode must be 'component' or 'shared_flow_deformation'")
         if transformer_d_model % transformer_nhead != 0:
             raise ValueError("transformer_d_model must be divisible by transformer_nhead")
         if not 0.0 <= component_mixing_floor < 0.5:
@@ -123,6 +149,18 @@ class VectorAdvectionNet(nn.Module):
         self.network_type = network_type
         self.transformer_causal = transformer_causal
         self.component_mixing_floor = component_mixing_floor
+        self.transition_kernel_weight_enabled = transition_kernel_weight
+        self.transition_kernel_weight_min = float(transition_kernel_weight_min)
+        self.transition_kernel_weight_max = float(transition_kernel_weight_max)
+        self.transition_residual_decay_enabled = transition_residual_decay
+        self.transition_residual_decay_min = float(transition_residual_decay_min)
+        self.transition_residual_decay_max = float(transition_residual_decay_max)
+        self.transition_control_dim = int(transition_control_dim)
+        self.transition_control_scale = float(transition_control_scale)
+        self.component_specific_mu = bool(component_specific_mu)
+        self.advection_mode = advection_mode
+        self.deformation_scale = float(deformation_scale)
+
         self.backbone = ConvBackbone(in_channels=in_channels, hidden_dim=hidden_dim)
         self.attention = ChannelSpatialAttention(hidden_dim=hidden_dim)
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -155,9 +193,68 @@ class VectorAdvectionNet(nn.Module):
             nn.Linear(feature_dim, feature_dim),
             nn.SiLU(),
         )
-        self.mu_head = nn.Linear(feature_dim, 4)
-        self.chol_head = nn.Linear(feature_dim, 10)
-        self.A_head = nn.Linear(feature_dim, 4)
+        use_component_heads = self.advection_mode == "component"
+        self.mu_head = None if (self.component_specific_mu or not use_component_heads) else nn.Linear(feature_dim, 4)
+        if use_component_heads and self.component_specific_mu:
+            self.mu_u_head_shared = nn.Sequential(
+                nn.Linear(feature_dim, feature_dim),
+                nn.SiLU(),
+            )
+            self.mu_v_head_shared = nn.Sequential(
+                nn.Linear(feature_dim, feature_dim),
+                nn.SiLU(),
+            )
+            self.mu_u_head = nn.Linear(feature_dim, 2)
+            self.mu_v_head = nn.Linear(feature_dim, 2)
+        else:
+            self.mu_u_head_shared = None
+            self.mu_v_head_shared = None
+            self.mu_u_head = None
+            self.mu_v_head = None
+        self.chol_head = nn.Linear(feature_dim, 10) if use_component_heads else None
+        self.A_head = nn.Linear(feature_dim, 4) if use_component_heads else None
+        if self.advection_mode == "shared_flow_deformation":
+            self.flow_head = nn.Linear(feature_dim, 2)
+            self.flow_chol_head = nn.Linear(feature_dim, 3)
+            self.deformation_head = nn.Linear(feature_dim, 4)
+            nn.init.zeros_(self.deformation_head.weight)
+            nn.init.zeros_(self.deformation_head.bias)
+        else:
+            self.flow_head = None
+            self.flow_chol_head = None
+            self.deformation_head = None
+        if self.transition_kernel_weight_enabled:
+            self.kernel_weight_head = nn.Linear(feature_dim, 1)
+            nn.init.zeros_(self.kernel_weight_head.weight)
+            nn.init.constant_(
+                self.kernel_weight_head.bias,
+                _bounded_logit(
+                    float(transition_kernel_weight_init),
+                    self.transition_kernel_weight_min,
+                    self.transition_kernel_weight_max,
+                ),
+            )
+        else:
+            self.kernel_weight_head = None
+        if self.transition_residual_decay_enabled:
+            self.residual_decay_head = nn.Linear(feature_dim, 1)
+            nn.init.zeros_(self.residual_decay_head.weight)
+            nn.init.constant_(
+                self.residual_decay_head.bias,
+                _bounded_logit(
+                    float(transition_residual_decay_init),
+                    self.transition_residual_decay_min,
+                    self.transition_residual_decay_max,
+                ),
+            )
+        else:
+            self.residual_decay_head = None
+        if self.transition_control_dim > 0:
+            self.control_head = nn.Linear(feature_dim, self.transition_control_dim)
+            nn.init.zeros_(self.control_head.weight)
+            nn.init.zeros_(self.control_head.bias)
+        else:
+            self.control_head = None
         self.raw_mu_scale = nn.Parameter(
             torch.tensor(inverse_softplus(mu_scale_init), dtype=torch.float32)
         )
@@ -175,10 +272,37 @@ class VectorAdvectionNet(nn.Module):
             yield from self.temporal_encoder.parameters()
         yield from self.head_norm.parameters()
         yield from self.head_shared.parameters()
-        yield from self.mu_head.parameters()
-        yield from self.chol_head.parameters()
-        yield from self.A_head.parameters()
+        if self.mu_head is not None:
+            yield from self.mu_head.parameters()
+        if self.mu_u_head_shared is not None:
+            yield from self.mu_u_head_shared.parameters()
+        if self.mu_v_head_shared is not None:
+            yield from self.mu_v_head_shared.parameters()
+        if self.mu_u_head is not None:
+            yield from self.mu_u_head.parameters()
+        if self.mu_v_head is not None:
+            yield from self.mu_v_head.parameters()
+        if self.chol_head is not None:
+            yield from self.chol_head.parameters()
+        if self.A_head is not None:
+            yield from self.A_head.parameters()
+        if self.flow_head is not None:
+            yield from self.flow_head.parameters()
+        if self.flow_chol_head is not None:
+            yield from self.flow_chol_head.parameters()
+        if self.deformation_head is not None:
+            yield from self.deformation_head.parameters()
+        if self.kernel_weight_head is not None:
+            yield from self.kernel_weight_head.parameters()
+        if self.residual_decay_head is not None:
+            yield from self.residual_decay_head.parameters()
+        if self.control_head is not None:
+            yield from self.control_head.parameters()
         yield self.raw_mu_scale
+
+    @staticmethod
+    def _bounded_sigmoid(raw: Tensor, lower: float, upper: float) -> Tensor:
+        return lower + (upper - lower) * torch.sigmoid(raw)
 
     def _causal_mask(self, length: int, device: torch.device) -> Tensor:
         return torch.triu(torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1)
@@ -197,6 +321,73 @@ class VectorAdvectionNet(nn.Module):
         encoded = self.temporal_encoder(seq, mask=mask)
         return encoded.squeeze(0)
 
+    def predict_raw_mu(self, shared_features: Tensor) -> Tensor:
+        if not self.component_specific_mu:
+            if self.mu_head is None:
+                raise RuntimeError("mu_head is not initialized")
+            return self.mu_head(shared_features)
+
+        features_u = self.mu_u_head_shared(shared_features)
+        features_v = self.mu_v_head_shared(shared_features)
+        return torch.cat([self.mu_u_head(features_u), self.mu_v_head(features_v)], dim=-1)
+
+    @staticmethod
+    def _expand_flow_cholesky_raw(raw_flow_chol: Tensor) -> Tensor:
+        raw_chol = raw_flow_chol.new_zeros(raw_flow_chol.shape[:-1] + (10,))
+        raw_chol[..., 0] = raw_flow_chol[..., 0]
+        raw_chol[..., 1] = raw_flow_chol[..., 1]
+        raw_chol[..., 2] = raw_flow_chol[..., 2]
+        raw_chol[..., 5] = raw_flow_chol[..., 0]
+        raw_chol[..., 8] = raw_flow_chol[..., 1]
+        raw_chol[..., 9] = raw_flow_chol[..., 2]
+        return raw_chol
+
+    def forward_shared_flow_deformation(self, features: Tensor) -> dict[str, Tensor]:
+        if self.flow_head is None or self.flow_chol_head is None or self.deformation_head is None:
+            raise RuntimeError("Shared-flow advection heads are not initialized")
+
+        raw_flow = self.flow_head(features)
+        raw_flow_chol = self.flow_chol_head(features)
+        raw_B = self.deformation_head(features)
+        flow_mu = torch.tanh(raw_flow) * self.mu_scale
+        flow_L, flow_sigma = covariance_from_cholesky_raw(
+            raw_flow_chol,
+            dim=2,
+            jitter=self.chol_jitter,
+        )
+
+        n_time = flow_mu.shape[0]
+        mu = torch.cat([flow_mu, flow_mu], dim=-1)
+        L = flow_L.new_zeros(n_time, 4, 4)
+        L[:, :2, :2] = flow_L
+        L[:, 2:, 2:] = flow_L
+        sigma = flow_sigma.new_zeros(n_time, 4, 4)
+        sigma[:, :2, :2] = flow_sigma
+        sigma[:, 2:, 2:] = flow_sigma
+
+        eye2 = torch.eye(2, device=features.device, dtype=features.dtype).unsqueeze(0)
+        B_delta = self.deformation_scale * torch.tanh(raw_B.reshape(-1, 2, 2))
+        B = eye2 + B_delta
+
+        raw_mu = torch.cat([raw_flow, raw_flow], dim=-1)
+        raw_chol = self._expand_flow_cholesky_raw(raw_flow_chol)
+        raw = torch.cat([raw_mu, raw_chol, raw_B], dim=-1)
+        B_logits = raw_B.reshape(-1, 2, 2)
+
+        return {
+            "raw": raw,
+            "mu": mu,
+            "L": L,
+            "Sigma": sigma,
+            "A": B,
+            "A_logits": B_logits,
+            "B": B,
+            "B_delta": B_delta,
+            "flow_mu": flow_mu,
+            "flow_L": flow_L,
+            "flow_Sigma": flow_sigma,
+        }
+
     def forward(self, x: Tensor) -> dict[str, Tensor]:
         if x.ndim == 3:
             x = x.unsqueeze(0)
@@ -206,7 +397,33 @@ class VectorAdvectionNet(nn.Module):
         features = self.encode_features(x)
         features = self.head_shared(self.head_norm(features))
 
-        raw_mu = self.mu_head(features)
+        if self.advection_mode == "shared_flow_deformation":
+            result = self.forward_shared_flow_deformation(features)
+            if self.kernel_weight_head is not None:
+                raw_kernel_weight = self.kernel_weight_head(features)
+                result["raw_kernel_weight"] = raw_kernel_weight
+                result["kernel_weight"] = self._bounded_sigmoid(
+                    raw_kernel_weight,
+                    self.transition_kernel_weight_min,
+                    self.transition_kernel_weight_max,
+                )
+            if self.residual_decay_head is not None:
+                raw_residual_decay = self.residual_decay_head(features)
+                result["raw_residual_decay"] = raw_residual_decay
+                result["residual_decay"] = self._bounded_sigmoid(
+                    raw_residual_decay,
+                    self.transition_residual_decay_min,
+                    self.transition_residual_decay_max,
+                )
+            if self.control_head is not None:
+                raw_control = self.control_head(features)
+                result["raw_transition_control"] = raw_control
+                result["transition_control"] = torch.tanh(raw_control) * self.transition_control_scale
+            return result
+
+        raw_mu = self.predict_raw_mu(features)
+        if self.chol_head is None or self.A_head is None:
+            raise RuntimeError("Component advection heads are not initialized")
         raw_chol = self.chol_head(features)
         raw_A = self.A_head(features)
         raw = torch.cat([raw_mu, raw_chol, raw_A], dim=-1)
@@ -222,7 +439,7 @@ class VectorAdvectionNet(nn.Module):
         if self.component_mixing_floor > 0.0:
             A = self.component_mixing_floor + (1.0 - 2.0 * self.component_mixing_floor) * A
 
-        return {
+        result = {
             "raw": raw,
             "mu": mu,
             "L": L,
@@ -230,3 +447,24 @@ class VectorAdvectionNet(nn.Module):
             "A": A,
             "A_logits": A_logits,
         }
+        if self.kernel_weight_head is not None:
+            raw_kernel_weight = self.kernel_weight_head(features)
+            result["raw_kernel_weight"] = raw_kernel_weight
+            result["kernel_weight"] = self._bounded_sigmoid(
+                raw_kernel_weight,
+                self.transition_kernel_weight_min,
+                self.transition_kernel_weight_max,
+            )
+        if self.residual_decay_head is not None:
+            raw_residual_decay = self.residual_decay_head(features)
+            result["raw_residual_decay"] = raw_residual_decay
+            result["residual_decay"] = self._bounded_sigmoid(
+                raw_residual_decay,
+                self.transition_residual_decay_min,
+                self.transition_residual_decay_max,
+            )
+        if self.control_head is not None:
+            raw_control = self.control_head(features)
+            result["raw_transition_control"] = raw_control
+            result["transition_control"] = torch.tanh(raw_control) * self.transition_control_scale
+        return result

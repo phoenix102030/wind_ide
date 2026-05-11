@@ -9,12 +9,14 @@ for 140m wind components. The latent state is ordered as:
 
 The neural network maps NWP grids to a four-dimensional random advection
 distribution and a 2x2 component mixing matrix. A Lagrangian kernel turns those
-outputs into a time-varying transition matrix for a Cholesky-based Kalman
+outputs into a base transition matrix. In residual-NWP mode, the model can then
+blend that base transition with identity persistence, decay the residual toward
+zero, and add a small learned control term before the Cholesky-based Kalman
 filter likelihood.
 
 ## Main Files
 
-- `model/vector_attcnn.py`: CNN/attention head for `(mu, Sigma, A)`.
+- `model/vector_attcnn.py`: CNN/attention head for `(mu, Sigma, A)` plus optional transition modifiers.
 - `model/vector_kernel.py`: 4D random-advection Lagrangian transition kernel.
 - `model/vector_dstm.py`: Kalman filtering, losses, and the combined model.
 - `model/covariance.py`: Cholesky covariance utilities and losses.
@@ -66,10 +68,11 @@ python train/evaluate_vector.py \
 ```
 
 The script reports RMSE/MAE overall, separately for U and V, per station and
-component, Kalman NLL per observation, and a persistence baseline where
-``Z_hat[t] = Z[t-1]``. It also reports multi-step forecasts from horizon 1 to
-`forecast_horizon`; for horizon `h`, the model filters through time `t` and
-then forecasts `t+h` without using observations from `t+1 ... t+h`.
+component, Kalman NLL per observation, a measurement persistence baseline, a
+nearest-grid NWP baseline, and an NWP-plus-persisted-residual baseline. It also
+reports multi-step forecasts from horizon 1 to `forecast_horizon`; for horizon
+`h`, the model filters through time `t` and then forecasts `t+h` without using
+observations from `t+1 ... t+h`.
 
 Evaluation artifacts are saved by default under:
 
@@ -80,10 +83,10 @@ outputs/evaluation/<checkpoint-name>_<split>/
 Key files:
 
 - `results.json`: metrics and metadata.
-- `forecasts.npz`: target, model prediction, persistence prediction.
-- `multi_step_metrics.npz`: RMSE/MAE curves for model vs persistence by horizon.
+- `forecasts.npz`: measurement target, residual target, NWP baseline, model prediction, and baselines.
+- `multi_step_metrics.npz`: RMSE/MAE curves for model vs persistence/NWP baselines by horizon.
 - `transition_matrices.npz`: all evaluated transition matrices `M[t,6,6]`.
-- `advection_parameters.npz`: `mu`, `Sigma`, `A`, `ell`, `Q`, `R`, station coordinates.
+- `advection_parameters.npz`: `mu`, `Sigma`, `A`, optional shared-flow `flow_mu`/`flow_Sigma`, deformation `B`, transition modifiers, `ell`, `Q`, `R`, station coordinates.
 - `time_parameters.csv`: flattened time-series parameters for quick inspection.
 - `plots/transition_matrix.gif`: animated transition matrix over sampled times.
 - `plots/*.png`: parameter time-series and heatmaps.
@@ -112,15 +115,59 @@ forecast loss from filtered state at time `t` to future observations:
 
 ```yaml
 lambda_multistep: 0.2
-multistep_horizons: [3, 6, 12]
+multistep_horizons: [1, 2, 3, 6, 9, 12]
 multistep_max_origins: 256
-multistep_stages: [joint]
+multistep_stages: [joint, online]
 checkpoint_metric: val_loss_forecast
 ```
 
 `loss_forecast` is `loss_kf + lambda_multistep * loss_multistep`, so checkpoint
 selection stays focused on Kalman fit plus multi-step forecast quality, without
 including auxiliary advection or regularization terms.
+
+## Residual Target
+
+The default target is now the residual to the nearest-grid 140m NWP baseline:
+
+```text
+b_t = NWP_140m(nearest_grid(s1,s2,s3), t)
+r_t = y_t - b_t
+```
+
+The Kalman/IDE model trains on `r_t`, while advection labels are still computed
+from the original NWP fields exactly as before. Forecasts are reported back in
+measurement space:
+
+```text
+y_hat_{t+h|t} = b_{t+h} + r_hat_{t+h|t}
+```
+
+This is enabled by:
+
+```yaml
+data:
+  target_mode: residual_nwp
+```
+
+For residual targets, the default transition is:
+
+```text
+r_{t+1} = rho_t * ((1 - pi_t) I + pi_t M_base,t) r_t + c_t + noise
+```
+
+`M_base,t` is still the original Lagrangian spatial kernel. `pi_t` lets the
+model keep short horizons close to persistence, `rho_t` lets long horizons
+return toward the NWP baseline, and `c_t` is a small NWP-dependent residual
+control initialized to zero. The defaults are conservative:
+
+```yaml
+transition_kernel_weight: true
+transition_kernel_weight_init: 0.2
+transition_residual_decay: true
+transition_residual_decay_init: 0.97
+transition_control: true
+transition_control_scale: 0.5
+```
 
 ## Online Adaptation
 
@@ -152,6 +199,64 @@ online_early_stop_patience: 0
 online_min_delta: 0.0
 ```
 
+## Full-Grid Residual Analysis Model
+
+The original VectorMIDE model is kept intact. A separate analysis-correction
+path trains a CNN to output a full NWP-grid residual field while applying
+supervised loss only at the three measurement stations.
+
+```bash
+python train/train_grid_residual.py --config yml_files/GridResidual_u140.yaml --dry-run
+python train/train_grid_residual.py --config yml_files/GridResidual_u140.yaml
+python train/train_grid_residual.py --config yml_files/GridResidual_v140.yaml
+```
+
+The model input combines NWP fields, projected grid coordinates, station
+residual broadcasts, station distance fields, wind-alignment features, and
+advective weights. The V0 objective is:
+
+```text
+loss = loss_obs + 0.05 * loss_smooth + 0.01 * loss_prior
+```
+
+where `loss_obs` is computed after bilinear sampling the predicted residual
+grid back to the three stations. No fake full-grid residual labels are built.
+Leave-one-station-out runs can be launched by withholding one station from both
+the residual conditioning channels and supervised loss:
+
+```bash
+python train/train_grid_residual.py \
+  --config yml_files/GridResidual_u140.yaml \
+  --holdout-station 2
+```
+
+Evaluate a checkpoint at station locations with raw-NWP skill metrics:
+
+```bash
+python train/evaluate_grid_residual.py \
+  --checkpoint checkpoints/grid_residual_u140.pt \
+  --split offline
+```
+
+Export full-grid residual and corrected NWP fields:
+
+```bash
+python train/infer_grid_residual.py \
+  --checkpoint checkpoints/grid_residual_u140.pt \
+  --split online
+```
+
+After training both U and V residual models, visualize corrected wind speed and
+direction maps, representative grid-point time series, and station comparisons:
+
+```bash
+python train/visualize_grid_residual.py \
+  --u-checkpoint checkpoints/grid_residual_u140.pt \
+  --v-checkpoint checkpoints/grid_residual_v140.pt \
+  --split offline \
+  --num-points 40
+```
+
 ## Neural Encoder
 
 The default encoder is now:
@@ -179,8 +284,21 @@ data/nwp/data_grid_offline.mat
 data/nwp/data_grid_online.mat
 ```
 
-Measurement rows are converted to `Z` using the 140m `U,V` columns. NWP maps
-use the channels `[u100, v100, u140, v140, u180, v180]` by default.
+Measurement rows are converted to raw `Y` using the 140m `U,V` columns. In
+`target_mode: residual_nwp`, model target `Z` is `Y - nwp_baseline`. NWP maps use
+the channels `[u100, v100, u140, v140, u180, v180]` by default.
+With `advection_mode: shared_flow_deformation`, the model predicts one physical
+advection displacement `flow_mu=(flow_x, flow_y)` shared by U and V, plus a
+signed component deformation matrix `B`. The transition is built as
+`[[B_UU K, B_UV K], [B_VU K, B_VV K]]`, where `K` is the shared spatial
+advection kernel. In this mode `mu` is still saved as `[flow_x, flow_y,
+flow_x, flow_y]` for backward-compatible plots. The default advection label mode
+remains `simple`, which uses the local NWP 140m wind displacement as the shared
+flow target. `shared_optical_flow` is available only as an experimental pattern
+tracking target; it estimates motion of the NWP U/V field texture, not the air
+parcel velocity, and can be near zero when the wind pattern changes slowly.
+`deformation_label_mode: nwp_gradient` gives `B` a near-identity rotation/shear
+target from local NWP velocity gradients.
 
 The measurement `.mat` files include `LatValue_vec` and `LonValue_vec`, and the
 loader uses them by default for the three station coordinates. You can override

@@ -41,6 +41,9 @@ nwp_channel_names:
   - v140
   - u180
   - v180
+component_specific_mu: false
+advection_mode: shared_flow_deformation
+deformation_scale: 0.3
 
 dt: 1.0
 dt_seconds: 600.0
@@ -65,6 +68,16 @@ rolling_window_size: 24
 batch_size: 1
 steps_per_epoch: 50
 forecast_horizon: 12
+transition_kernel_weight: true
+transition_kernel_weight_init: 0.2
+transition_kernel_weight_min: 0.0
+transition_kernel_weight_max: 1.0
+transition_residual_decay: true
+transition_residual_decay_init: 0.97
+transition_residual_decay_min: 0.0
+transition_residual_decay_max: 1.0
+transition_control: true
+transition_control_scale: 0.5
 
 lr_cnn: 1.0e-4
 lr_heads: 5.0e-4
@@ -74,12 +87,13 @@ weight_decay: 1.0e-4
 grad_clip: 1.0
 
 lambda_adv: 0.1
+lambda_deform: 0.05
 lambda_smooth: 0.001
 lambda_reg: 0.0001
 lambda_multistep: 0.2
-multistep_horizons: [3, 6, 12]
+multistep_horizons: [1, 2, 3, 6, 9, 12]
 multistep_max_origins: 256
-multistep_stages: [joint]
+multistep_stages: [joint, online]
 lambda_anchor: 0.01
 
 offline_epochs_pretrain_adv: 20
@@ -116,6 +130,7 @@ data:
   offline_nwp_path: data/nwp/data_grid_offline.mat
   online_measurement_path: data/measurement/wv_h100_180_online.mat
   online_nwp_path: data/nwp/data_grid_online.mat
+  target_mode: residual_nwp
 
   # Measurement files include LatValue_vec/LonValue_vec and those exact
   # station coordinates are used by default. Set this to false to force
@@ -135,6 +150,10 @@ data:
   #   ASOW6: [lat, lon]
 
   advection_label_mode: simple
+  deformation_label_mode: nwp_gradient
+  deformation_label_clip: 0.3
+  optical_flow_stride: 2
+  optical_flow_ridge: 1.0e-4
   patch_radius: 2
   standardize_x: true
   standardize_z: false

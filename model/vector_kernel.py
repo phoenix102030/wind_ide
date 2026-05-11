@@ -129,9 +129,116 @@ class VectorLagrangianKernel(nn.Module):
             Sigma_seq = Sigma_seq.unsqueeze(0)
             A_seq = A_seq.unsqueeze(0)
 
-        Ms = [
-            self.forward_single(S, mu_seq[t], Sigma_seq[t], A_seq[t])
-            for t in range(mu_seq.shape[0])
-        ]
-        out = torch.stack(Ms, dim=0)
+        if S.shape != (self.n_dim, 2):
+            raise ValueError(f"Expected S shape {(self.n_dim, 2)}, got {tuple(S.shape)}")
+        if mu_seq.ndim != 2 or mu_seq.shape[-1] != 4:
+            raise ValueError("mu_seq must have shape [T,4]")
+        if Sigma_seq.ndim != 3 or Sigma_seq.shape[-2:] != (4, 4):
+            raise ValueError("Sigma_seq must have shape [T,4,4]")
+        if A_seq.ndim != 3 or A_seq.shape[-2:] != (2, 2):
+            raise ValueError("A_seq must have shape [T,2,2]")
+        if not (mu_seq.shape[0] == Sigma_seq.shape[0] == A_seq.shape[0]):
+            raise ValueError("mu_seq, Sigma_seq, and A_seq must have matching time dimension")
+
+        S = S.to(device=mu_seq.device, dtype=mu_seq.dtype)
+        Es = self.selectors(mu_seq.device, mu_seq.dtype)
+        ell = self.get_ell().to(device=mu_seq.device, dtype=mu_seq.dtype)
+        gamma = self.gamma_value(mu_seq.device, mu_seq.dtype)
+        eye2 = torch.eye(2, device=mu_seq.device, dtype=mu_seq.dtype)
+        H = S[:, None, :] - S[None, :, :]
+        n_pairs = self.n_dim * self.n_dim
+
+        row_blocks = []
+        for i in range(2):
+            col_blocks = []
+            for j in range(2):
+                B = self.dt * (Es[i] - gamma * Es[j])
+                shift = mu_seq @ B.T
+                B_sigma = torch.matmul(B.unsqueeze(0), Sigma_seq)
+                D = ell[i, j].pow(2) * eye2 + 2.0 * torch.matmul(B_sigma, B.T)
+                D = D + self.jitter * eye2
+                L = safe_cholesky(D)
+
+                H_prime = H.unsqueeze(0) - shift[:, None, None, :]
+                flat = H_prime.reshape(mu_seq.shape[0], n_pairs, 2)
+                alpha = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
+                maha = (flat * alpha).sum(dim=-1).reshape(mu_seq.shape[0], self.n_dim, self.n_dim)
+                logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
+                K = torch.exp(-maha - 0.5 * logdet[:, None, None])
+                col_blocks.append(A_seq[:, i, j, None, None] * K)
+            row_blocks.append(torch.cat(col_blocks, dim=2))
+
+        out = torch.cat(row_blocks, dim=1)
+        if self.row_normalize:
+            out = out / out.sum(dim=2, keepdim=True).clamp_min(1.0e-8)
+        if self.use_spectral_scaling:
+            eigvals = torch.linalg.eigvals(out)
+            rho = eigvals.abs().amax(dim=-1).real
+            scale = torch.clamp(rho / self.spectral_radius, min=1.0)
+            out = out / scale[:, None, None]
+        return out[0] if single else out
+
+    def forward_shared_flow(
+        self,
+        S: Tensor,
+        flow_mu_seq: Tensor,
+        flow_Sigma_seq: Tensor,
+        B_seq: Tensor,
+    ) -> Tensor:
+        """Transition matrix from a shared 2D flow and signed component deformation.
+
+        The spatial kernel is shared by U and V. Component-specific behavior is
+        represented by ``B_seq`` in block form:
+        ``[[B_UU K, B_UV K], [B_VU K, B_VV K]]``.
+        """
+        single = flow_mu_seq.ndim == 1
+        if single:
+            flow_mu_seq = flow_mu_seq.unsqueeze(0)
+            flow_Sigma_seq = flow_Sigma_seq.unsqueeze(0)
+            B_seq = B_seq.unsqueeze(0)
+
+        if S.shape != (self.n_dim, 2):
+            raise ValueError(f"Expected S shape {(self.n_dim, 2)}, got {tuple(S.shape)}")
+        if flow_mu_seq.ndim != 2 or flow_mu_seq.shape[-1] != 2:
+            raise ValueError("flow_mu_seq must have shape [T,2]")
+        if flow_Sigma_seq.ndim != 3 or flow_Sigma_seq.shape[-2:] != (2, 2):
+            raise ValueError("flow_Sigma_seq must have shape [T,2,2]")
+        if B_seq.ndim != 3 or B_seq.shape[-2:] != (2, 2):
+            raise ValueError("B_seq must have shape [T,2,2]")
+        if not (flow_mu_seq.shape[0] == flow_Sigma_seq.shape[0] == B_seq.shape[0]):
+            raise ValueError("flow_mu_seq, flow_Sigma_seq, and B_seq must have matching time dimension")
+
+        S = S.to(device=flow_mu_seq.device, dtype=flow_mu_seq.dtype)
+        eye2 = torch.eye(2, device=flow_mu_seq.device, dtype=flow_mu_seq.dtype)
+        ell = self.get_ell().to(device=flow_mu_seq.device, dtype=flow_mu_seq.dtype).mean()
+        H = S[:, None, :] - S[None, :, :]
+        n_pairs = self.n_dim * self.n_dim
+
+        shift = self.dt * flow_mu_seq
+        D = ell.pow(2) * eye2 + 2.0 * flow_Sigma_seq
+        D = D + self.jitter * eye2
+        L = safe_cholesky(D)
+
+        H_prime = H.unsqueeze(0) - shift[:, None, None, :]
+        flat = H_prime.reshape(flow_mu_seq.shape[0], n_pairs, 2)
+        alpha = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
+        maha = (flat * alpha).sum(dim=-1).reshape(flow_mu_seq.shape[0], self.n_dim, self.n_dim)
+        logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
+        K = torch.exp(-maha - 0.5 * logdet[:, None, None])
+        if self.row_normalize:
+            K = K / K.sum(dim=2, keepdim=True).clamp_min(1.0e-8)
+
+        row_blocks = []
+        for i in range(2):
+            col_blocks = []
+            for j in range(2):
+                col_blocks.append(B_seq[:, i, j, None, None] * K)
+            row_blocks.append(torch.cat(col_blocks, dim=2))
+        out = torch.cat(row_blocks, dim=1)
+
+        if self.use_spectral_scaling:
+            eigvals = torch.linalg.eigvals(out)
+            rho = eigvals.abs().amax(dim=-1).real
+            scale = torch.clamp(rho / self.spectral_radius, min=1.0)
+            out = out / scale[:, None, None]
         return out[0] if single else out

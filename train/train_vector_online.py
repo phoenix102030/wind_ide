@@ -75,12 +75,14 @@ def window_tensors(
     start: int,
     end: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     x = torch.from_numpy(data["X"][start:end]).to(device)
     z = torch.from_numpy(data["Z"][start:end]).to(device)
     v_star = data["V_star"]
     v = torch.from_numpy(v_star[start:end]).to(device) if v_star is not None else None
-    return x, z, v
+    B_star = data.get("B_star")
+    B = torch.from_numpy(B_star[start:end]).to(device) if B_star is not None else None
+    return x, z, v, B
 
 
 def evaluate_window_loss(
@@ -96,12 +98,13 @@ def evaluate_window_loss(
         return {}
     model.eval()
     with torch.no_grad():
-        x, z, v_star = window_tensors(data, start, end, device)
+        x, z, v_star, B_star = window_tensors(data, start, end, device)
         losses = model.training_losses(
             x=x,
             z=z,
             coords=coords,
             v_star=v_star,
+            B_star=B_star,
             **training_loss_kwargs(config, "online"),
         )
     return {
@@ -128,6 +131,11 @@ def main() -> None:
     parser.add_argument("--device", default=None, help="Override config device: auto, cpu, mps, cuda, cuda:0.")
     parser.add_argument("--limit", type=int, default=None, help="Optional online time limit.")
     parser.add_argument("--no-update-ell", action="store_true")
+    parser.add_argument("--online-window-size", type=int, default=None, help="Override online rolling train window size.")
+    parser.add_argument("--online-update-every", type=int, default=None, help="Override online update stride.")
+    parser.add_argument("--online-steps", type=int, default=None, help="Override gradient steps per online update.")
+    parser.add_argument("--online-validation-every-updates", type=int, default=None, help="Override validation frequency; 0 disables validation.")
+    parser.add_argument("--max-updates", type=int, default=None, help="Stop after this many online updates.")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -148,7 +156,11 @@ def main() -> None:
     checkpoint = torch.load(ckpt_path, map_location=device)
 
     model = build_model(config).to(device)
-    model.load_state_dict(checkpoint["model_state"])
+    missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+    if missing:
+        print(f"Initialized new online parameters not found in checkpoint: {missing}")
+    if unexpected:
+        print(f"Ignored checkpoint parameters not used by this config: {unexpected}")
     configure_online_trainable(model, update_ell=not args.no_update_ell)
     anchor = {name: param.detach().cpu().clone() for name, param in trainable_named_parameters(model).items()}
     optimizer = build_online_optimizer(model, config)
@@ -156,11 +168,15 @@ def main() -> None:
     data = load_vector_dataset(config, split="online", time_limit=args.limit)
 
     coords = torch.from_numpy(data["coords"]).to(device)
-    window_size = int(config.get("online_window_size", 168))
-    update_every = int(config.get("online_update_every", 6))
-    online_steps = int(config.get("online_steps", 10))
+    window_size = int(args.online_window_size or config.get("online_window_size", 168))
+    update_every = int(args.online_update_every or config.get("online_update_every", 6))
+    online_steps = int(args.online_steps or config.get("online_steps", 10))
     online_val_window = int(config.get("online_validation_window_size", window_size))
-    online_val_every = int(config.get("online_validation_every_updates", 10))
+    online_val_every = int(
+        config.get("online_validation_every_updates", 10)
+        if args.online_validation_every_updates is None
+        else args.online_validation_every_updates
+    )
     online_val_gap = int(config.get("online_validation_gap", 0))
     online_monitor_metric = str(config.get("online_checkpoint_metric", "val_loss_kf"))
     online_early_stop_patience = int(config.get("online_early_stop_patience", 0))
@@ -181,16 +197,19 @@ def main() -> None:
     )
 
     for update_idx, end in enumerate(range(window_size, T + 1, update_every), start=1):
+        if args.max_updates is not None and update_idx > args.max_updates:
+            break
         start = end - window_size
         model.train()
         for _ in range(online_steps):
-            x, z, v_star = window_tensors(data, start, end, device)
+            x, z, v_star, B_star = window_tensors(data, start, end, device)
             optimizer.zero_grad(set_to_none=True)
             losses = model.training_losses(
                 x=x,
                 z=z,
                 coords=coords,
                 v_star=v_star,
+                B_star=B_star,
                 **training_loss_kwargs(config, "online"),
             )
             current = trainable_named_parameters(model)
@@ -207,6 +226,7 @@ def main() -> None:
             "loss_forecast": float(losses["loss_forecast"].detach().cpu()),
             "loss_kf": float(losses["loss_kf"].detach().cpu()),
             "loss_adv": float(losses["loss_adv"].detach().cpu()),
+            "loss_deform": float(losses["loss_deform"].detach().cpu()),
             "loss_smooth": float(losses["loss_smooth"].detach().cpu()),
             "loss_reg": float(losses["loss_reg"].detach().cpu()),
             "loss_multistep": float(losses["loss_multistep"].detach().cpu()),

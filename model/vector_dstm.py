@@ -56,6 +56,7 @@ class VectorDSTM(nn.Module):
         self,
         z: Tensor,
         M_seq: Tensor,
+        control_seq: Optional[Tensor] = None,
         H: Optional[Tensor] = None,
         y0: Optional[Tensor] = None,
         P0: Optional[Tensor] = None,
@@ -72,6 +73,10 @@ class VectorDSTM(nn.Module):
             raise ValueError("M_seq and z must have matching time dimension")
         if M_seq.shape[-2:] != (self.state_dim, self.state_dim):
             raise ValueError(f"M_seq must have trailing shape {(self.state_dim, self.state_dim)}")
+        if control_seq is not None:
+            if control_seq.shape != (T, self.state_dim):
+                raise ValueError(f"Expected control_seq shape {(T, self.state_dim)}, got {tuple(control_seq.shape)}")
+            control_seq = control_seq.to(device=z.device, dtype=z.dtype)
 
         dtype = z.dtype
         device = z.device
@@ -98,7 +103,8 @@ class VectorDSTM(nn.Module):
 
         for t in range(T):
             M_t = M_seq[t].to(device=device, dtype=dtype)
-            pred_mean = M_t @ mean
+            control_t = control_seq[t] if control_seq is not None else 0.0
+            pred_mean = M_t @ mean + control_t
             pred_cov = M_t @ cov @ M_t.T + Q
             pred_cov = 0.5 * (pred_cov + pred_cov.T)
 
@@ -159,41 +165,86 @@ class VectorDSTM(nn.Module):
             )
         return result
 
-    def kalman_nll(self, z: Tensor, M_seq: Tensor, H: Optional[Tensor] = None) -> Tensor:
-        return self.kalman_filter(z=z, M_seq=M_seq, H=H, reduction="mean")["loss"]
+    def kalman_nll(
+        self,
+        z: Tensor,
+        M_seq: Tensor,
+        control_seq: Optional[Tensor] = None,
+        H: Optional[Tensor] = None,
+    ) -> Tensor:
+        return self.kalman_filter(
+            z=z,
+            M_seq=M_seq,
+            control_seq=control_seq,
+            H=H,
+            reduction="mean",
+        )["loss"]
 
-    def get_filter_dist(self, z: Tensor, M_seq: Tensor, H: Optional[Tensor] = None) -> dict[str, Tensor]:
-        return self.kalman_filter(z=z, M_seq=M_seq, H=H, return_history=True)
+    def get_filter_dist(
+        self,
+        z: Tensor,
+        M_seq: Tensor,
+        control_seq: Optional[Tensor] = None,
+        H: Optional[Tensor] = None,
+    ) -> dict[str, Tensor]:
+        return self.kalman_filter(
+            z=z,
+            M_seq=M_seq,
+            control_seq=control_seq,
+            H=H,
+            return_history=True,
+        )
 
     def get_forecast_dist(
         self,
         filter_mean: Tensor,
         filter_cov: Tensor,
         future_M: Tensor,
+        future_control: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
         Q = self.process_covariance().to(device=filter_mean.device, dtype=filter_mean.dtype)
-        mean = future_M @ filter_mean
+        control = 0.0 if future_control is None else future_control.to(
+            device=filter_mean.device,
+            dtype=filter_mean.dtype,
+        )
+        mean = future_M @ filter_mean + control
         cov = future_M @ filter_cov @ future_M.T + Q
         return mean, 0.5 * (cov + cov.T)
 
-    def torch_get_kf(self, z: Tensor, M_seq: Tensor, H: Optional[Tensor] = None) -> dict[str, Tensor]:
-        return self.get_filter_dist(z=z, M_seq=M_seq, H=H)
+    def torch_get_kf(
+        self,
+        z: Tensor,
+        M_seq: Tensor,
+        control_seq: Optional[Tensor] = None,
+        H: Optional[Tensor] = None,
+    ) -> dict[str, Tensor]:
+        return self.get_filter_dist(z=z, M_seq=M_seq, control_seq=control_seq, H=H)
 
-    def torch_e_step(self, z: Tensor, M_seq: Tensor, H: Optional[Tensor] = None) -> dict[str, Tensor]:
-        return self.get_filter_dist(z=z, M_seq=M_seq, H=H)
+    def torch_e_step(
+        self,
+        z: Tensor,
+        M_seq: Tensor,
+        control_seq: Optional[Tensor] = None,
+        H: Optional[Tensor] = None,
+    ) -> dict[str, Tensor]:
+        return self.get_filter_dist(z=z, M_seq=M_seq, control_seq=control_seq, H=H)
 
     def torch_multi_step_forecast(
         self,
         filter_mean: Tensor,
         filter_cov: Tensor,
         future_M_seq: Tensor,
+        future_control_seq: Optional[Tensor] = None,
     ) -> dict[str, Tensor]:
         means = []
         covs = []
         mean = filter_mean
         cov = filter_cov
-        for M_t in future_M_seq:
-            mean, cov = self.get_forecast_dist(mean, cov, M_t)
+        if future_control_seq is not None and future_control_seq.shape[0] != future_M_seq.shape[0]:
+            raise ValueError("future_control_seq and future_M_seq must have matching time dimension")
+        for step, M_t in enumerate(future_M_seq):
+            control_t = None if future_control_seq is None else future_control_seq[step]
+            mean, cov = self.get_forecast_dist(mean, cov, M_t, future_control=control_t)
             means.append(mean)
             covs.append(cov)
         return {"means": torch.stack(means), "covs": torch.stack(covs)}
@@ -217,6 +268,9 @@ class VectorMIDE(nn.Module):
         transformer_dropout: float = 0.1,
         transformer_causal: bool = True,
         transformer_max_len: int = 4096,
+        component_specific_mu: bool = False,
+        advection_mode: str = "component",
+        deformation_scale: float = 0.3,
         dt: float = 1.0,
         gamma: float = 0.0,
         row_normalize: bool = True,
@@ -229,6 +283,16 @@ class VectorMIDE(nn.Module):
         q_init: float = 0.2,
         r_init: float = 0.2,
         kalman_jitter: float = 1.0e-5,
+        transition_kernel_weight: bool = False,
+        transition_kernel_weight_init: float = 1.0,
+        transition_kernel_weight_min: float = 0.0,
+        transition_kernel_weight_max: float = 1.0,
+        transition_residual_decay: bool = False,
+        transition_residual_decay_init: float = 1.0,
+        transition_residual_decay_min: float = 0.0,
+        transition_residual_decay_max: float = 1.0,
+        transition_control: bool = False,
+        transition_control_scale: float = 0.0,
     ) -> None:
         super().__init__()
         self.n_sites = n_sites
@@ -246,6 +310,19 @@ class VectorMIDE(nn.Module):
             transformer_dropout=transformer_dropout,
             transformer_causal=transformer_causal,
             transformer_max_len=transformer_max_len,
+            component_specific_mu=component_specific_mu,
+            advection_mode=advection_mode,
+            deformation_scale=deformation_scale,
+            transition_kernel_weight=transition_kernel_weight,
+            transition_kernel_weight_init=transition_kernel_weight_init,
+            transition_kernel_weight_min=transition_kernel_weight_min,
+            transition_kernel_weight_max=transition_kernel_weight_max,
+            transition_residual_decay=transition_residual_decay,
+            transition_residual_decay_init=transition_residual_decay_init,
+            transition_residual_decay_min=transition_residual_decay_min,
+            transition_residual_decay_max=transition_residual_decay_max,
+            transition_control_dim=self.state_dim if transition_control else 0,
+            transition_control_scale=transition_control_scale,
         )
         self.kernel = VectorLagrangianKernel(
             n_dim=n_sites,
@@ -267,15 +344,52 @@ class VectorMIDE(nn.Module):
         )
         self.qr_params = self.dstm.qr_params
 
+    def shape_transition_matrix(self, base_M: Tensor, outputs: dict[str, Tensor]) -> Tensor:
+        M = base_M
+        if "kernel_weight" in outputs:
+            eye = torch.eye(self.state_dim, device=M.device, dtype=M.dtype).unsqueeze(0)
+            weight = outputs["kernel_weight"].to(device=M.device, dtype=M.dtype).view(-1, 1, 1)
+            M = (1.0 - weight) * eye + weight * M
+        if "residual_decay" in outputs:
+            decay = outputs["residual_decay"].to(device=M.device, dtype=M.dtype).view(-1, 1, 1)
+            M = decay * M
+        return M
+
+    @staticmethod
+    def transition_modifier_smoothness(outputs: dict[str, Tensor]) -> Tensor:
+        terms = []
+        for key in ("kernel_weight", "residual_decay", "transition_control"):
+            value = outputs.get(key)
+            if value is not None and value.shape[0] > 1:
+                terms.append((value[1:] - value[:-1]).pow(2).mean())
+        if not terms:
+            return outputs["mu"].new_tensor(0.0)
+        return torch.stack(terms).mean()
+
     def forward(self, x: Tensor, coords: Tensor) -> dict[str, Tensor]:
         outputs = self.net(x)
-        M = self.kernel(coords, outputs["mu"], outputs["Sigma"], outputs["A"])
+        if "flow_mu" in outputs and "flow_Sigma" in outputs and "B" in outputs:
+            base_M = self.kernel.forward_shared_flow(
+                coords,
+                outputs["flow_mu"],
+                outputs["flow_Sigma"],
+                outputs["B"],
+            )
+        else:
+            base_M = self.kernel(coords, outputs["mu"], outputs["Sigma"], outputs["A"])
+        M = self.shape_transition_matrix(base_M, outputs)
+        outputs["M_base"] = base_M
         outputs["M"] = M
         return outputs
 
     def kalman_nll(self, x: Tensor, z: Tensor, coords: Tensor, H: Optional[Tensor] = None) -> Tensor:
         outputs = self.forward(x, coords)
-        return self.dstm.kalman_nll(z=z, M_seq=outputs["M"], H=H)
+        return self.dstm.kalman_nll(
+            z=z,
+            M_seq=outputs["M"],
+            control_seq=outputs.get("transition_control"),
+            H=H,
+        )
 
     def multi_step_forecast_loss(
         self,
@@ -283,6 +397,7 @@ class VectorMIDE(nn.Module):
         M_seq: Tensor,
         filter_means: Tensor,
         horizons: Sequence[int],
+        control_seq: Optional[Tensor] = None,
         H: Optional[Tensor] = None,
         max_origins: int = 0,
     ) -> Tensor:
@@ -313,6 +428,8 @@ class VectorMIDE(nn.Module):
             for step in range(1, h + 1):
                 M_batch = M_seq[origin_idx + step].to(device=z.device, dtype=z.dtype)
                 mean = torch.bmm(M_batch, mean.unsqueeze(-1)).squeeze(-1)
+                if control_seq is not None:
+                    mean = mean + control_seq[origin_idx + step].to(device=z.device, dtype=z.dtype)
 
             pred = mean if H_full is None else mean @ H_full.T
             target = z[origin_idx + h]
@@ -324,14 +441,49 @@ class VectorMIDE(nn.Module):
             return z.new_tensor(0.0)
         return torch.stack(losses).mean()
 
+    @staticmethod
+    def shared_flow_target(v_star: Optional[Tensor]) -> Optional[Tensor]:
+        if v_star is None:
+            return None
+        if v_star.shape[-1] == 2:
+            return v_star
+        if v_star.shape[-1] == 4:
+            return 0.5 * (v_star[..., :2] + v_star[..., 2:])
+        raise ValueError(f"Expected v_star trailing size 2 or 4, got {v_star.shape[-1]}")
+
+    def advection_supervision_loss(
+        self,
+        v_star: Optional[Tensor],
+        outputs: dict[str, Tensor],
+    ) -> Tensor:
+        if "flow_mu" in outputs and "flow_Sigma" in outputs:
+            target = self.shared_flow_target(v_star)
+            return advection_nll_loss(target, outputs["flow_mu"], outputs["flow_Sigma"])
+        return advection_nll_loss(v_star, outputs["mu"], outputs["Sigma"])
+
+    @staticmethod
+    def deformation_supervision_loss(
+        B_star: Optional[Tensor],
+        outputs: dict[str, Tensor],
+    ) -> Tensor:
+        B = outputs.get("B")
+        if B_star is None or B is None:
+            return outputs["mu"].new_tensor(0.0)
+        valid = torch.isfinite(B_star).all(dim=(-1, -2))
+        if valid.sum() == 0:
+            return B.new_tensor(0.0)
+        return (B[valid] - B_star[valid].to(device=B.device, dtype=B.dtype)).pow(2).mean()
+
     def training_losses(
         self,
         x: Tensor,
         z: Tensor,
         coords: Tensor,
         v_star: Optional[Tensor] = None,
+        B_star: Optional[Tensor] = None,
         H: Optional[Tensor] = None,
         lambda_adv: float = 0.1,
+        lambda_deform: float = 0.0,
         lambda_smooth: float = 0.001,
         lambda_reg: float = 0.0001,
         lambda_multistep: float = 0.0,
@@ -344,6 +496,7 @@ class VectorMIDE(nn.Module):
             kf = self.dstm.kalman_filter(
                 z=z,
                 M_seq=outputs["M"],
+                control_seq=outputs.get("transition_control"),
                 H=H,
                 return_history=True,
             )
@@ -353,19 +506,29 @@ class VectorMIDE(nn.Module):
                 M_seq=outputs["M"],
                 filter_means=kf["filter_means"],
                 horizons=multistep_horizons or (),
+                control_seq=outputs.get("transition_control"),
                 H=H,
                 max_origins=multistep_max_origins,
             )
         else:
-            loss_kf = self.dstm.kalman_nll(z=z, M_seq=outputs["M"], H=H)
+            loss_kf = self.dstm.kalman_nll(
+                z=z,
+                M_seq=outputs["M"],
+                control_seq=outputs.get("transition_control"),
+                H=H,
+            )
             loss_multistep = loss_kf.new_tensor(0.0)
-        loss_adv = advection_nll_loss(v_star, outputs["mu"], outputs["Sigma"])
-        loss_smooth = smoothness_loss(outputs["mu"], outputs["A"])
+        loss_adv = self.advection_supervision_loss(v_star, outputs)
+        loss_deform = self.deformation_supervision_loss(B_star, outputs)
+        smooth_mu = outputs.get("flow_mu", outputs["mu"])
+        smooth_matrix = outputs.get("B", outputs["A"])
+        loss_smooth = smoothness_loss(smooth_mu, smooth_matrix) + self.transition_modifier_smoothness(outputs)
         reg_params = list(self.kernel.parameters()) + list(self.qr_params.parameters())
         loss_reg = l2_regularization(reg_params)
         total = (
             loss_kf
             + lambda_adv * loss_adv
+            + lambda_deform * loss_deform
             + lambda_smooth * loss_smooth
             + lambda_reg * loss_reg
             + lambda_multistep * loss_multistep
@@ -376,6 +539,7 @@ class VectorMIDE(nn.Module):
             "loss_forecast": loss_forecast,
             "loss_kf": loss_kf,
             "loss_adv": loss_adv,
+            "loss_deform": loss_deform,
             "loss_smooth": loss_smooth,
             "loss_reg": loss_reg,
             "loss_multistep": loss_multistep,

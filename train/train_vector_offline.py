@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from dataset.vector_data_utils import load_vector_dataset
-from model.covariance import advection_nll_loss, smoothness_loss
+from model.covariance import smoothness_loss
 from model.vector_dstm import VectorMIDE
 
 
@@ -85,6 +85,9 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         transformer_dropout=float(config.get("transformer_dropout", 0.1)),
         transformer_causal=bool(config.get("transformer_causal", True)),
         transformer_max_len=int(config.get("transformer_max_len", 4096)),
+        component_specific_mu=bool(config.get("component_specific_mu", False)),
+        advection_mode=str(config.get("advection_mode", "component")),
+        deformation_scale=float(config.get("deformation_scale", 0.3)),
         dt=float(config.get("dt", 1.0)),
         gamma=gamma,
         row_normalize=bool(config.get("row_normalize", True)),
@@ -97,6 +100,16 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         q_init=float(config.get("q_init", 0.2)),
         r_init=float(config.get("r_init", 0.2)),
         kalman_jitter=float(config.get("kalman_jitter", 1.0e-5)),
+        transition_kernel_weight=bool(config.get("transition_kernel_weight", False)),
+        transition_kernel_weight_init=float(config.get("transition_kernel_weight_init", 1.0)),
+        transition_kernel_weight_min=float(config.get("transition_kernel_weight_min", 0.0)),
+        transition_kernel_weight_max=float(config.get("transition_kernel_weight_max", 1.0)),
+        transition_residual_decay=bool(config.get("transition_residual_decay", False)),
+        transition_residual_decay_init=float(config.get("transition_residual_decay_init", 1.0)),
+        transition_residual_decay_min=float(config.get("transition_residual_decay_min", 0.0)),
+        transition_residual_decay_max=float(config.get("transition_residual_decay_max", 1.0)),
+        transition_control=bool(config.get("transition_control", False)),
+        transition_control_scale=float(config.get("transition_control_scale", 0.0)),
     )
 
 
@@ -128,7 +141,7 @@ def sample_window(
     arrays: dict[str, np.ndarray | None],
     window_size: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     T = arrays["X"].shape[0]
     if T <= window_size:
         start = 0
@@ -140,7 +153,9 @@ def sample_window(
     z = torch.from_numpy(arrays["Z"][start:end]).to(device)
     v_star_np = arrays.get("V_star")
     v_star = torch.from_numpy(v_star_np[start:end]).to(device) if v_star_np is not None else None
-    return x, z, v_star
+    B_star_np = arrays.get("B_star")
+    B_star = torch.from_numpy(B_star_np[start:end]).to(device) if B_star_np is not None else None
+    return x, z, v_star, B_star
 
 
 def slice_arrays(
@@ -216,6 +231,7 @@ def lambda_multistep_for_stage(config: dict[str, Any], stage: str) -> float:
 def training_loss_kwargs(config: dict[str, Any], stage: str) -> dict[str, Any]:
     return {
         "lambda_adv": float(config.get("lambda_adv", 0.1)),
+        "lambda_deform": float(config.get("lambda_deform", 0.0)),
         "lambda_smooth": float(config.get("lambda_smooth", 0.001)),
         "lambda_reg": float(config.get("lambda_reg", 0.0001)),
         "lambda_multistep": lambda_multistep_for_stage(config, stage),
@@ -245,11 +261,14 @@ def validation_losses(
             z = torch.from_numpy(val_arrays["Z"][start:end]).to(device)
             v_star_np = val_arrays.get("V_star")
             v_star = torch.from_numpy(v_star_np[start:end]).to(device) if v_star_np is not None else None
+            B_star_np = val_arrays.get("B_star")
+            B_star = torch.from_numpy(B_star_np[start:end]).to(device) if B_star_np is not None else None
             losses = model.training_losses(
                 x=x,
                 z=z,
                 coords=coords,
                 v_star=v_star,
+                B_star=B_star,
                 **training_loss_kwargs(config, "joint"),
             )
             for key, value in losses.items():
@@ -277,17 +296,29 @@ def run_epoch(
     sums: dict[str, float] = {}
 
     for _ in range(steps):
-        x, z, v_star = sample_window(arrays, window_size, device)
+        x, z, v_star, B_star = sample_window(arrays, window_size, device)
         optimizer.zero_grad(set_to_none=True)
 
         if stage == "adv":
             if v_star is None:
                 continue
             outputs = model.net(x)
-            loss_adv = advection_nll_loss(v_star, outputs["mu"], outputs["Sigma"])
-            loss_smooth = smoothness_loss(outputs["mu"], outputs["A"])
-            loss = loss_adv + float(config.get("lambda_smooth", 0.001)) * loss_smooth
-            losses = {"loss": loss, "loss_adv": loss_adv, "loss_smooth": loss_smooth}
+            loss_adv = model.advection_supervision_loss(v_star, outputs)
+            loss_deform = model.deformation_supervision_loss(B_star, outputs)
+            smooth_mu = outputs.get("flow_mu", outputs["mu"])
+            smooth_matrix = outputs.get("B", outputs["A"])
+            loss_smooth = smoothness_loss(smooth_mu, smooth_matrix)
+            loss = (
+                loss_adv
+                + float(config.get("lambda_deform", 0.0)) * loss_deform
+                + float(config.get("lambda_smooth", 0.001)) * loss_smooth
+            )
+            losses = {
+                "loss": loss,
+                "loss_adv": loss_adv,
+                "loss_deform": loss_deform,
+                "loss_smooth": loss_smooth,
+            }
         elif stage == "kf":
             losses = model.training_losses(
                 x=x,
@@ -308,6 +339,7 @@ def run_epoch(
                 z=z,
                 coords=coords,
                 v_star=v_star,
+                B_star=B_star,
                 **training_loss_kwargs(config, stage),
             )
             loss = losses["loss"]
@@ -371,7 +403,7 @@ def main() -> None:
 
     data = load_vector_dataset(config, split="offline", time_limit=args.limit)
 
-    arrays = {"X": data["X"], "Z": data["Z"], "V_star": data["V_star"]}
+    arrays = {"X": data["X"], "Z": data["Z"], "V_star": data["V_star"], "B_star": data.get("B_star")}
     train_arrays, val_arrays, val_starts = split_train_validation(arrays, config)
     if val_arrays is not None:
         print(
@@ -386,13 +418,14 @@ def main() -> None:
     optimizer = build_optimizer(model, config)
 
     if args.dry_run:
-        x, z, v_star = sample_window(arrays, min(16, arrays["X"].shape[0]), device)
+        x, z, v_star, B_star = sample_window(arrays, min(16, arrays["X"].shape[0]), device)
         with torch.enable_grad():
             losses = model.training_losses(
                 x=x,
                 z=z,
                 coords=coords,
                 v_star=v_star,
+                B_star=B_star,
                 **training_loss_kwargs(config, "joint"),
             )
         print({key: float(value.detach().cpu()) for key, value in losses.items() if key.startswith("loss")})

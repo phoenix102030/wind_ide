@@ -38,6 +38,78 @@ def test_advection_net_cnn_mode_still_works():
     assert out["A"].shape == (3, 2, 2)
 
 
+def test_component_specific_mu_uses_shared_full_input_with_separate_heads():
+    x = torch.randn(3, 6, 40, 40)
+    net = VectorAdvectionNet(
+        in_channels=6,
+        hidden_dim=32,
+        network_type="cnn",
+        component_specific_mu=True,
+    )
+    out = net(x)
+
+    assert out["mu"].shape == (3, 4)
+    assert net.mu_head is None
+    assert net.mu_u_head is not None
+    assert net.mu_v_head is not None
+    assert net.mu_u_head is not net.mu_v_head
+    assert net.mu_u_head.in_features == net.mu_v_head.in_features
+
+
+def test_shared_flow_deformation_outputs_and_transition_are_finite():
+    T = 4
+    x = torch.randn(T, 6, 40, 40)
+    coords = torch.tensor([[0.0, 0.0], [3.0, 0.5], [1.5, 2.0]])
+    model = VectorMIDE(
+        n_sites=3,
+        in_channels=6,
+        hidden_dim=32,
+        network_type="cnn",
+        advection_mode="shared_flow_deformation",
+        deformation_scale=0.3,
+    )
+    out = model(x, coords)
+
+    assert out["flow_mu"].shape == (T, 2)
+    assert out["flow_Sigma"].shape == (T, 2, 2)
+    assert out["B"].shape == (T, 2, 2)
+    assert torch.allclose(out["mu"][:, :2], out["mu"][:, 2:], atol=1.0e-6)
+    assert torch.all(torch.linalg.eigvalsh(out["flow_Sigma"]) > 0)
+    assert torch.allclose(
+        out["B"],
+        torch.eye(2).expand(T, 2, 2),
+        atol=1.0e-6,
+    )
+    assert out["M"].shape == (T, 6, 6)
+    assert torch.isfinite(out["M"]).all()
+    assert torch.allclose(out["M_base"].sum(dim=-1), torch.ones(T, 6), atol=1.0e-4)
+
+
+def test_advection_net_transition_heads_are_bounded_and_zero_control_init():
+    x = torch.randn(3, 6, 40, 40)
+    net = VectorAdvectionNet(
+        in_channels=6,
+        hidden_dim=32,
+        network_type="cnn",
+        transition_kernel_weight=True,
+        transition_kernel_weight_init=0.2,
+        transition_residual_decay=True,
+        transition_residual_decay_init=0.97,
+        transition_control_dim=6,
+        transition_control_scale=0.5,
+    )
+    out = net(x)
+
+    assert out["kernel_weight"].shape == (3, 1)
+    assert out["residual_decay"].shape == (3, 1)
+    assert out["transition_control"].shape == (3, 6)
+    assert torch.all((0.0 <= out["kernel_weight"]) & (out["kernel_weight"] <= 1.0))
+    assert torch.all((0.0 <= out["residual_decay"]) & (out["residual_decay"] <= 1.0))
+    assert torch.allclose(out["kernel_weight"], torch.full((3, 1), 0.2), atol=1.0e-5)
+    assert torch.allclose(out["residual_decay"], torch.full((3, 1), 0.97), atol=1.0e-5)
+    assert torch.allclose(out["transition_control"], torch.zeros(3, 6), atol=1.0e-6)
+
+
 def test_vector_kernel_transition_shape_and_row_sums():
     T = 4
     coords = torch.tensor([[0.0, 0.0], [3.0, 0.5], [1.5, 2.0]])
@@ -54,6 +126,24 @@ def test_vector_kernel_transition_shape_and_row_sums():
     assert torch.all(M >= 0)
 
 
+def test_vector_kernel_vectorized_matches_single_step():
+    T = 5
+    coords = torch.tensor([[0.0, 0.0], [3.0, 0.5], [1.5, 2.0]])
+    mu = torch.randn(T, 4) * 0.1
+    raw = torch.randn(T, 4, 4)
+    sigma = raw @ raw.transpose(-1, -2) + 0.05 * torch.eye(4)
+    A = torch.softmax(torch.randn(T, 2, 2), dim=-1)
+
+    kernel = VectorLagrangianKernel(n_dim=3, dt=1.0, gamma=0.0)
+    vectorized = kernel(coords, mu, sigma, A)
+    stepwise = torch.stack(
+        [kernel.forward_single(coords, mu[t], sigma[t], A[t]) for t in range(T)],
+        dim=0,
+    )
+
+    assert torch.allclose(vectorized, stepwise, atol=1.0e-6, rtol=1.0e-5)
+
+
 def test_vector_mide_kalman_loss_is_finite():
     T = 6
     x = torch.randn(T, 6, 40, 40)
@@ -66,6 +156,40 @@ def test_vector_mide_kalman_loss_is_finite():
     assert torch.isfinite(losses["loss"])
     assert torch.isfinite(losses["loss_kf"])
     assert losses["M"].shape == (T, 6, 6)
+
+
+def test_vector_mide_transition_modifiers_and_control_loss_are_finite():
+    T = 6
+    x = torch.randn(T, 6, 40, 40)
+    z = torch.randn(T, 6)
+    coords = torch.tensor([[0.0, 0.0], [3.0, 0.5], [1.5, 2.0]])
+
+    model = VectorMIDE(
+        n_sites=3,
+        in_channels=6,
+        hidden_dim=32,
+        network_type="cnn",
+        transition_kernel_weight=True,
+        transition_kernel_weight_init=0.2,
+        transition_residual_decay=True,
+        transition_residual_decay_init=0.97,
+        transition_control=True,
+        transition_control_scale=0.5,
+    )
+    losses = model.training_losses(
+        x=x,
+        z=z,
+        coords=coords,
+        v_star=torch.randn(T, 4) * 0.1,
+        lambda_multistep=0.1,
+        multistep_horizons=[1, 3],
+    )
+
+    assert torch.isfinite(losses["loss"])
+    assert losses["M"].shape == (T, 6, 6)
+    assert losses["transition_control"].shape == (T, 6)
+    assert torch.allclose(losses["M"].sum(dim=-1), torch.full((T, 6), 0.97), atol=1.0e-4)
+    assert torch.allclose(losses["M_base"].sum(dim=-1), torch.ones(T, 6), atol=1.0e-4)
 
 
 def test_measurement_columns_build_140m_state_order():

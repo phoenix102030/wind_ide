@@ -257,6 +257,55 @@ def coords_from_grid_indices(
     return coords
 
 
+def nearest_grid_indices_from_station_latlon(
+    lat_grid: np.ndarray,
+    lon_grid: np.ndarray,
+    station_lat: np.ndarray,
+    station_lon: np.ndarray,
+) -> list[list[int]]:
+    """Find the nearest NWP grid point for each measurement station."""
+    lat_grid = np.asarray(lat_grid, dtype=np.float64)
+    lon_grid = np.asarray(lon_grid, dtype=np.float64)
+    station_lat = np.asarray(station_lat, dtype=np.float64).reshape(-1)
+    station_lon = np.asarray(station_lon, dtype=np.float64).reshape(-1)
+    if station_lat.shape[0] != 3 or station_lon.shape[0] != 3:
+        raise ValueError("Expected exactly three station lat/lon values")
+
+    indices: list[list[int]] = []
+    for lat, lon in zip(station_lat, station_lon):
+        lat0 = np.deg2rad(float(lat))
+        dy = (lat_grid - lat) * 111.0
+        dx = (lon_grid - lon) * 111.0 * np.cos(lat0)
+        flat_index = int(np.nanargmin(dx * dx + dy * dy))
+        i, j = np.unravel_index(flat_index, lat_grid.shape)
+        indices.append([int(i), int(j)])
+    return indices
+
+
+def build_nwp_station_baseline(
+    u140: np.ndarray,
+    v140: np.ndarray,
+    station_grid_indices: list[list[int]] | tuple[tuple[int, int], ...],
+) -> np.ndarray:
+    """Extract nearest-grid 140m NWP baseline in state order [U1,U2,U3,V1,V2,V3]."""
+    u140 = np.asarray(u140)
+    v140 = np.asarray(v140)
+    if u140.shape != v140.shape or u140.ndim != 3:
+        raise ValueError("u140 and v140 must both have shape [H,W,T]")
+
+    h, w, _ = u140.shape
+    u_series = []
+    v_series = []
+    for i, j in station_grid_indices:
+        ii = int(np.clip(i, 0, h - 1))
+        jj = int(np.clip(j, 0, w - 1))
+        u_series.append(u140[ii, jj])
+        v_series.append(v140[ii, jj])
+    if len(u_series) != 3:
+        raise ValueError("station_grid_indices must contain exactly three [row, col] pairs")
+    return np.stack([*u_series, *v_series], axis=1).astype(np.float32, copy=False)
+
+
 def standardize_maps(
     x: np.ndarray,
     standardizer: Optional[Standardizer] = None,
@@ -291,6 +340,21 @@ def _patch_mean(field: np.ndarray, center: tuple[int, int], radius: int) -> np.n
     i0, i1 = max(i - radius, 0), min(i + radius + 1, h)
     j0, j1 = max(j - radius, 0), min(j + radius + 1, w)
     return np.nanmean(field[i0:i1, j0:j1], axis=(0, 1))
+
+
+def _patch_mean_2d(field: np.ndarray, center: tuple[int, int], radius: int) -> float:
+    h, w = field.shape
+    i, j = center
+    i0, i1 = max(i - radius, 0), min(i + radius + 1, h)
+    j0, j1 = max(j - radius, 0), min(j + radius + 1, w)
+    return float(np.nanmean(field[i0:i1, j0:j1]))
+
+
+def _latlon_grid_spacing_km(lat_grid: np.ndarray, lon_grid: np.ndarray) -> tuple[float, float]:
+    xy = latlon_to_xy_km(lat_grid, lon_grid)
+    dx = float(np.nanmean(np.abs(np.diff(xy[..., 0], axis=1))))
+    dy = float(np.nanmean(np.abs(np.diff(xy[..., 1], axis=0))))
+    return max(dx, 1.0e-6), max(dy, 1.0e-6)
 
 
 def build_simple_advection_labels(
@@ -432,6 +496,102 @@ def build_optical_flow_advection_labels_from_uv(
     return labels
 
 
+def build_shared_optical_flow_advection_labels_from_uv(
+    u140: np.ndarray,
+    v140: np.ndarray,
+    lat_grid: np.ndarray,
+    lon_grid: np.ndarray,
+    dt_seconds: float = 600.0,
+    stride: int = 2,
+    ridge: float = 1.0e-4,
+) -> np.ndarray:
+    """Estimate one shared 2D flow from both NWP U and V optical-flow equations."""
+    dx, dy = _latlon_grid_spacing_km(lat_grid, lon_grid)
+    u = u140.astype(np.float64)
+    v = v140.astype(np.float64)
+    T = u.shape[2]
+    labels = np.zeros((T, 4), dtype=np.float32)
+
+    for t in range(T - 1):
+        du_dt = (u[..., t + 1] - u[..., t]) / dt_seconds
+        dv_dt = (v[..., t + 1] - v[..., t]) / dt_seconds
+        du_dy, du_dx = np.gradient(u[..., t], dy, dx)
+        dv_dy, dv_dx = np.gradient(v[..., t], dy, dx)
+
+        A_u = np.stack([du_dx[::stride, ::stride].ravel(), du_dy[::stride, ::stride].ravel()], axis=1)
+        A_v = np.stack([dv_dx[::stride, ::stride].ravel(), dv_dy[::stride, ::stride].ravel()], axis=1)
+        A = np.concatenate([A_u, A_v], axis=0)
+        b = np.concatenate(
+            [
+                -du_dt[::stride, ::stride].ravel(),
+                -dv_dt[::stride, ::stride].ravel(),
+            ],
+            axis=0,
+        )
+        valid = np.isfinite(A).all(axis=1) & np.isfinite(b)
+        if valid.sum() >= 2:
+            lhs = A[valid].T @ A[valid] + ridge * np.eye(2)
+            rhs = A[valid].T @ b[valid]
+            flow = np.linalg.solve(lhs, rhs).astype(np.float32) * dt_seconds
+            labels[t] = [flow[0], flow[1], flow[0], flow[1]]
+    if T > 1:
+        labels[-1] = labels[-2]
+    return labels
+
+
+def build_deformation_labels_from_uv(
+    u140: np.ndarray,
+    v140: np.ndarray,
+    lat_grid: np.ndarray,
+    lon_grid: np.ndarray,
+    station_grid_indices: Optional[list[list[int]]] = None,
+    dt_seconds: float = 600.0,
+    patch_radius: int = 2,
+    delta_clip: float = 0.3,
+) -> np.ndarray:
+    """Build near-identity 2x2 deformation labels from local NWP velocity gradients."""
+    dx, dy = _latlon_grid_spacing_km(lat_grid, lon_grid)
+    u = u140.astype(np.float64)
+    v = v140.astype(np.float64)
+    T = u.shape[2]
+    labels = np.zeros((T, 2, 2), dtype=np.float32)
+    identity = np.eye(2, dtype=np.float32)
+    scale = dt_seconds / 1000.0
+
+    for t in range(T):
+        du_dy, du_dx = np.gradient(u[..., t], dy, dx)
+        dv_dy, dv_dx = np.gradient(v[..., t], dy, dx)
+        if station_grid_indices:
+            grads = []
+            for center in station_grid_indices:
+                center_tuple = (int(center[0]), int(center[1]))
+                grads.append(
+                    [
+                        _patch_mean_2d(du_dx, center_tuple, patch_radius),
+                        _patch_mean_2d(du_dy, center_tuple, patch_radius),
+                        _patch_mean_2d(dv_dx, center_tuple, patch_radius),
+                        _patch_mean_2d(dv_dy, center_tuple, patch_radius),
+                    ]
+                )
+            grad = np.nanmean(np.asarray(grads, dtype=np.float64), axis=0)
+        else:
+            grad = np.asarray(
+                [
+                    np.nanmean(du_dx),
+                    np.nanmean(du_dy),
+                    np.nanmean(dv_dx),
+                    np.nanmean(dv_dy),
+                ],
+                dtype=np.float64,
+            )
+
+        delta = scale * grad.reshape(2, 2)
+        if delta_clip > 0.0:
+            delta = np.clip(delta, -delta_clip, delta_clip)
+        labels[t] = identity + delta.astype(np.float32)
+    return labels
+
+
 def load_vector_dataset(
     config: dict[str, Any],
     split: str = "offline",
@@ -463,56 +623,125 @@ def load_vector_dataset(
     T = min(x.shape[0], z.shape[0])
     x = x[:T]
     z = z[:T]
+    u140, v140 = load_nwp_uv140(nwp_path, time_limit=time_limit)
+    u140 = u140[:, :, :T]
+    v140 = v140[:, :, :T]
 
     if data_cfg.get("station_latlon"):
-        coords = coords_from_station_latlon(data_cfg["station_latlon"])
+        station_latlon_cfg = data_cfg["station_latlon"]
+        coords = coords_from_station_latlon(station_latlon_cfg)
+        if isinstance(station_latlon_cfg, dict):
+            station_latlon_values = [station_latlon_cfg[name] for name in sorted(station_latlon_cfg)]
+        else:
+            station_latlon_values = station_latlon_cfg
+        station_latlon_arr = np.asarray(station_latlon_values, dtype=np.float64)
+        baseline_grid_indices = nearest_grid_indices_from_station_latlon(
+            lat_grid,
+            lon_grid,
+            station_latlon_arr[:, 0],
+            station_latlon_arr[:, 1],
+        )
     elif station_lat_vec is not None and station_lon_vec is not None:
         station_latlon = np.stack([station_lat_vec, station_lon_vec], axis=1)
         coords = coords_from_station_latlon(station_latlon)
+        baseline_grid_indices = nearest_grid_indices_from_station_latlon(
+            lat_grid,
+            lon_grid,
+            station_lat_vec,
+            station_lon_vec,
+        )
     else:
         station_indices = data_cfg.get("station_grid_indices")
         if station_indices is None:
             station_indices = [[18, 18], [20, 20], [22, 22]]
         coords = coords_from_grid_indices(lat_grid, lon_grid, station_indices)
+        baseline_grid_indices = [[int(i), int(j)] for i, j in station_indices]
 
+    if data_cfg.get("nwp_baseline_grid_indices") is not None:
+        baseline_grid_indices = [
+            [int(i), int(j)]
+            for i, j in data_cfg["nwp_baseline_grid_indices"]
+        ]
+    nwp_baseline = build_nwp_station_baseline(u140, v140, baseline_grid_indices)
+    target_mode = str(data_cfg.get("target_mode", config.get("target_mode", "measurement"))).lower()
+    if target_mode in {"measurement", "direct"}:
+        model_target = z
+    elif target_mode in {"residual_nwp", "nwp_residual", "residual"}:
+        model_target = z - nwp_baseline
+    else:
+        raise ValueError(f"Unknown target_mode: {target_mode}")
+
+    label_grid_indices = [[int(i), int(j)] for i, j in baseline_grid_indices]
     label_mode = data_cfg.get("advection_label_mode", "simple")
     if label_mode == "simple":
-        u140, v140 = load_nwp_uv140(nwp_path, time_limit=time_limit)
         v_star = build_simple_advection_labels_from_uv(
             u140,
             v140,
-            station_grid_indices=data_cfg.get("station_grid_indices"),
+            station_grid_indices=label_grid_indices,
             dt_seconds=float(config.get("dt_seconds", 600.0)),
             patch_radius=int(data_cfg.get("patch_radius", 2)),
         )[:T]
+    elif label_mode in {"shared_optical_flow", "joint_optical_flow"}:
+        v_star = build_shared_optical_flow_advection_labels_from_uv(
+            u140,
+            v140,
+            lat_grid,
+            lon_grid,
+            dt_seconds=float(config.get("dt_seconds", 600.0)),
+            stride=int(data_cfg.get("optical_flow_stride", 2)),
+            ridge=float(data_cfg.get("optical_flow_ridge", 1.0e-4)),
+        )[:T]
     elif label_mode == "optical_flow":
-        u140, v140 = load_nwp_uv140(nwp_path, time_limit=time_limit)
         v_star = build_optical_flow_advection_labels_from_uv(
             u140,
             v140,
             lat_grid,
             lon_grid,
             dt_seconds=float(config.get("dt_seconds", 600.0)),
+            stride=int(data_cfg.get("optical_flow_stride", 2)),
+            ridge=float(data_cfg.get("optical_flow_ridge", 1.0e-4)),
         )[:T]
     elif label_mode in {"none", None}:
         v_star = None
     else:
         raise ValueError(f"Unknown advection_label_mode: {label_mode}")
 
+    deformation_label_mode = data_cfg.get("deformation_label_mode", "none")
+    if deformation_label_mode == "nwp_gradient":
+        B_star = build_deformation_labels_from_uv(
+            u140,
+            v140,
+            lat_grid,
+            lon_grid,
+            station_grid_indices=label_grid_indices,
+            dt_seconds=float(config.get("dt_seconds", 600.0)),
+            patch_radius=int(data_cfg.get("patch_radius", 2)),
+            delta_clip=float(data_cfg.get("deformation_label_clip", config.get("deformation_scale", 0.3))),
+        )[:T]
+    elif deformation_label_mode in {"none", None}:
+        B_star = None
+    else:
+        raise ValueError(f"Unknown deformation_label_mode: {deformation_label_mode}")
+
     if data_cfg.get("standardize_x", True):
         x, x_standardizer = standardize_maps(x)
     else:
         x_standardizer = None
     if data_cfg.get("standardize_z", False):
-        z, z_standardizer = standardize_series(z)
+        model_target, z_standardizer = standardize_series(model_target)
     else:
         z_standardizer = None
 
     return {
         "X": x,
-        "Z": z.astype(np.float32, copy=False),
+        "Z": model_target.astype(np.float32, copy=False),
+        "Y": z.astype(np.float32, copy=False),
+        "nwp_baseline": nwp_baseline.astype(np.float32, copy=False),
         "V_star": v_star,
+        "B_star": B_star,
         "coords": coords,
+        "target_mode": target_mode,
+        "baseline_grid_indices": np.asarray(baseline_grid_indices, dtype=np.int64),
         "lat_grid": lat_grid,
         "lon_grid": lon_grid,
         "x_standardizer": x_standardizer,
