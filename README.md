@@ -201,9 +201,32 @@ online_min_delta: 0.0
 
 ## Full-Grid Residual Analysis Model
 
-The original VectorMIDE model is kept intact. A separate analysis-correction
-path trains a CNN to output a full NWP-grid residual field while applying
-supervised loss only at the three measurement stations.
+The original VectorMIDE model can be extended to the full NWP grid without
+changing its three-station training objective. First train/evaluate VectorMIDE
+as usual, then use the same learned IDE kernel to map the filtered/predicted
+three-station residual state to all 40x40 grid locations:
+
+```bash
+python train/infer_vector_grid_residual.py \
+  --config yml_files/VectorMIDE_cuda.yaml \
+  --checkpoint checkpoints/vector_mide_offline_cuda.pt \
+  --split offline
+
+python train/visualize_vector_grid_residual.py \
+  --npz outputs/vector_grid_residual/vector_mide_offline_cuda_offline/grid_residual_extension.npz \
+  --state prediction \
+  --num-points 40
+```
+
+The exported file contains both `prediction_*` fields, matching the one-step
+Kalman prior used for station forecast metrics, and `analysis_*` fields, which
+use same-time station observations after filtering. This path keeps the
+three-point IDE/Kalman model as the primary model; off-station residuals are a
+spatial extension of that model, not a replacement.
+
+A separate experimental analysis-correction CNN is also available. It trains a
+full-grid residual field directly while applying supervised loss only at the
+three measurement stations:
 
 ```bash
 python train/train_grid_residual.py --config yml_files/GridResidual_u140.yaml --dry-run
