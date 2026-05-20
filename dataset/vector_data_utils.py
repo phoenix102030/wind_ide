@@ -76,6 +76,58 @@ def load_mat_variable(path: str | Path, variable_name: str) -> np.ndarray:
     return np.asarray(arr)
 
 
+def imputed_measurement_path(path: str | Path) -> Path:
+    """Return the sibling ``*_imputed.mat`` path for a measurement file."""
+    path = Path(path)
+    if path.stem.endswith("_imputed"):
+        return path
+    return path.with_name(f"{path.stem}_imputed{path.suffix}")
+
+
+def resolve_measurement_path(data_cfg: dict[str, Any], split: str) -> tuple[Path, Path]:
+    """Resolve the configured measurement file, preferring imputed data by default."""
+    configured = Path(data_cfg[f"{split}_measurement_path"])
+    if bool(data_cfg.get("prefer_imputed_measurements", True)):
+        candidate = imputed_measurement_path(configured)
+        if candidate.exists():
+            return configured, candidate
+    return configured, configured
+
+
+def finite_summary(values: np.ndarray) -> dict[str, int | float]:
+    values = np.asarray(values)
+    total = int(values.size)
+    finite = int(np.isfinite(values).sum())
+    return {
+        "total": total,
+        "finite": finite,
+        "missing": total - finite,
+        "finite_fraction": float(finite / total) if total else 1.0,
+    }
+
+
+def impute_time_series_columns(values: np.ndarray) -> np.ndarray:
+    """Linearly fill missing values column-by-column along time.
+
+    This is a fallback for experiments without precomputed ``*_imputed.mat``
+    files. Columns that are entirely missing are filled with zero.
+    """
+    arr = np.asarray(values, dtype=np.float32).copy()
+    if arr.ndim != 2:
+        raise ValueError(f"Expected a 2D time series array, got {arr.shape}")
+    time = np.arange(arr.shape[0], dtype=np.float64)
+    for col in range(arr.shape[1]):
+        series = arr[:, col]
+        finite = np.isfinite(series)
+        if finite.all():
+            continue
+        if finite.any():
+            arr[:, col] = np.interp(time, time[finite], series[finite]).astype(np.float32)
+        else:
+            arr[:, col] = 0.0
+    return arr
+
+
 def _open_hdf5_mat(path: Path):
     try:
         import h5py
@@ -601,11 +653,30 @@ def load_vector_dataset(
     if split not in {"offline", "online"}:
         raise ValueError("split must be 'offline' or 'online'")
 
-    measurement_path = Path(data_cfg[f"{split}_measurement_path"])
+    configured_measurement_path, measurement_path = resolve_measurement_path(data_cfg, split)
     nwp_path = Path(data_cfg[f"{split}_nwp_path"])
     ws_uv = load_mat_variable(measurement_path, "Ws_uv")
     if time_limit is not None:
         ws_uv = ws_uv[:time_limit]
+    measurement_summary_before = finite_summary(ws_uv)
+    if measurement_summary_before["missing"]:
+        missing_policy = str(data_cfg.get("measurement_missing_policy", "error")).lower()
+        if missing_policy in {"interpolate", "linear", "impute"}:
+            ws_uv = impute_time_series_columns(ws_uv)
+        elif missing_policy in {"allow", "mask"}:
+            pass
+        else:
+            candidate = imputed_measurement_path(measurement_path)
+            hint = (
+                f" Use {candidate} or set data.measurement_missing_policy: interpolate "
+                "if you want the loader to fill missing measurements."
+            )
+            raise ValueError(
+                f"{measurement_path} contains {measurement_summary_before['missing']} missing "
+                f"Ws_uv values out of {measurement_summary_before['total']}."
+                + hint
+            )
+    measurement_summary_after = finite_summary(ws_uv)
     station_lat_vec = None
     station_lon_vec = None
     if data_cfg.get("use_measurement_station_coords", True):
@@ -644,6 +715,7 @@ def load_vector_dataset(
     elif station_lat_vec is not None and station_lon_vec is not None:
         station_latlon = np.stack([station_lat_vec, station_lon_vec], axis=1)
         coords = coords_from_station_latlon(station_latlon)
+        station_latlon_arr = station_latlon.astype(np.float64, copy=False)
         baseline_grid_indices = nearest_grid_indices_from_station_latlon(
             lat_grid,
             lon_grid,
@@ -656,6 +728,10 @@ def load_vector_dataset(
             station_indices = [[18, 18], [20, 20], [22, 22]]
         coords = coords_from_grid_indices(lat_grid, lon_grid, station_indices)
         baseline_grid_indices = [[int(i), int(j)] for i, j in station_indices]
+        station_latlon_arr = np.asarray(
+            [[lat_grid[int(i), int(j)], lon_grid[int(i), int(j)]] for i, j in baseline_grid_indices],
+            dtype=np.float64,
+        )
 
     if data_cfg.get("nwp_baseline_grid_indices") is not None:
         baseline_grid_indices = [
@@ -670,6 +746,13 @@ def load_vector_dataset(
         model_target = z - nwp_baseline
     else:
         raise ValueError(f"Unknown target_mode: {target_mode}")
+    target_summary = finite_summary(model_target)
+    if target_summary["missing"] and bool(data_cfg.get("require_complete_target", True)):
+        raise ValueError(
+            f"VectorMIDE target contains {target_summary['missing']} missing values after "
+            f"building target_mode={target_mode!r}. Check measurement and NWP baseline inputs, "
+            "or set data.require_complete_target: false to keep masked-observation training."
+        )
 
     label_grid_indices = [[int(i), int(j)] for i, j in baseline_grid_indices]
     label_mode = data_cfg.get("advection_label_mode", "simple")
@@ -740,12 +823,18 @@ def load_vector_dataset(
         "V_star": v_star,
         "B_star": B_star,
         "coords": coords,
+        "station_latlon": station_latlon_arr.astype(np.float32, copy=False),
         "target_mode": target_mode,
         "baseline_grid_indices": np.asarray(baseline_grid_indices, dtype=np.int64),
         "lat_grid": lat_grid,
         "lon_grid": lon_grid,
         "x_standardizer": x_standardizer,
         "z_standardizer": z_standardizer,
+        "configured_measurement_path": str(configured_measurement_path),
+        "measurement_path": str(measurement_path),
+        "measurement_summary_before": measurement_summary_before,
+        "measurement_summary_after": measurement_summary_after,
+        "target_summary": target_summary,
     }
 
 

@@ -302,7 +302,9 @@ The current `data/` folder is expected to contain:
 
 ```text
 data/measurement/wv_h100_180_offline.mat
+data/measurement/wv_h100_180_offline_imputed.mat
 data/measurement/wv_h100_180_online.mat
+data/measurement/wv_h100_180_online_imputed.mat
 data/nwp/data_grid_offline.mat
 data/nwp/data_grid_online.mat
 ```
@@ -310,6 +312,11 @@ data/nwp/data_grid_online.mat
 Measurement rows are converted to raw `Y` using the 140m `U,V` columns. In
 `target_mode: residual_nwp`, model target `Z` is `Y - nwp_baseline`. NWP maps use
 the channels `[u100, v100, u140, v140, u180, v180]` by default.
+Training configs point to the imputed measurement files, and the loader also
+prefers a same-directory `*_imputed.mat` sibling by default when a raw
+measurement path is configured. If the resolved measurement file still contains
+missing values, training fails loudly unless `data.measurement_missing_policy:
+interpolate` is set.
 With `advection_mode: shared_flow_deformation`, the model predicts one physical
 advection displacement `flow_mu=(flow_x, flow_y)` shared by U and V, plus a
 signed component deformation matrix `B`. The transition is built as

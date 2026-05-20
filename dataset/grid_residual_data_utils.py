@@ -12,10 +12,14 @@ from .vector_data_utils import (
     NWP_CHANNELS,
     Standardizer,
     build_z_from_measurements,
+    finite_summary,
+    impute_time_series_columns,
+    imputed_measurement_path,
     latlon_to_xy_km,
     load_mat_variable,
     load_nwp_maps,
     load_nwp_uv140,
+    resolve_measurement_path,
     standardize_maps,
 )
 
@@ -329,7 +333,7 @@ def load_grid_residual_dataset(
     if split not in {"offline", "online"}:
         raise ValueError("split must be 'offline' or 'online'")
 
-    measurement_path = Path(data_cfg[f"{split}_measurement_path"])
+    configured_measurement_path, measurement_path = resolve_measurement_path(data_cfg, split)
     nwp_path = Path(data_cfg[f"{split}_nwp_path"])
     target_component = str(data_cfg.get("target_component", "u")).lower()
     if target_component not in TARGET_COMPONENT_SLICES:
@@ -351,6 +355,21 @@ def load_grid_residual_dataset(
     ws_uv = load_mat_variable(measurement_path, "Ws_uv")
     if time_limit is not None:
         ws_uv = ws_uv[:time_limit]
+    measurement_summary_before = finite_summary(ws_uv)
+    if measurement_summary_before["missing"]:
+        missing_policy = str(data_cfg.get("measurement_missing_policy", "error")).lower()
+        if missing_policy in {"interpolate", "linear", "impute"}:
+            ws_uv = impute_time_series_columns(ws_uv)
+        elif missing_policy in {"allow", "mask"}:
+            pass
+        else:
+            candidate = imputed_measurement_path(measurement_path)
+            raise ValueError(
+                f"{measurement_path} contains {measurement_summary_before['missing']} missing "
+                f"Ws_uv values out of {measurement_summary_before['total']}. Use {candidate} "
+                "or set data.measurement_missing_policy: interpolate."
+            )
+    measurement_summary_after = finite_summary(ws_uv)
     y = build_z_from_measurements(ws_uv)
     obs_values = y[:, TARGET_COMPONENT_SLICES[target_component]]
 
@@ -409,6 +428,10 @@ def load_grid_residual_dataset(
         "target_channel": target_channel,
         "nwp_channel_names": tuple(channel_names),
         "x_standardizer": x_standardizer,
+        "configured_measurement_path": str(configured_measurement_path),
+        "measurement_path": str(measurement_path),
+        "measurement_summary_before": measurement_summary_before,
+        "measurement_summary_after": measurement_summary_after,
     }
 
 

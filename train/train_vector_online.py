@@ -19,6 +19,7 @@ from model.vector_dstm import VectorMIDE
 from train.train_vector_offline import (
     build_model,
     checkpoint_name_with_suffix,
+    print_data_input_summary,
     print_device_info,
     resolve_device,
     save_checkpoint,
@@ -166,6 +167,7 @@ def main() -> None:
     optimizer = build_online_optimizer(model, config)
 
     data = load_vector_dataset(config, split="online", time_limit=args.limit)
+    print_data_input_summary(data, "online")
 
     coords = torch.from_numpy(data["coords"]).to(device)
     window_size = int(args.online_window_size or config.get("online_window_size", 168))

@@ -212,6 +212,22 @@ def split_train_validation(
     return train_arrays, val_arrays, starts
 
 
+def print_data_input_summary(data: dict[str, Any], split: str) -> None:
+    configured = data.get("configured_measurement_path")
+    resolved = data.get("measurement_path")
+    if configured and resolved and configured != resolved:
+        print(f"Using imputed {split} measurements: {resolved} (configured: {configured})")
+    elif resolved:
+        print(f"Using {split} measurements: {resolved}")
+    target_summary = data.get("target_summary")
+    if target_summary:
+        print(
+            f"{split} target finite values: "
+            f"{target_summary['finite']}/{target_summary['total']} "
+            f"({target_summary['finite_fraction']:.2%})"
+        )
+
+
 def multistep_horizons(config: dict[str, Any]) -> list[int]:
     raw = config.get("multistep_horizons", [3, 6, 12])
     if isinstance(raw, str):
@@ -402,6 +418,7 @@ def main() -> None:
     print_device_info(device)
 
     data = load_vector_dataset(config, split="offline", time_limit=args.limit)
+    print_data_input_summary(data, "offline")
 
     arrays = {"X": data["X"], "Z": data["Z"], "V_star": data["V_star"], "B_star": data.get("B_star")}
     train_arrays, val_arrays, val_starts = split_train_validation(arrays, config)

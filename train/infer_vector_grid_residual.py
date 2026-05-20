@@ -23,9 +23,19 @@ from model.covariance import safe_cholesky, solve_linear_system
 from train.train_vector_offline import build_model, load_config, print_device_info, resolve_device
 
 
-def grid_coords_from_latlon(lat_grid: np.ndarray, lon_grid: np.ndarray) -> np.ndarray:
-    origin = (float(np.nanmean(lat_grid)), float(np.nanmean(lon_grid)))
-    return latlon_to_xy_km(lat_grid, lon_grid, origin=origin).reshape(-1, 2).astype(np.float32)
+def station_and_grid_coords(data: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Return station and grid coordinates in one shared local projection."""
+    station_latlon = data.get("station_latlon")
+    if station_latlon is None:
+        return data["coords"].astype(np.float32, copy=False), latlon_to_xy_km(
+            data["lat_grid"],
+            data["lon_grid"],
+        ).reshape(-1, 2).astype(np.float32)
+    station_latlon = np.asarray(station_latlon, dtype=np.float64)
+    origin = (float(np.nanmean(station_latlon[:, 0])), float(np.nanmean(station_latlon[:, 1])))
+    station_coords = latlon_to_xy_km(station_latlon[:, 0], station_latlon[:, 1], origin=origin)
+    grid_coords = latlon_to_xy_km(data["lat_grid"], data["lon_grid"], origin=origin)
+    return station_coords.astype(np.float32, copy=False), grid_coords.reshape(-1, 2).astype(np.float32)
 
 
 def component_selectors(device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
@@ -159,7 +169,8 @@ def run_station_filter_and_grid_extension(
 ) -> dict[str, np.ndarray]:
     if data.get("z_standardizer") is not None:
         raise ValueError("Grid extension currently expects unstandardized residual targets (standardize_z: false).")
-    coords = torch.from_numpy(data["coords"]).to(device)
+    source_coords_np, _ = station_and_grid_coords(data)
+    coords = torch.from_numpy(source_coords_np).to(device)
     target_coords = torch.from_numpy(grid_coords).to(device)
     z = torch.from_numpy(data["Z"]).to(device)
     n_time = int(data["X"].shape[0])
@@ -314,7 +325,7 @@ def main() -> None:
             )
         )
 
-    grid_coords = grid_coords_from_latlon(data["lat_grid"], data["lon_grid"])
+    station_coords, grid_coords = station_and_grid_coords(data)
     height, width = data["lat_grid"].shape
     outputs = run_station_filter_and_grid_extension(
         model,
@@ -354,8 +365,9 @@ def main() -> None:
         station_analysis_residual=outputs["station_analysis_residual"],
         measurement_target=data["Y"].astype(np.float32, copy=False),
         station_nwp_baseline=data["nwp_baseline"].astype(np.float32, copy=False),
-        coords=data["coords"].astype(np.float32, copy=False),
+        coords=station_coords.astype(np.float32, copy=False),
         grid_coords=grid_coords,
+        station_latlon=data.get("station_latlon", np.empty((0, 2), dtype=np.float32)),
         lat_grid=data["lat_grid"].astype(np.float32, copy=False),
         lon_grid=data["lon_grid"].astype(np.float32, copy=False),
     )

@@ -1,7 +1,12 @@
 import numpy as np
 import torch
 
-from dataset.vector_data_utils import build_z_from_measurements
+from dataset.vector_data_utils import (
+    build_z_from_measurements,
+    impute_time_series_columns,
+    imputed_measurement_path,
+    resolve_measurement_path,
+)
 from model.vector_attcnn import VectorAdvectionNet
 from model.vector_dstm import VectorMIDE
 from model.vector_kernel import VectorLagrangianKernel
@@ -198,3 +203,55 @@ def test_measurement_columns_build_140m_state_order():
 
     assert z.shape == (2, 6)
     np.testing.assert_array_equal(z[0], ws_uv[0, [6, 8, 10, 7, 9, 11]])
+
+
+def test_measurement_path_prefers_imputed_sibling(tmp_path):
+    raw_path = tmp_path / "wv_h100_180_offline.mat"
+    imputed_path = tmp_path / "wv_h100_180_offline_imputed.mat"
+    raw_path.touch()
+    imputed_path.touch()
+
+    configured, resolved = resolve_measurement_path(
+        {"offline_measurement_path": str(raw_path)},
+        "offline",
+    )
+
+    assert configured == raw_path
+    assert resolved == imputed_path
+    assert imputed_measurement_path(raw_path) == imputed_path
+    assert imputed_measurement_path(imputed_path) == imputed_path
+
+
+def test_measurement_path_can_disable_imputed_preference(tmp_path):
+    raw_path = tmp_path / "wv_h100_180_offline.mat"
+    imputed_path = tmp_path / "wv_h100_180_offline_imputed.mat"
+    raw_path.touch()
+    imputed_path.touch()
+
+    _, resolved = resolve_measurement_path(
+        {
+            "offline_measurement_path": str(raw_path),
+            "prefer_imputed_measurements": False,
+        },
+        "offline",
+    )
+
+    assert resolved == raw_path
+
+
+def test_impute_time_series_columns_fills_all_missing_values():
+    values = np.array(
+        [
+            [1.0, np.nan, np.nan],
+            [np.nan, 2.0, np.nan],
+            [3.0, np.nan, np.nan],
+        ],
+        dtype=np.float32,
+    )
+
+    filled = impute_time_series_columns(values)
+
+    assert np.isfinite(filled).all()
+    np.testing.assert_allclose(filled[:, 0], [1.0, 2.0, 3.0])
+    np.testing.assert_allclose(filled[:, 1], [2.0, 2.0, 2.0])
+    np.testing.assert_allclose(filled[:, 2], [0.0, 0.0, 0.0])

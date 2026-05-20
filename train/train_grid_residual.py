@@ -335,6 +335,12 @@ def main() -> None:
     print_device_info(device)
 
     data = load_grid_residual_dataset(config, split="offline", time_limit=args.limit)
+    configured = data.get("configured_measurement_path")
+    resolved = data.get("measurement_path")
+    if configured and resolved and configured != resolved:
+        print(f"Using imputed offline measurements: {resolved} (configured: {configured})")
+    elif resolved:
+        print(f"Using offline measurements: {resolved}")
     train_data, val_data, val_starts = split_train_validation(data, config)
     n_stations = int(data["obs_values"].shape[1])
     station_input_mask, station_loss_mask = station_masks(n_stations, config, args.holdout_station, device)

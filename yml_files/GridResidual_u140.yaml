@@ -15,13 +15,15 @@ nwp_channel_names:
   - v180
 
 data:
-  offline_measurement_path: data/measurement/wv_h100_180_offline.mat
+  offline_measurement_path: data/measurement/wv_h100_180_offline_imputed.mat
   offline_nwp_path: data/nwp/data_grid_offline.mat
-  online_measurement_path: data/measurement/wv_h100_180_online.mat
+  online_measurement_path: data/measurement/wv_h100_180_online_imputed.mat
   online_nwp_path: data/nwp/data_grid_online.mat
   target_component: u
   target_channel: u140
   dt_seconds: 600.0
+  prefer_imputed_measurements: true
+  measurement_missing_policy: error
   use_measurement_station_coords: true
   standardize_x: true
   distance_scale_km: null

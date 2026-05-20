@@ -115,11 +115,14 @@ validation_min_windows: 2
 validation_every_epochs: 5
 
 data:
-  offline_measurement_path: data/measurement/wv_h100_180_offline.mat
+  offline_measurement_path: data/measurement/wv_h100_180_offline_imputed.mat
   offline_nwp_path: data/nwp/data_grid_offline.mat
-  online_measurement_path: data/measurement/wv_h100_180_online.mat
+  online_measurement_path: data/measurement/wv_h100_180_online_imputed.mat
   online_nwp_path: data/nwp/data_grid_online.mat
   target_mode: residual_nwp
+  prefer_imputed_measurements: true
+  measurement_missing_policy: error
+  require_complete_target: true
   use_measurement_station_coords: true
   station_grid_indices:
   - [ 18, 18 ]
