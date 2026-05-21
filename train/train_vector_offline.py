@@ -362,6 +362,12 @@ def multistep_horizons(config: dict[str, Any]) -> list[int]:
     return [int(item) for item in raw]
 
 
+def parse_int_list(raw: Any) -> list[int]:
+    if isinstance(raw, str):
+        raw = [item.strip() for item in raw.split(",") if item.strip()]
+    return [int(item) for item in raw]
+
+
 def lambda_multistep_for_stage(config: dict[str, Any], stage: str) -> float:
     stages = config.get("multistep_stages", ["joint"])
     if isinstance(stages, str):
@@ -372,14 +378,22 @@ def lambda_multistep_for_stage(config: dict[str, Any], stage: str) -> float:
 
 
 def training_loss_kwargs(config: dict[str, Any], stage: str) -> dict[str, Any]:
+    prefix = f"{stage}_"
+    horizons = config.get(f"{prefix}multistep_horizons")
+    if horizons is None:
+        horizons = multistep_horizons(config)
     return {
-        "lambda_adv": float(config.get("lambda_adv", 0.1)),
-        "lambda_deform": float(config.get("lambda_deform", 0.0)),
-        "lambda_smooth": float(config.get("lambda_smooth", 0.001)),
-        "lambda_reg": float(config.get("lambda_reg", 0.0001)),
-        "lambda_multistep": lambda_multistep_for_stage(config, stage),
-        "multistep_horizons": multistep_horizons(config),
-        "multistep_max_origins": int(config.get("multistep_max_origins", 256)),
+        "lambda_adv": float(config.get(f"{prefix}lambda_adv", config.get("lambda_adv", 0.1))),
+        "lambda_deform": float(config.get(f"{prefix}lambda_deform", config.get("lambda_deform", 0.0))),
+        "lambda_smooth": float(config.get(f"{prefix}lambda_smooth", config.get("lambda_smooth", 0.001))),
+        "lambda_reg": float(config.get(f"{prefix}lambda_reg", config.get("lambda_reg", 0.0001))),
+        "lambda_multistep": float(
+            config.get(f"{prefix}lambda_multistep", lambda_multistep_for_stage(config, stage))
+        ),
+        "multistep_horizons": parse_int_list(horizons),
+        "multistep_max_origins": int(
+            config.get(f"{prefix}multistep_max_origins", config.get("multistep_max_origins", 256))
+        ),
     }
 
 

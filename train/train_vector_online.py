@@ -81,12 +81,36 @@ def anchor_loss(
     return loss
 
 
+def parameter_drift_summary(
+    current: dict[str, torch.Tensor],
+    anchor: dict[str, torch.Tensor],
+) -> dict[str, float]:
+    if not current:
+        return {}
+    sq_delta = 0.0
+    sq_anchor = 0.0
+    max_abs = 0.0
+    for name, param in current.items():
+        if name not in anchor:
+            continue
+        base = anchor[name].to(device=param.device, dtype=param.dtype)
+        delta = (param.detach() - base).float()
+        sq_delta += float(delta.pow(2).sum().detach().cpu())
+        sq_anchor += float(base.detach().float().pow(2).sum().detach().cpu())
+        max_abs = max(max_abs, float(delta.abs().max().detach().cpu()))
+    return {
+        "param_drift_l2": math.sqrt(sq_delta),
+        "param_drift_relative_l2": math.sqrt(sq_delta) / max(math.sqrt(sq_anchor), 1.0e-12),
+        "param_drift_max_abs": max_abs,
+    }
+
+
 def build_online_optimizer(model: VectorMIDE, config: dict[str, Any]) -> torch.optim.Optimizer:
     params = [param for param in model.parameters() if param.requires_grad]
     return torch.optim.AdamW(
         params,
-        lr=float(config.get("lr_heads", 5.0e-4)),
-        weight_decay=float(config.get("weight_decay", 1.0e-4)),
+        lr=float(config.get("online_lr", config.get("lr_heads", 5.0e-4))),
+        weight_decay=float(config.get("online_weight_decay", config.get("weight_decay", 1.0e-4))),
     )
 
 
@@ -134,9 +158,100 @@ def evaluate_window_loss(
     }
 
 
+def evaluate_forecast_metrics(
+    model: VectorMIDE,
+    data: dict[str, Any],
+    start: int,
+    end: int,
+    coords: torch.Tensor,
+    forecast_horizon: int,
+    device: torch.device,
+) -> dict[str, float]:
+    """Validation metrics aligned with multi-step forecast evaluation.
+
+    The metric is computed in model-target space. For residual-NWP targets this
+    is equivalent to measurement-space error because the same future NWP
+    baseline is added to both prediction and target.
+    """
+    if end - start < 2 or forecast_horizon < 1:
+        return {}
+    model.eval()
+    with torch.no_grad():
+        x = torch.from_numpy(data["X"][start:end]).to(device)
+        z = torch.from_numpy(data["Z"][start:end]).to(device)
+        outputs = model(x, coords)
+        control_seq = outputs.get("transition_control")
+        kf = model.dstm.kalman_filter(
+            z=z,
+            M_seq=outputs["M"],
+            control_seq=control_seq,
+            return_history=True,
+        )
+
+        max_horizon = min(int(forecast_horizon), z.shape[0] - 1)
+        rmse_by_horizon: list[torch.Tensor] = []
+        mae_by_horizon: list[torch.Tensor] = []
+        for horizon in range(1, max_horizon + 1):
+            origins = torch.arange(0, z.shape[0] - horizon, device=device)
+            if origins.numel() == 0:
+                continue
+            mean = kf["filter_means"][origins]
+            for step in range(1, horizon + 1):
+                M_batch = outputs["M"][origins + step]
+                mean = torch.bmm(M_batch, mean.unsqueeze(-1)).squeeze(-1)
+                if control_seq is not None:
+                    mean = mean + control_seq[origins + step]
+            target = z[origins + horizon]
+            mask = torch.isfinite(mean) & torch.isfinite(target)
+            if not mask.any():
+                continue
+            err = mean[mask] - target[mask]
+            rmse_by_horizon.append(torch.sqrt(err.pow(2).mean()))
+            mae_by_horizon.append(err.abs().mean())
+
+    if not rmse_by_horizon:
+        return {}
+    rmse = torch.stack(rmse_by_horizon)
+    mae = torch.stack(mae_by_horizon)
+    return {
+        "val_forecast_rmse_mean": float(rmse.mean().detach().cpu()),
+        "val_forecast_mae_mean": float(mae.mean().detach().cpu()),
+        "val_forecast_rmse_horizon": float(rmse[-1].detach().cpu()),
+        "val_forecast_mae_horizon": float(mae[-1].detach().cpu()),
+        "val_forecast_horizon": float(max_horizon),
+    }
+
+
+def evaluate_online_validation(
+    model: VectorMIDE,
+    data: dict[str, Any],
+    start: int,
+    end: int,
+    coords: torch.Tensor,
+    config: dict[str, Any],
+    device: torch.device,
+    forecast_horizon: int,
+) -> dict[str, float]:
+    metrics = evaluate_window_loss(model, data, start, end, coords, config, device)
+    metrics.update(
+        evaluate_forecast_metrics(
+            model,
+            data,
+            start,
+            end,
+            coords,
+            forecast_horizon=forecast_horizon,
+            device=device,
+        )
+    )
+    return metrics
+
+
 def metric_value(metrics: dict[str, float], name: str) -> float | None:
     if name in metrics:
         return float(metrics[name])
+    if "val_forecast_rmse_mean" in metrics:
+        return float(metrics["val_forecast_rmse_mean"])
     if "val_loss_kf" in metrics:
         return float(metrics["val_loss_kf"])
     if "val_loss" in metrics:
@@ -212,14 +327,17 @@ def run_global_finetune(
     optimizer: torch.optim.Optimizer,
     anchor: dict[str, torch.Tensor],
     best_path: Path,
+    initial_path: Path,
     last_path: Path,
     steps: int,
     window_size: int,
     validation_every: int,
     validation_window: int,
+    validation_forecast_horizon: int,
     monitor_metric: str,
     lambda_anchor: float,
     grad_clip: float,
+    require_improvement_over_initial: bool,
 ) -> None:
     rng = np.random.default_rng(int(config.get("seed", 123)))
     T = int(data["X"].shape[0])
@@ -230,12 +348,76 @@ def run_global_finetune(
     metrics: list[dict[str, Any]] = []
     best_score = math.inf
     best_info: dict[str, Any] | None = None
+    best_source = "none"
+    val_end = T
+    val_start = max(0, val_end - min(validation_window, T))
 
     print(
         "Global online finetune: "
         f"T={T}, window_size={window_size}, steps={steps}, "
         f"validation_every={validation_every}"
     )
+    if validation_every > 0:
+        initial_record = {"step": 0, "train_start": None, "end": None}
+        initial_record.update(
+            evaluate_online_validation(
+                model,
+                data,
+                val_start,
+                val_end,
+                coords,
+                config,
+                device,
+                validation_forecast_horizon,
+            )
+        )
+        initial_score = metric_value(initial_record, monitor_metric)
+        print({"initial_baseline": True, **initial_record})
+        initial_info = {
+            "step": 0,
+            "score": initial_score,
+            "monitor_metric": monitor_metric,
+            "validation_start": val_start,
+            "validation_end": val_end,
+            "metrics": initial_record,
+            "initial_baseline": True,
+            "best_source": "initial",
+        }
+        save_checkpoint(
+            model,
+            config,
+            initial_path,
+            extra={
+                "initial": initial_info,
+                "metrics": [initial_record],
+                "mode": "global_finetune",
+                "checkpoint_role": "initial_offline_baseline",
+            },
+        )
+        print(f"Saved explicit initial online baseline checkpoint to {initial_path}")
+        if require_improvement_over_initial and initial_score is not None:
+            best_score = initial_score
+            best_info = initial_info
+            best_source = "initial"
+            save_checkpoint(
+                model,
+                config,
+                best_path,
+                extra={
+                    "best": best_info,
+                    "metrics": [initial_record],
+                    "mode": "global_finetune",
+                    "checkpoint_role": "best",
+                    "best_source": best_source,
+                    "initial_checkpoint": str(initial_path),
+                },
+            )
+            print(
+                f"Saved initial baseline as current best global online checkpoint to {best_path} "
+                f"({monitor_metric}={initial_score:.6g})"
+            )
+        metrics.append(initial_record)
+
     for step in range(1, steps + 1):
         start = int(rng.integers(0, max_start + 1)) if max_start > 0 else 0
         end = start + window_size
@@ -257,9 +439,18 @@ def run_global_finetune(
 
         should_validate = validation_every > 0 and (step % validation_every == 0 or step == steps)
         if should_validate:
-            val_end = T
-            val_start = max(0, val_end - min(validation_window, T))
-            record.update(evaluate_window_loss(model, data, val_start, val_end, coords, config, device))
+            record.update(
+                evaluate_online_validation(
+                    model,
+                    data,
+                    val_start,
+                    val_end,
+                    coords,
+                    config,
+                    device,
+                    validation_forecast_horizon,
+                )
+            )
             score = metric_value(record, monitor_metric)
             if score is not None and score < best_score:
                 best_score = score
@@ -270,14 +461,26 @@ def run_global_finetune(
                     "validation_start": val_start,
                     "validation_end": val_end,
                     "metrics": record,
+                    "best_source": "trained_online",
                 }
+                best_source = "trained_online"
                 save_checkpoint(
                     model,
                     config,
                     best_path,
-                    extra={"best": best_info, "metrics": metrics + [record], "mode": "global_finetune"},
+                    extra={
+                        "best": best_info,
+                        "metrics": metrics + [record],
+                        "mode": "global_finetune",
+                        "checkpoint_role": "best",
+                        "best_source": best_source,
+                        "initial_checkpoint": str(initial_path),
+                    },
                 )
                 print(f"Saved best global online checkpoint to {best_path} ({monitor_metric}={score:.6g})")
+            elif score is not None and require_improvement_over_initial:
+                record["did_not_beat_initial_baseline"] = 1.0
+            record.update(parameter_drift_summary(trainable_named_parameters(model), anchor))
 
         metrics.append(record)
         if step == 1 or step == steps or (validation_every > 0 and step % validation_every == 0):
@@ -287,12 +490,26 @@ def run_global_finetune(
         model,
         config,
         last_path,
-        extra={"best": best_info, "metrics": metrics, "mode": "global_finetune"},
+        extra={
+            "best": best_info,
+            "metrics": metrics,
+            "mode": "global_finetune",
+            "checkpoint_role": "last_trained_online",
+            "best_source": best_source,
+            "initial_checkpoint": str(initial_path),
+            "param_drift": parameter_drift_summary(trainable_named_parameters(model), anchor),
+        },
     )
     if best_info is None:
         save_checkpoint(model, config, best_path, extra={"metrics": metrics, "mode": "global_finetune"})
         print(f"Saved global online checkpoint to {best_path}")
     print(f"Saved last global online checkpoint to {last_path}")
+    if best_source == "initial":
+        print(
+            "No trained online checkpoint beat the initial offline baseline on the selected "
+            f"metric ({monitor_metric}). Evaluate the *_last.pt checkpoint if you want to inspect "
+            "the trained-but-not-best model."
+        )
 
 
 def main() -> None:
@@ -306,6 +523,8 @@ def main() -> None:
     parser.add_argument("--online-update-every", type=int, default=None, help="Override online update stride.")
     parser.add_argument("--online-steps", type=int, default=None, help="Override gradient steps per online update.")
     parser.add_argument("--online-validation-every-updates", type=int, default=None, help="Override validation frequency; 0 disables validation.")
+    parser.add_argument("--online-validation-forecast-horizon", type=int, default=None, help="Override forecast horizon used for online checkpoint selection.")
+    parser.add_argument("--online-checkpoint-metric", default=None, help="Override online checkpoint selection metric.")
     parser.add_argument("--global-finetune", action="store_true", help="Train on random windows from the full online split for a fixed number of steps.")
     parser.add_argument("--global-steps", type=int, default=None, help="Total optimizer steps for --global-finetune.")
     parser.add_argument("--adaptation-scope", choices=["full-head", "output-head", "ide-only"], default=None, help="Online trainable parameter set.")
@@ -313,6 +532,8 @@ def main() -> None:
     parser.add_argument("--lambda-adv", type=float, default=None, help="Override lambda_adv for online training.")
     parser.add_argument("--lambda-deform", type=float, default=None, help="Override lambda_deform for online training.")
     parser.add_argument("--lambda-smooth", type=float, default=None, help="Override lambda_smooth for online training.")
+    parser.add_argument("--online-lr", type=float, default=None, help="Override online learning rate.")
+    parser.add_argument("--allow-worse-than-initial", action="store_true", help="Allow global online best checkpoint to be worse than the initial offline checkpoint on the validation window.")
     parser.add_argument("--save-every-update", action="store_true", help="Save one online checkpoint after every rolling update.")
     parser.add_argument("--online-checkpoint-every", type=int, default=None, help="Save an online checkpoint every N updates; 0 disables update checkpoints.")
     parser.add_argument("--max-updates", type=int, default=None, help="Stop after this many online updates.")
@@ -320,10 +541,11 @@ def main() -> None:
 
     config = load_config(args.config)
     for key, value in (
-        ("lambda_multistep", args.lambda_multistep),
-        ("lambda_adv", args.lambda_adv),
-        ("lambda_deform", args.lambda_deform),
-        ("lambda_smooth", args.lambda_smooth),
+        ("online_lambda_multistep", args.lambda_multistep),
+        ("online_lambda_adv", args.lambda_adv),
+        ("online_lambda_deform", args.lambda_deform),
+        ("online_lambda_smooth", args.lambda_smooth),
+        ("online_lr", args.online_lr),
     ):
         if value is not None:
             config[key] = value
@@ -369,7 +591,11 @@ def main() -> None:
         else args.online_validation_every_updates
     )
     online_val_gap = int(config.get("online_validation_gap", 0))
-    online_monitor_metric = str(config.get("online_checkpoint_metric", "val_loss_kf"))
+    online_monitor_metric = str(args.online_checkpoint_metric or config.get("online_checkpoint_metric", "val_loss_kf"))
+    online_val_forecast_horizon = int(
+        args.online_validation_forecast_horizon
+        or config.get("online_validation_forecast_horizon", config.get("forecast_horizon", 1))
+    )
     online_early_stop_patience = int(config.get("online_early_stop_patience", 0))
     online_min_delta = float(config.get("online_min_delta", 0.0))
     lambda_anchor = float(config.get("lambda_anchor", 0.01))
@@ -398,6 +624,10 @@ def main() -> None:
             "global_online_checkpoint_name",
             checkpoint_name_with_suffix(best_path.name, "_global"),
         )
+        global_initial_path = ckpt_dir / config.get(
+            "initial_global_online_checkpoint_name",
+            checkpoint_name_with_suffix(global_best_path.name, "_initial"),
+        )
         global_last_path = ckpt_dir / config.get(
             "last_global_online_checkpoint_name",
             checkpoint_name_with_suffix(global_best_path.name, "_last"),
@@ -411,14 +641,20 @@ def main() -> None:
             optimizer=optimizer,
             anchor=anchor,
             best_path=global_best_path,
+            initial_path=global_initial_path,
             last_path=global_last_path,
             steps=int(args.global_steps or config.get("online_global_steps", online_steps)),
             window_size=window_size,
             validation_every=online_val_every,
             validation_window=online_val_window,
+            validation_forecast_horizon=online_val_forecast_horizon,
             monitor_metric=online_monitor_metric,
             lambda_anchor=lambda_anchor,
             grad_clip=grad_clip,
+            require_improvement_over_initial=bool(
+                config.get("online_require_improvement_over_initial", True)
+            )
+            and not args.allow_worse_than_initial,
         )
         return
 
@@ -452,7 +688,7 @@ def main() -> None:
             val_end = min(val_start + online_val_window, T)
             if val_end > val_start:
                 record.update(
-                    evaluate_window_loss(
+                    evaluate_online_validation(
                         model,
                         data,
                         val_start,
@@ -460,6 +696,7 @@ def main() -> None:
                         coords,
                         config,
                         device,
+                        online_val_forecast_horizon,
                     )
                 )
                 score = metric_value(record, online_monitor_metric)

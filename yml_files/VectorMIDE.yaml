@@ -105,14 +105,21 @@ online_update_every: 6
 online_steps: 10
 online_validation_window_size: 168
 online_validation_every_updates: 10
+online_validation_forecast_horizon: 72
 online_validation_gap: 0
-online_checkpoint_metric: val_loss_forecast
+online_checkpoint_metric: val_forecast_rmse_mean
 online_early_stop_patience: 0
 online_min_delta: 0.0
 online_checkpoint_every_updates: 0
-online_adaptation_scope: output_head
+online_adaptation_scope: ide_only
+online_lr: 5.0e-5
+online_lambda_adv: 0.0
+online_lambda_deform: 0.0
+online_lambda_multistep: 0.0
+online_require_improvement_over_initial: true
 online_global_steps: 1000
 global_online_checkpoint_name: vector_mide_online_global.pt
+initial_global_online_checkpoint_name: vector_mide_online_global_initial.pt
 last_global_online_checkpoint_name: vector_mide_online_global_last.pt
 
 checkpoint_dir: checkpoints

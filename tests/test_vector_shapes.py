@@ -10,6 +10,7 @@ from dataset.vector_data_utils import (
 from model.vector_attcnn import VectorAdvectionNet
 from model.vector_dstm import VectorMIDE
 from model.vector_kernel import VectorLagrangianKernel
+from train.train_vector_offline import training_loss_kwargs
 
 
 def test_advection_net_shapes_and_constraints():
@@ -255,3 +256,28 @@ def test_impute_time_series_columns_fills_all_missing_values():
     np.testing.assert_allclose(filled[:, 0], [1.0, 2.0, 3.0])
     np.testing.assert_allclose(filled[:, 1], [2.0, 2.0, 2.0])
     np.testing.assert_allclose(filled[:, 2], [0.0, 0.0, 0.0])
+
+
+def test_online_training_loss_kwargs_can_override_offline_objective():
+    config = {
+        "lambda_adv": 0.1,
+        "lambda_deform": 0.05,
+        "lambda_multistep": 0.2,
+        "multistep_stages": ["joint", "online"],
+        "multistep_horizons": [1, 2, 3],
+        "online_lambda_adv": 0.0,
+        "online_lambda_deform": 0.0,
+        "online_lambda_multistep": 0.0,
+        "online_multistep_horizons": [1],
+    }
+
+    joint = training_loss_kwargs(config, "joint")
+    online = training_loss_kwargs(config, "online")
+
+    assert joint["lambda_adv"] == 0.1
+    assert joint["lambda_deform"] == 0.05
+    assert joint["lambda_multistep"] == 0.2
+    assert online["lambda_adv"] == 0.0
+    assert online["lambda_deform"] == 0.0
+    assert online["lambda_multistep"] == 0.0
+    assert online["multistep_horizons"] == [1]
