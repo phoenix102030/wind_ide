@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 import sys
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +21,80 @@ if str(ROOT) not in sys.path:
 from dataset.vector_data_utils import load_vector_dataset
 from model.covariance import smoothness_loss
 from model.vector_dstm import VectorMIDE
+
+
+class VectorMIDETrainingModule(torch.nn.Module):
+    """DDP-friendly wrapper whose forward computes the training loss dict."""
+
+    def __init__(self, model: VectorMIDE) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        coords: torch.Tensor,
+        v_star: torch.Tensor | None,
+        B_star: torch.Tensor | None,
+        stage: str,
+        loss_kwargs: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        if stage == "adv":
+            if v_star is None:
+                outputs = self.model(x, coords)
+                zero = outputs["M"].new_tensor(0.0)
+                return {
+                    "loss": zero,
+                    "loss_adv": zero,
+                    "loss_deform": zero,
+                    "loss_smooth": zero,
+                    **outputs,
+                }
+            outputs = self.model(x, coords)
+            loss_adv = self.model.advection_supervision_loss(v_star, outputs)
+            loss_deform = self.model.deformation_supervision_loss(B_star, outputs)
+            smooth_mu = outputs.get("flow_mu", outputs["mu"])
+            smooth_matrix = outputs.get("B", outputs["A"])
+            loss_smooth = smoothness_loss(smooth_mu, smooth_matrix)
+            loss = (
+                loss_adv
+                + float(loss_kwargs.get("lambda_deform", 0.0)) * loss_deform
+                + float(loss_kwargs.get("lambda_smooth", 0.001)) * loss_smooth
+            )
+            return {
+                "loss": loss,
+                "loss_adv": loss_adv,
+                "loss_deform": loss_deform,
+                "loss_smooth": loss_smooth,
+                **outputs,
+            }
+        if stage == "kf":
+            return self.model.training_losses(
+                x=x,
+                z=z,
+                coords=coords,
+                v_star=None,
+                lambda_adv=0.0,
+                lambda_smooth=0.0,
+                lambda_reg=float(loss_kwargs.get("lambda_reg", 0.0001)),
+                lambda_multistep=float(loss_kwargs.get("lambda_multistep", 0.0)),
+                multistep_horizons=loss_kwargs.get("multistep_horizons", ()),
+                multistep_max_origins=int(loss_kwargs.get("multistep_max_origins", 256)),
+            )
+        if stage == "joint":
+            return self.model.training_losses(
+                x=x,
+                z=z,
+                coords=coords,
+                v_star=v_star,
+                B_star=B_star,
+                **loss_kwargs,
+            )
+        raise ValueError(f"Unknown stage: {stage}")
+
+
+ModelLike = VectorMIDE | VectorMIDETrainingModule | DistributedDataParallel
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -59,6 +136,54 @@ def print_device_info(device: torch.device) -> None:
         print(f"Using device: {device} ({name}); visible CUDA devices: {count}")
     else:
         print(f"Using device: {device}")
+
+
+def distributed_requested() -> bool:
+    return "LOCAL_RANK" in os.environ and "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1
+
+
+def setup_distributed(config: dict[str, Any], requested_device: str) -> tuple[bool, int, int, torch.device]:
+    if not distributed_requested():
+        device = resolve_device(
+            requested_device,
+            allow_fallback=bool(config.get("allow_device_fallback", True)),
+        )
+        return False, 0, 1, device
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("torchrun multi-process training requires CUDA for this script.")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    if local_rank >= torch.cuda.device_count():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} but only {torch.cuda.device_count()} CUDA device(s) are visible."
+        )
+    torch.cuda.set_device(local_rank)
+    backend = str(config.get("distributed_backend", "nccl"))
+    dist.init_process_group(backend=backend)
+    return True, local_rank, world_size, torch.device(f"cuda:{local_rank}")
+
+
+def cleanup_distributed(enabled: bool) -> None:
+    if enabled and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process() -> bool:
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def rank_zero_print(*args: Any, **kwargs: Any) -> None:
+    if is_main_process():
+        print(*args, **kwargs)
+
+
+def unwrap_model(model: ModelLike) -> VectorMIDE:
+    if isinstance(model, DistributedDataParallel):
+        return unwrap_model(model.module)
+    if isinstance(model, VectorMIDETrainingModule):
+        return model.model
+    return model
 
 
 def set_seed(seed: int) -> None:
@@ -113,12 +238,13 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
     )
 
 
-def build_optimizer(model: VectorMIDE, config: dict[str, Any]) -> torch.optim.Optimizer:
+def build_optimizer(model: ModelLike, config: dict[str, Any]) -> torch.optim.Optimizer:
+    base_model = unwrap_model(model)
     groups = [
-        {"params": model.net.backbone.parameters(), "lr": float(config["lr_cnn"])},
-        {"params": list(model.net.head_parameters()), "lr": float(config["lr_heads"])},
-        {"params": model.kernel.parameters(), "lr": float(config["lr_kernel"])},
-        {"params": model.qr_params.parameters(), "lr": float(config["lr_qr"])},
+        {"params": base_model.net.backbone.parameters(), "lr": float(config["lr_cnn"])},
+        {"params": list(base_model.net.head_parameters()), "lr": float(config["lr_heads"])},
+        {"params": base_model.kernel.parameters(), "lr": float(config["lr_kernel"])},
+        {"params": base_model.qr_params.parameters(), "lr": float(config["lr_qr"])},
     ]
     return torch.optim.AdamW(groups, weight_decay=float(config.get("weight_decay", 1.0e-4)))
 
@@ -128,13 +254,14 @@ def set_module_grad(module: torch.nn.Module, requires_grad: bool) -> None:
         param.requires_grad = requires_grad
 
 
-def configure_stage(model: VectorMIDE, stage: str) -> None:
-    set_module_grad(model, True)
+def configure_stage(model: ModelLike, stage: str) -> None:
+    base_model = unwrap_model(model)
+    set_module_grad(base_model, True)
     if stage == "kf":
-        set_module_grad(model.net, False)
+        set_module_grad(base_model.net, False)
     elif stage == "adv":
-        set_module_grad(model.kernel, False)
-        set_module_grad(model.qr_params, False)
+        set_module_grad(base_model.kernel, False)
+        set_module_grad(base_model.qr_params, False)
 
 
 def sample_window(
@@ -257,7 +384,7 @@ def training_loss_kwargs(config: dict[str, Any], stage: str) -> dict[str, Any]:
 
 
 def validation_losses(
-    model: VectorMIDE,
+    model: ModelLike,
     val_arrays: dict[str, np.ndarray | None],
     val_starts: list[int],
     coords: torch.Tensor,
@@ -267,7 +394,8 @@ def validation_losses(
     if not val_arrays or not val_starts:
         return {}
 
-    model.eval()
+    base_model = unwrap_model(model)
+    base_model.eval()
     window_size = int(config.get("validation_window_size") or config.get("window_size", 1008))
     sums: dict[str, float] = {}
     with torch.no_grad():
@@ -279,7 +407,7 @@ def validation_losses(
             v_star = torch.from_numpy(v_star_np[start:end]).to(device) if v_star_np is not None else None
             B_star_np = val_arrays.get("B_star")
             B_star = torch.from_numpy(B_star_np[start:end]).to(device) if B_star_np is not None else None
-            losses = model.training_losses(
+            losses = base_model.training_losses(
                 x=x,
                 z=z,
                 coords=coords,
@@ -296,7 +424,7 @@ def validation_losses(
 
 
 def run_epoch(
-    model: VectorMIDE,
+    model: ModelLike,
     arrays: dict[str, np.ndarray | None],
     coords: torch.Tensor,
     optimizer: torch.optim.Optimizer,
@@ -306,6 +434,7 @@ def run_epoch(
 ) -> dict[str, float]:
     model.train()
     configure_stage(model, stage)
+    base_model = unwrap_model(model)
     steps = int(config.get("steps_per_epoch", 50))
     window_size = int(config.get("window_size", 1008))
     grad_clip = float(config.get("grad_clip", 1.0))
@@ -315,52 +444,27 @@ def run_epoch(
         x, z, v_star, B_star = sample_window(arrays, window_size, device)
         optimizer.zero_grad(set_to_none=True)
 
-        if stage == "adv":
-            if v_star is None:
-                continue
-            outputs = model.net(x)
-            loss_adv = model.advection_supervision_loss(v_star, outputs)
-            loss_deform = model.deformation_supervision_loss(B_star, outputs)
-            smooth_mu = outputs.get("flow_mu", outputs["mu"])
-            smooth_matrix = outputs.get("B", outputs["A"])
-            loss_smooth = smoothness_loss(smooth_mu, smooth_matrix)
-            loss = (
-                loss_adv
-                + float(config.get("lambda_deform", 0.0)) * loss_deform
-                + float(config.get("lambda_smooth", 0.001)) * loss_smooth
-            )
-            losses = {
-                "loss": loss,
-                "loss_adv": loss_adv,
-                "loss_deform": loss_deform,
-                "loss_smooth": loss_smooth,
-            }
-        elif stage == "kf":
-            losses = model.training_losses(
-                x=x,
-                z=z,
-                coords=coords,
-                v_star=None,
-                lambda_adv=0.0,
-                lambda_smooth=0.0,
-                lambda_reg=float(config.get("lambda_reg", 0.0001)),
-                lambda_multistep=lambda_multistep_for_stage(config, stage),
-                multistep_horizons=multistep_horizons(config),
-                multistep_max_origins=int(config.get("multistep_max_origins", 256)),
-            )
-            loss = losses["loss"]
-        elif stage == "joint":
-            losses = model.training_losses(
+        if isinstance(model, (VectorMIDETrainingModule, DistributedDataParallel)):
+            losses = model(
                 x=x,
                 z=z,
                 coords=coords,
                 v_star=v_star,
                 B_star=B_star,
-                **training_loss_kwargs(config, stage),
+                stage=stage,
+                loss_kwargs=training_loss_kwargs(config, stage),
             )
-            loss = losses["loss"]
         else:
-            raise ValueError(f"Unknown stage: {stage}")
+            losses = VectorMIDETrainingModule(base_model)(
+                x=x,
+                z=z,
+                coords=coords,
+                v_star=v_star,
+                B_star=B_star,
+                stage=stage,
+                loss_kwargs=training_loss_kwargs(config, stage),
+            )
+        loss = losses["loss"]
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -375,13 +479,13 @@ def run_epoch(
 
 
 def save_checkpoint(
-    model: VectorMIDE,
+    model: ModelLike,
     config: dict[str, Any],
     path: Path,
     extra: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"model_state": model.state_dict(), "config": config}
+    payload = {"model_state": unwrap_model(model).state_dict(), "config": config}
     if extra:
         payload.update(extra)
     torch.save(payload, path)
@@ -409,21 +513,22 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
-    set_seed(int(config.get("seed", 123)))
     device_name = args.device if args.device is not None else config.get("device", "auto")
-    device = resolve_device(
-        device_name,
-        allow_fallback=bool(config.get("allow_device_fallback", True)),
-    )
-    print_device_info(device)
+    distributed, local_rank, world_size, device = setup_distributed(config, str(device_name))
+    set_seed(int(config.get("seed", 123)) + local_rank)
+    if distributed:
+        rank_zero_print(f"Distributed training enabled: world_size={world_size}")
+    if is_main_process():
+        print_device_info(device)
 
     data = load_vector_dataset(config, split="offline", time_limit=args.limit)
-    print_data_input_summary(data, "offline")
+    if is_main_process():
+        print_data_input_summary(data, "offline")
 
     arrays = {"X": data["X"], "Z": data["Z"], "V_star": data["V_star"], "B_star": data.get("B_star")}
     train_arrays, val_arrays, val_starts = split_train_validation(arrays, config)
-    if val_arrays is not None:
-        print(
+    if val_arrays is not None and is_main_process():
+        rank_zero_print(
             "Validation enabled: "
             f"train_T={train_arrays['X'].shape[0]}, "
             f"val_T={val_arrays['X'].shape[0]}, "
@@ -431,13 +536,21 @@ def main() -> None:
             f"val_every={int(config.get('validation_every_epochs', 5))} epoch(s)"
         )
     coords = torch.from_numpy(data["coords"]).to(device)
-    model = build_model(config).to(device)
-    optimizer = build_optimizer(model, config)
+    base_model = build_model(config).to(device)
+    train_model: ModelLike = VectorMIDETrainingModule(base_model)
+    if distributed:
+        train_model = DistributedDataParallel(
+            train_model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+    optimizer = build_optimizer(train_model, config)
 
     if args.dry_run:
         x, z, v_star, B_star = sample_window(arrays, min(16, arrays["X"].shape[0]), device)
         with torch.enable_grad():
-            losses = model.training_losses(
+            losses = unwrap_model(train_model).training_losses(
                 x=x,
                 z=z,
                 coords=coords,
@@ -445,7 +558,9 @@ def main() -> None:
                 B_star=B_star,
                 **training_loss_kwargs(config, "joint"),
             )
-        print({key: float(value.detach().cpu()) for key, value in losses.items() if key.startswith("loss")})
+        if is_main_process():
+            print({key: float(value.detach().cpu()) for key, value in losses.items() if key.startswith("loss")})
+        cleanup_distributed(distributed)
         return
 
     schedule = [
@@ -467,52 +582,60 @@ def main() -> None:
     best_score = math.inf
     best_info: dict[str, Any] | None = None
 
-    for stage, epochs in schedule:
-        for epoch in range(epochs):
-            metrics = run_epoch(model, train_arrays, coords, optimizer, config, stage, device)
-            if (
-                val_arrays is not None
-                and stage == monitor_stage
-                and validation_every > 0
-                and ((epoch + 1) % validation_every == 0 or epoch + 1 == epochs)
-            ):
-                metrics.update(validation_losses(model, val_arrays, val_starts, coords, config, device))
-            print(f"{stage} epoch {epoch + 1}/{epochs}: {metrics}")
-            record = {"stage": stage, "epoch": epoch + 1, "epochs": epochs, **metrics}
-            history.append(record)
+    try:
+        for stage, epochs in schedule:
+            for epoch in range(epochs):
+                metrics = run_epoch(train_model, train_arrays, coords, optimizer, config, stage, device)
+                if (
+                    val_arrays is not None
+                    and stage == monitor_stage
+                    and validation_every > 0
+                    and ((epoch + 1) % validation_every == 0 or epoch + 1 == epochs)
+                    and is_main_process()
+                ):
+                    metrics.update(validation_losses(train_model, val_arrays, val_starts, coords, config, device))
+                if distributed:
+                    dist.barrier()
+                if is_main_process():
+                    rank_zero_print(f"{stage} epoch {epoch + 1}/{epochs}: {metrics}")
+                    record = {"stage": stage, "epoch": epoch + 1, "epochs": epochs, **metrics}
+                    history.append(record)
 
-            if stage == monitor_stage and monitor_metric in metrics:
-                score = checkpoint_score(metrics, monitor_metric)
-                if score < best_score:
-                    best_score = score
-                    best_info = {
-                        "stage": stage,
-                        "epoch": epoch + 1,
-                        "score": score,
-                        "monitor_metric": monitor_metric,
-                        "metrics": metrics,
-                    }
-                    save_checkpoint(
-                        model,
-                        config,
-                        best_ckpt_path,
-                        extra={"best": best_info, "history": history},
-                    )
-                    print(
-                        f"Saved best checkpoint to {best_ckpt_path} "
-                        f"({monitor_stage}/{monitor_metric}={score:.6g})"
-                    )
+                    if stage == monitor_stage and monitor_metric in metrics:
+                        score = checkpoint_score(metrics, monitor_metric)
+                        if score < best_score:
+                            best_score = score
+                            best_info = {
+                                "stage": stage,
+                                "epoch": epoch + 1,
+                                "score": score,
+                                "monitor_metric": monitor_metric,
+                                "metrics": metrics,
+                            }
+                            save_checkpoint(
+                                train_model,
+                                config,
+                                best_ckpt_path,
+                                extra={"best": best_info, "history": history},
+                            )
+                            rank_zero_print(
+                                f"Saved best checkpoint to {best_ckpt_path} "
+                                f"({monitor_stage}/{monitor_metric}={score:.6g})"
+                            )
 
-    save_checkpoint(
-        model,
-        config,
-        last_ckpt_path,
-        extra={"best": best_info, "history": history},
-    )
-    if best_info is None:
-        save_checkpoint(model, config, best_ckpt_path, extra={"history": history})
-        print(f"Saved checkpoint to {best_ckpt_path}")
-    print(f"Saved last checkpoint to {last_ckpt_path}")
+        if is_main_process():
+            save_checkpoint(
+                train_model,
+                config,
+                last_ckpt_path,
+                extra={"best": best_info, "history": history},
+            )
+            if best_info is None:
+                save_checkpoint(train_model, config, best_ckpt_path, extra={"history": history})
+                rank_zero_print(f"Saved checkpoint to {best_ckpt_path}")
+            rank_zero_print(f"Saved last checkpoint to {last_ckpt_path}")
+    finally:
+        cleanup_distributed(distributed)
 
 
 if __name__ == "__main__":

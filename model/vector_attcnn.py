@@ -300,6 +300,38 @@ class VectorAdvectionNet(nn.Module):
             yield from self.control_head.parameters()
         yield self.raw_mu_scale
 
+    def output_head_parameters(self) -> Iterable[nn.Parameter]:
+        """Lightweight online adaptation parameters after frozen feature encoding."""
+        yield from self.head_norm.parameters()
+        yield from self.head_shared.parameters()
+        if self.mu_head is not None:
+            yield from self.mu_head.parameters()
+        if self.mu_u_head_shared is not None:
+            yield from self.mu_u_head_shared.parameters()
+        if self.mu_v_head_shared is not None:
+            yield from self.mu_v_head_shared.parameters()
+        if self.mu_u_head is not None:
+            yield from self.mu_u_head.parameters()
+        if self.mu_v_head is not None:
+            yield from self.mu_v_head.parameters()
+        if self.chol_head is not None:
+            yield from self.chol_head.parameters()
+        if self.A_head is not None:
+            yield from self.A_head.parameters()
+        if self.flow_head is not None:
+            yield from self.flow_head.parameters()
+        if self.flow_chol_head is not None:
+            yield from self.flow_chol_head.parameters()
+        if self.deformation_head is not None:
+            yield from self.deformation_head.parameters()
+        if self.kernel_weight_head is not None:
+            yield from self.kernel_weight_head.parameters()
+        if self.residual_decay_head is not None:
+            yield from self.residual_decay_head.parameters()
+        if self.control_head is not None:
+            yield from self.control_head.parameters()
+        yield self.raw_mu_scale
+
     @staticmethod
     def _bounded_sigmoid(raw: Tensor, lower: float, upper: float) -> Tensor:
         return lower + (upper - lower) * torch.sigmoid(raw)

@@ -98,6 +98,11 @@ online_validation_gap: 0
 online_checkpoint_metric: val_loss_forecast
 online_early_stop_patience: 0
 online_min_delta: 0.0
+online_checkpoint_every_updates: 0
+online_adaptation_scope: output_head
+online_global_steps: 1000
+global_online_checkpoint_name: vector_mide_online_mps_global.pt
+last_global_online_checkpoint_name: vector_mide_online_mps_global_last.pt
 
 checkpoint_dir: checkpoints
 offline_checkpoint_name: vector_mide_offline_mps.pt
