@@ -119,14 +119,16 @@ def window_tensors(
     start: int,
     end: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     x = torch.from_numpy(data["X"][start:end]).to(device)
     z = torch.from_numpy(data["Z"][start:end]).to(device)
+    nwp = data.get("nwp_baseline")
+    nwp_baseline = torch.from_numpy(nwp[start:end]).to(device) if nwp is not None else None
     v_star = data["V_star"]
     v = torch.from_numpy(v_star[start:end]).to(device) if v_star is not None else None
     B_star = data.get("B_star")
     B = torch.from_numpy(B_star[start:end]).to(device) if B_star is not None else None
-    return x, z, v, B
+    return x, z, nwp_baseline, v, B
 
 
 def evaluate_window_loss(
@@ -142,13 +144,14 @@ def evaluate_window_loss(
         return {}
     model.eval()
     with torch.no_grad():
-        x, z, v_star, B_star = window_tensors(data, start, end, device)
+        x, z, nwp_baseline, v_star, B_star = window_tensors(data, start, end, device)
         losses = model.training_losses(
             x=x,
             z=z,
             coords=coords,
             v_star=v_star,
             B_star=B_star,
+            nwp_baseline=nwp_baseline,
             **training_loss_kwargs(config, "online"),
         )
     return {
@@ -297,7 +300,7 @@ def train_one_window(
     lambda_anchor: float,
     grad_clip: float,
 ) -> dict[str, torch.Tensor]:
-    x, z, v_star, B_star = window_tensors(data, start, end, device)
+    x, z, nwp_baseline, v_star, B_star = window_tensors(data, start, end, device)
     optimizer.zero_grad(set_to_none=True)
     losses = model.training_losses(
         x=x,
@@ -305,6 +308,7 @@ def train_one_window(
         coords=coords,
         v_star=v_star,
         B_star=B_star,
+        nwp_baseline=nwp_baseline,
         **training_loss_kwargs(config, "online"),
     )
     current = trainable_named_parameters(model)

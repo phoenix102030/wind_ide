@@ -398,12 +398,24 @@ class VectorMIDE(nn.Module):
         filter_means: Tensor,
         horizons: Sequence[int],
         control_seq: Optional[Tensor] = None,
+        nwp_baseline: Optional[Tensor] = None,
+        hybrid_first_horizon_direct: bool = False,
+        hybrid_direct_horizon_steps: int = 1,
         H: Optional[Tensor] = None,
         max_origins: int = 0,
     ) -> Tensor:
         """Masked MSE for forecasts rolled forward from filtered states."""
         if not horizons:
             return z.new_tensor(0.0)
+        direct_steps = max(int(hybrid_direct_horizon_steps), 1)
+        if hybrid_first_horizon_direct:
+            if nwp_baseline is None:
+                raise ValueError("hybrid_first_horizon_direct requires nwp_baseline")
+            if nwp_baseline.shape != z.shape:
+                raise ValueError(
+                    f"Expected nwp_baseline shape {tuple(z.shape)}, got {tuple(nwp_baseline.shape)}"
+                )
+            nwp_baseline = nwp_baseline.to(device=z.device, dtype=z.dtype)
 
         T = z.shape[0]
         H_full = H.to(device=z.device, dtype=z.dtype) if H is not None else None
@@ -432,7 +444,12 @@ class VectorMIDE(nn.Module):
                     mean = mean + control_seq[origin_idx + step].to(device=z.device, dtype=z.dtype)
 
             pred = mean if H_full is None else mean @ H_full.T
-            target = z[origin_idx + h]
+            if hybrid_first_horizon_direct and h <= direct_steps:
+                # In residual-NWP mode, direct measurement persistence at t+1 is
+                # (measurement_t - nwp_{t+h}) = z_t + nwp_t - nwp_{t+h}.
+                target = z[origin_idx] + nwp_baseline[origin_idx] - nwp_baseline[origin_idx + h]
+            else:
+                target = z[origin_idx + h]
             mask = torch.isfinite(pred) & torch.isfinite(target)
             if mask.any():
                 losses.append((pred[mask] - target[mask]).pow(2).mean())
@@ -489,6 +506,9 @@ class VectorMIDE(nn.Module):
         lambda_multistep: float = 0.0,
         multistep_horizons: Optional[Sequence[int]] = None,
         multistep_max_origins: int = 0,
+        nwp_baseline: Optional[Tensor] = None,
+        hybrid_first_horizon_direct: bool = False,
+        hybrid_direct_horizon_steps: int = 1,
     ) -> dict[str, Tensor]:
         outputs = self.forward(x, coords)
         use_multistep = lambda_multistep > 0.0 and bool(multistep_horizons)
@@ -507,6 +527,9 @@ class VectorMIDE(nn.Module):
                 filter_means=kf["filter_means"],
                 horizons=multistep_horizons or (),
                 control_seq=outputs.get("transition_control"),
+                nwp_baseline=nwp_baseline,
+                hybrid_first_horizon_direct=hybrid_first_horizon_direct,
+                hybrid_direct_horizon_steps=hybrid_direct_horizon_steps,
                 H=H,
                 max_origins=multistep_max_origins,
             )

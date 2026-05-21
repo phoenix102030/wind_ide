@@ -34,6 +34,7 @@ class VectorMIDETrainingModule(torch.nn.Module):
         self,
         x: torch.Tensor,
         z: torch.Tensor,
+        nwp_baseline: torch.Tensor | None,
         coords: torch.Tensor,
         v_star: torch.Tensor | None,
         B_star: torch.Tensor | None,
@@ -81,6 +82,9 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 lambda_multistep=float(loss_kwargs.get("lambda_multistep", 0.0)),
                 multistep_horizons=loss_kwargs.get("multistep_horizons", ()),
                 multistep_max_origins=int(loss_kwargs.get("multistep_max_origins", 256)),
+                nwp_baseline=nwp_baseline,
+                hybrid_first_horizon_direct=bool(loss_kwargs.get("hybrid_first_horizon_direct", False)),
+                hybrid_direct_horizon_steps=int(loss_kwargs.get("hybrid_direct_horizon_steps", 1)),
             )
         if stage == "joint":
             return self.model.training_losses(
@@ -89,6 +93,7 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 coords=coords,
                 v_star=v_star,
                 B_star=B_star,
+                nwp_baseline=nwp_baseline,
                 **loss_kwargs,
             )
         raise ValueError(f"Unknown stage: {stage}")
@@ -268,7 +273,7 @@ def sample_window(
     arrays: dict[str, np.ndarray | None],
     window_size: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     T = arrays["X"].shape[0]
     if T <= window_size:
         start = 0
@@ -278,11 +283,13 @@ def sample_window(
         end = start + window_size
     x = torch.from_numpy(arrays["X"][start:end]).to(device)
     z = torch.from_numpy(arrays["Z"][start:end]).to(device)
+    nwp_np = arrays.get("nwp_baseline")
+    nwp_baseline = torch.from_numpy(nwp_np[start:end]).to(device) if nwp_np is not None else None
     v_star_np = arrays.get("V_star")
     v_star = torch.from_numpy(v_star_np[start:end]).to(device) if v_star_np is not None else None
     B_star_np = arrays.get("B_star")
     B_star = torch.from_numpy(B_star_np[start:end]).to(device) if B_star_np is not None else None
-    return x, z, v_star, B_star
+    return x, z, nwp_baseline, v_star, B_star
 
 
 def slice_arrays(
@@ -394,6 +401,18 @@ def training_loss_kwargs(config: dict[str, Any], stage: str) -> dict[str, Any]:
         "multistep_max_origins": int(
             config.get(f"{prefix}multistep_max_origins", config.get("multistep_max_origins", 256))
         ),
+        "hybrid_first_horizon_direct": bool(
+            config.get(
+                f"{prefix}hybrid_first_horizon_direct",
+                config.get("hybrid_first_horizon_direct", False),
+            )
+        ),
+        "hybrid_direct_horizon_steps": int(
+            config.get(
+                f"{prefix}hybrid_direct_horizon_steps",
+                config.get("hybrid_direct_horizon_steps", 1),
+            )
+        ),
     }
 
 
@@ -417,6 +436,8 @@ def validation_losses(
             end = min(start + window_size, val_arrays["X"].shape[0])
             x = torch.from_numpy(val_arrays["X"][start:end]).to(device)
             z = torch.from_numpy(val_arrays["Z"][start:end]).to(device)
+            nwp_np = val_arrays.get("nwp_baseline")
+            nwp_baseline = torch.from_numpy(nwp_np[start:end]).to(device) if nwp_np is not None else None
             v_star_np = val_arrays.get("V_star")
             v_star = torch.from_numpy(v_star_np[start:end]).to(device) if v_star_np is not None else None
             B_star_np = val_arrays.get("B_star")
@@ -427,6 +448,7 @@ def validation_losses(
                 coords=coords,
                 v_star=v_star,
                 B_star=B_star,
+                nwp_baseline=nwp_baseline,
                 **training_loss_kwargs(config, "joint"),
             )
             for key, value in losses.items():
@@ -455,13 +477,14 @@ def run_epoch(
     sums: dict[str, float] = {}
 
     for _ in range(steps):
-        x, z, v_star, B_star = sample_window(arrays, window_size, device)
+        x, z, nwp_baseline, v_star, B_star = sample_window(arrays, window_size, device)
         optimizer.zero_grad(set_to_none=True)
 
         if isinstance(model, (VectorMIDETrainingModule, DistributedDataParallel)):
             losses = model(
                 x=x,
                 z=z,
+                nwp_baseline=nwp_baseline,
                 coords=coords,
                 v_star=v_star,
                 B_star=B_star,
@@ -475,6 +498,7 @@ def run_epoch(
                 coords=coords,
                 v_star=v_star,
                 B_star=B_star,
+                nwp_baseline=nwp_baseline,
                 stage=stage,
                 loss_kwargs=training_loss_kwargs(config, stage),
             )
@@ -539,7 +563,13 @@ def main() -> None:
     if is_main_process():
         print_data_input_summary(data, "offline")
 
-    arrays = {"X": data["X"], "Z": data["Z"], "V_star": data["V_star"], "B_star": data.get("B_star")}
+    arrays = {
+        "X": data["X"],
+        "Z": data["Z"],
+        "nwp_baseline": data.get("nwp_baseline"),
+        "V_star": data["V_star"],
+        "B_star": data.get("B_star"),
+    }
     train_arrays, val_arrays, val_starts = split_train_validation(arrays, config)
     if val_arrays is not None and is_main_process():
         rank_zero_print(
@@ -562,7 +592,7 @@ def main() -> None:
     optimizer = build_optimizer(train_model, config)
 
     if args.dry_run:
-        x, z, v_star, B_star = sample_window(arrays, min(16, arrays["X"].shape[0]), device)
+        x, z, nwp_baseline, v_star, B_star = sample_window(arrays, min(16, arrays["X"].shape[0]), device)
         with torch.enable_grad():
             losses = unwrap_model(train_model).training_losses(
                 x=x,
@@ -570,6 +600,7 @@ def main() -> None:
                 coords=coords,
                 v_star=v_star,
                 B_star=B_star,
+                nwp_baseline=nwp_baseline,
                 **training_loss_kwargs(config, "joint"),
             )
         if is_main_process():

@@ -198,6 +198,58 @@ def test_vector_mide_transition_modifiers_and_control_loss_are_finite():
     assert torch.allclose(losses["M_base"].sum(dim=-1), torch.ones(T, 6), atol=1.0e-4)
 
 
+def test_hybrid_direct_horizon_steps_use_measurement_persistence_target():
+    T = 4
+    model = VectorMIDE(n_sites=3, in_channels=6, hidden_dim=32)
+    z = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        ]
+    )
+    nwp = torch.tensor(
+        [
+            [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+            [90.0, 90.0, 90.0, 90.0, 90.0, 90.0],
+            [80.0, 80.0, 80.0, 80.0, 80.0, 80.0],
+            [70.0, 70.0, 70.0, 70.0, 70.0, 70.0],
+        ]
+    )
+    M = torch.eye(6).expand(T, 6, 6)
+    filter_means = torch.zeros(T, 6)
+
+    loss = model.multi_step_forecast_loss(
+        z=z,
+        M_seq=M,
+        filter_means=filter_means,
+        horizons=[1],
+        nwp_baseline=nwp,
+        hybrid_first_horizon_direct=True,
+        hybrid_direct_horizon_steps=2,
+    )
+
+    expected_target = z[:-1] + nwp[:-1] - nwp[1:]
+    expected = expected_target.pow(2).mean()
+    assert torch.allclose(loss, expected)
+
+    loss = model.multi_step_forecast_loss(
+        z=z,
+        M_seq=M,
+        filter_means=filter_means,
+        horizons=[2, 3],
+        nwp_baseline=nwp,
+        hybrid_first_horizon_direct=True,
+        hybrid_direct_horizon_steps=2,
+    )
+
+    expected_h2 = z[:-2] + nwp[:-2] - nwp[2:]
+    expected_h3 = z[3:]
+    expected = torch.stack([expected_h2.pow(2).mean(), expected_h3.pow(2).mean()]).mean()
+    assert torch.allclose(loss, expected)
+
+
 def test_measurement_columns_build_140m_state_order():
     ws_uv = np.arange(2 * 18, dtype=np.float32).reshape(2, 18)
     z = build_z_from_measurements(ws_uv)

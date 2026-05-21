@@ -56,7 +56,7 @@ window_size: 336
 rolling_window_size: 24
 batch_size: 512
 steps_per_epoch: 30
-forecast_horizon: 12
+forecast_horizon: 36
 transition_kernel_weight: true
 transition_kernel_weight_init: 0.2
 transition_kernel_weight_min: 0.0
@@ -80,9 +80,11 @@ lambda_deform: 0.05
 lambda_smooth: 0.001
 lambda_reg: 0.0001
 lambda_multistep: 0.2
-multistep_horizons: [1, 2, 3, 6, 9, 12]
+multistep_horizons: [1, 2, 3, 6, 9, 12, 18, 24, 36]
 multistep_max_origins: 256
 multistep_stages: [joint, online]
+hybrid_first_horizon_direct: true
+hybrid_direct_horizon_steps: 6
 lambda_anchor: 0.01
 
 offline_epochs_pretrain_adv: 20
@@ -100,11 +102,12 @@ online_checkpoint_metric: val_forecast_rmse_mean
 online_early_stop_patience: 0
 online_min_delta: 0.0
 online_checkpoint_every_updates: 0
-online_adaptation_scope: ide_only
+online_adaptation_scope: output_head
 online_lr: 5.0e-5
 online_lambda_adv: 0.0
 online_lambda_deform: 0.0
-online_lambda_multistep: 0.0
+online_lambda_multistep: 0.1
+online_multistep_horizons: [1, 3, 6, 12, 24, 36]
 online_require_improvement_over_initial: true
 online_global_steps: 1000
 global_online_checkpoint_name: vector_mide_online_cuda_global.pt
