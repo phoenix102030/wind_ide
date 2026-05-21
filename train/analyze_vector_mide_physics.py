@@ -240,6 +240,14 @@ def plot_skill_curves(metrics: dict[str, np.ndarray], out: Path) -> None:
     columns = [str(x) for x in metrics["curve_columns"]]
     rmse_curve = metrics["rmse_curve"]
     mae_curve = metrics["mae_curve"]
+    horizons, rmse_curve, mae_curve, columns = hourly_skill_curves(
+        horizons,
+        rmse_curve,
+        mae_curve,
+        columns,
+        group_size=6,
+        exclude_columns={"nwp_residual_persistence"},
+    )
 
     colors = [MODEL_COLOR, PERSISTENCE_COLOR, NWP_COLOR, PALETTE["purple"]]
     markers = ["o", "s", "^", "D"]
@@ -261,10 +269,10 @@ def plot_skill_curves(metrics: dict[str, np.ndarray], out: Path) -> None:
             markersize=5.5,
             label=name,
         )
-    axes[0].set_title("RMSE by forecast horizon")
-    axes[1].set_title("MAE by forecast horizon")
+    axes[0].set_title("Hourly RMSE by forecast lead")
+    axes[1].set_title("Hourly MAE by forecast lead")
     for ax in axes:
-        ax.set_xlabel("Horizon")
+        ax.set_xlabel("Forecast hour")
         polish_axes(ax)
     axes[0].set_ylabel("Error")
     axes[1].legend(loc="upper left", fontsize=8)
@@ -272,6 +280,33 @@ def plot_skill_curves(metrics: dict[str, np.ndarray], out: Path) -> None:
     panel_label(axes[1], "b")
     fig.savefig(out / "skill_by_horizon.png")
     plt.close(fig)
+
+
+def hourly_skill_curves(
+    horizons: np.ndarray,
+    rmse_curve: np.ndarray,
+    mae_curve: np.ndarray,
+    columns: list[str],
+    group_size: int = 6,
+    exclude_columns: set[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    exclude = exclude_columns or set()
+    keep = [idx for idx, name in enumerate(columns) if name not in exclude]
+    columns = [columns[idx] for idx in keep]
+    rmse_curve = rmse_curve[:, keep]
+    mae_curve = mae_curve[:, keep]
+
+    if group_size <= 1:
+        return horizons, rmse_curve, mae_curve, columns
+
+    groups = ((horizons.astype(int) - 1) // int(group_size)) + 1
+    grouped_horizons = np.unique(groups)
+    grouped_rmse = np.full((grouped_horizons.size, rmse_curve.shape[1]), np.nan, dtype=np.float32)
+    grouped_mae = np.full((grouped_horizons.size, mae_curve.shape[1]), np.nan, dtype=np.float32)
+    for row, group in enumerate(grouped_horizons):
+        grouped_rmse[row] = np.nanmean(rmse_curve[groups == group], axis=0)
+        grouped_mae[row] = np.nanmean(mae_curve[groups == group], axis=0)
+    return grouped_horizons.astype(np.int32), grouped_rmse, grouped_mae, columns
 
 
 def per_station_metrics(

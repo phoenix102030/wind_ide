@@ -942,23 +942,58 @@ def _horizon_plot(
     labels: np.ndarray,
     title: str,
     ylabel: str,
+    group_size: int = 6,
+    exclude_labels: set[str] | None = None,
 ) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    horizons, values, labels = _prepare_horizon_plot_data(
+        horizons,
+        values,
+        labels,
+        group_size=group_size,
+        exclude_labels=exclude_labels,
+    )
     fig, ax = plt.subplots(figsize=(8, 4.5))
     for col, label in enumerate(labels.tolist()):
         ax.plot(horizons, values[:, col], marker="o", linewidth=1.8, label=str(label))
     ax.set_title(title)
-    ax.set_xlabel("forecast horizon")
+    ax.set_xlabel("forecast hour" if group_size > 1 else "forecast horizon")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.25)
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=160)
     plt.close(fig)
+
+
+def _prepare_horizon_plot_data(
+    horizons: np.ndarray,
+    values: np.ndarray,
+    labels: np.ndarray,
+    group_size: int = 6,
+    exclude_labels: set[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    horizons = np.asarray(horizons)
+    values = np.asarray(values)
+    labels = np.asarray(labels)
+    exclude = exclude_labels or {"nwp_residual_persistence"}
+    keep = np.asarray([str(label) not in exclude for label in labels], dtype=bool)
+    labels = labels[keep]
+    values = values[:, keep]
+
+    if group_size <= 1 or horizons.size == 0:
+        return horizons, values, labels
+
+    groups = ((horizons.astype(int) - 1) // int(group_size)) + 1
+    grouped_horizons = np.unique(groups)
+    grouped_values = np.full((grouped_horizons.size, values.shape[1]), np.nan, dtype=np.float32)
+    for row, group in enumerate(grouped_horizons):
+        grouped_values[row] = np.nanmean(values[groups == group], axis=0)
+    return grouped_horizons.astype(np.int32), grouped_values, labels
 
 
 def _bubble_matrix(
@@ -1709,7 +1744,7 @@ def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: i
         artifacts["horizons"],
         artifacts["multi_step_rmse_curve"],
         artifacts["multi_step_curve_columns"],
-        "Multi-step RMSE",
+        "Hourly mean multi-step RMSE",
         "RMSE",
     )
     _horizon_plot(
@@ -1717,7 +1752,7 @@ def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: i
         artifacts["horizons"],
         artifacts["multi_step_mae_curve"],
         artifacts["multi_step_curve_columns"],
-        "Multi-step MAE",
+        "Hourly mean multi-step MAE",
         "MAE",
     )
 
