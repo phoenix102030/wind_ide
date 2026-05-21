@@ -1,6 +1,6 @@
 experiment_type: VectorMIDE
 seed: 123
-device: cuda
+device: cuda:0
 allow_device_fallback: false
 
 n_dim: 3
@@ -56,7 +56,7 @@ window_size: 336
 rolling_window_size: 24
 batch_size: 512
 steps_per_epoch: 30
-forecast_horizon: 12
+forecast_horizon: 72
 transition_kernel_weight: true
 transition_kernel_weight_init: 0.2
 transition_kernel_weight_min: 0.0
@@ -80,9 +80,9 @@ lambda_deform: 0.05
 lambda_smooth: 0.001
 lambda_reg: 0.0001
 lambda_multistep: 0.2
-multistep_horizons: [1, 2, 3, 6, 9, 12]
+multistep_horizons: [ 1, 2, 3, 6, 9, 12 ]
 multistep_max_origins: 256
-multistep_stages: [joint, online]
+multistep_stages: [ joint, online ]
 lambda_anchor: 0.01
 
 offline_epochs_pretrain_adv: 20
@@ -99,12 +99,17 @@ online_checkpoint_metric: val_loss_forecast
 online_early_stop_patience: 0
 online_min_delta: 0.0
 online_checkpoint_every_updates: 0
-online_adaptation_scope: output_head
+online_adaptation_scope: ide_only
+online_lr: 5e-5
+online_lambda_adv: 0.0
+online_lambda_deform: 0.0
+online_lambda_multistep: 0.0
+online_require_improvement_over_initial: true
 online_global_steps: 1000
 global_online_checkpoint_name: vector_mide_online_cuda_global.pt
 last_global_online_checkpoint_name: vector_mide_online_cuda_global_last.pt
 
-checkpoint_dir: outputs/cnn_transformer_new
+checkpoint_dir: outputs/cnn_transformer_imputed_bkup #_bkup
 offline_checkpoint_name: vector_mide_offline_cuda.pt
 last_offline_checkpoint_name: vector_mide_offline_cuda_last.pt
 online_checkpoint_name: vector_mide_online_cuda.pt
@@ -137,7 +142,7 @@ data:
   deformation_label_mode: nwp_gradient
   deformation_label_clip: 0.3
   optical_flow_stride: 2
-  optical_flow_ridge: 1.0e-4
+  optical_flow_ridge: 1e-4
   patch_radius: 2
   standardize_x: true
   standardize_z: false
