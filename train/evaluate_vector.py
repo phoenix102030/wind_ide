@@ -406,6 +406,8 @@ def evaluate(
     flow_mu_sum: np.ndarray | None = None
     flow_sigma_sum: np.ndarray | None = None
     B_sum: np.ndarray | None = None
+    pair_flow_mu_sum: np.ndarray | None = None
+    pair_flow_sigma_sum: np.ndarray | None = None
     control_sum: np.ndarray | None = None
     kernel_weight_sum: np.ndarray | None = None
     residual_decay_sum: np.ndarray | None = None
@@ -436,6 +438,14 @@ def evaluate(
                 if B_sum is None:
                     B_sum = np.zeros((T, 2, 2), dtype=np.float64)
                 B_sum[start:end] += outputs["B"].detach().cpu().numpy()
+            if "pair_flow_mu" in outputs:
+                if pair_flow_mu_sum is None:
+                    pair_flow_mu_sum = np.zeros((T, 2, 2, 2), dtype=np.float64)
+                pair_flow_mu_sum[start:end] += outputs["pair_flow_mu"].detach().cpu().numpy()
+            if "pair_flow_Sigma" in outputs:
+                if pair_flow_sigma_sum is None:
+                    pair_flow_sigma_sum = np.zeros((T, 2, 2, 2, 2), dtype=np.float64)
+                pair_flow_sigma_sum[start:end] += outputs["pair_flow_Sigma"].detach().cpu().numpy()
             if "transition_control" in outputs:
                 if control_sum is None:
                     control_sum = np.zeros((T, outputs["transition_control"].shape[-1]), dtype=np.float64)
@@ -465,6 +475,8 @@ def evaluate(
     flow_mu_np = None
     flow_sigma_np = None
     B_np = None
+    pair_flow_mu_np = None
+    pair_flow_sigma_np = None
     if flow_mu_sum is not None:
         flow_mu_np = np.full(flow_mu_sum.shape, np.nan, dtype=np.float32)
         flow_mu_np[valid_params] = (flow_mu_sum[valid_params] / counts).astype(np.float32)
@@ -474,6 +486,12 @@ def evaluate(
     if B_sum is not None:
         B_np = np.full(B_sum.shape, np.nan, dtype=np.float32)
         B_np[valid_params] = (B_sum[valid_params] / counts[:, :, None]).astype(np.float32)
+    if pair_flow_mu_sum is not None:
+        pair_flow_mu_np = np.full(pair_flow_mu_sum.shape, np.nan, dtype=np.float32)
+        pair_flow_mu_np[valid_params] = (pair_flow_mu_sum[valid_params] / counts[:, :, None, None]).astype(np.float32)
+    if pair_flow_sigma_sum is not None:
+        pair_flow_sigma_np = np.full(pair_flow_sigma_sum.shape, np.nan, dtype=np.float32)
+        pair_flow_sigma_np[valid_params] = (pair_flow_sigma_sum[valid_params] / counts[:, :, None, None, None]).astype(np.float32)
     processed_flow_mu_np = None
     if flow_mu_np is not None and B_np is not None:
         processed_flow_mu_np = np.einsum("tij,tj->ti", B_np, flow_mu_np).astype(np.float32)
@@ -737,6 +755,21 @@ def evaluate(
         "target_component_flow": target_component_flow_np,
         "component_flow_strength": component_flow_strength_np,
         "row_scaled_B_flow": row_scaled_B_flow_np,
+        "pair_flow_mu": (
+            pair_flow_mu_np
+            if pair_flow_mu_np is not None
+            else np.empty((0, 2, 2, 2), dtype=np.float32)
+        ),
+        "pair_flow_Sigma": (
+            pair_flow_sigma_np
+            if pair_flow_sigma_np is not None
+            else np.empty((0, 2, 2, 2, 2), dtype=np.float32)
+        ),
+        "pair_flow_Sigma_diag": (
+            np.diagonal(pair_flow_sigma_np, axis1=3, axis2=4)
+            if pair_flow_sigma_np is not None
+            else np.empty((0, 2, 2, 2), dtype=np.float32)
+        ),
         "kernel_weight": (
             kernel_weight_np
             if kernel_weight_np is not None
@@ -829,6 +862,9 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
         target_component_flow=artifacts["target_component_flow"],
         component_flow_strength=artifacts["component_flow_strength"],
         row_scaled_B_flow=artifacts["row_scaled_B_flow"],
+        pair_flow_mu=artifacts["pair_flow_mu"],
+        pair_flow_Sigma=artifacts["pair_flow_Sigma"],
+        pair_flow_Sigma_diag=artifacts["pair_flow_Sigma_diag"],
         kernel_weight=artifacts["kernel_weight"],
         residual_decay=artifacts["residual_decay"],
         transition_control=artifacts["transition_control"],

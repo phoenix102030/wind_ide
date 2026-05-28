@@ -368,7 +368,13 @@ class VectorMIDE(nn.Module):
 
     def forward(self, x: Tensor, coords: Tensor) -> dict[str, Tensor]:
         outputs = self.net(x)
-        if "flow_mu" in outputs and "flow_Sigma" in outputs and "B" in outputs:
+        if "pair_flow_mu" in outputs and "pair_flow_Sigma" in outputs:
+            base_M = self.kernel.forward_pairwise_flow(
+                coords,
+                outputs["pair_flow_mu"],
+                outputs["pair_flow_Sigma"],
+            )
+        elif "flow_mu" in outputs and "flow_Sigma" in outputs and "B" in outputs:
             base_M = self.kernel.forward_shared_flow(
                 coords,
                 outputs["flow_mu"],

@@ -1,0 +1,153 @@
+experiment_type: VectorMIDE
+seed: 123
+device: cuda
+allow_device_fallback: false
+
+n_dim: 3
+p_dim: 2
+m_dim: 6
+height_target: 140
+
+img_size: 40
+in_channels: 6
+hidden_dim: 64
+output_dim: 18
+mu_scale_init: 10.0
+component_mixing_floor: 0.01
+network_type: cnn_transformer
+transformer_d_model: 128
+transformer_nhead: 4
+transformer_layers: 2
+transformer_dim_feedforward: 256
+transformer_dropout: 0.1
+transformer_causal: true
+transformer_max_len: 4096
+
+nwp_channel_names:
+- u100
+- v100
+- u140
+- v140
+- u180
+- v180
+component_specific_mu: false
+advection_mode: shared_flow_component_kernel
+deformation_scale: 0.3
+
+dt: 1.0
+dt_seconds: 600.0
+time_mode: target_only
+gamma: 0.0
+learnable_gamma: false
+
+row_normalize: true
+use_spectral_scaling: false
+spectral_radius: 0.98
+kernel_jitter: 1e-5
+kalman_jitter: 1e-5
+ell_init: 80.0
+ell_min: 5.0
+ell_max: 300.0
+
+q_init: 0.2
+r_init: 0.2
+
+window_size: 336
+rolling_window_size: 24
+batch_size: 512
+steps_per_epoch: 30
+forecast_horizon: 36
+transition_kernel_weight: true
+transition_kernel_weight_init: 0.2
+transition_kernel_weight_min: 0.0
+transition_kernel_weight_max: 1.0
+transition_residual_decay: true
+transition_residual_decay_init: 0.97
+transition_residual_decay_min: 0.0
+transition_residual_decay_max: 1.0
+transition_control: true
+transition_control_scale: 0.5
+
+lr_cnn: 2e-5
+lr_heads: 1e-4
+lr_kernel: 5e-4
+lr_qr: 5e-4
+weight_decay: 1e-4
+grad_clip: 1.0
+
+lambda_adv: 0.1
+lambda_deform: 0.05
+lambda_smooth: 0.001
+lambda_reg: 0.0001
+lambda_multistep: 0.2
+multistep_horizons: [1, 2, 3, 6, 9, 12, 18, 24, 36]
+multistep_max_origins: 256
+multistep_stages: [joint, online]
+hybrid_first_horizon_direct: true
+hybrid_direct_horizon_steps: 6
+lambda_anchor: 0.01
+
+offline_epochs_pretrain_adv: 20
+offline_epochs_kf: 10
+offline_epochs_finetune: 250
+
+online_window_size: 168
+online_update_every: 6
+online_steps: 10
+online_validation_window_size: 168
+online_validation_every_updates: 10
+online_validation_forecast_horizon: 72
+online_validation_gap: 0
+online_checkpoint_metric: val_forecast_rmse_mean
+online_early_stop_patience: 0
+online_min_delta: 0.0
+online_checkpoint_every_updates: 0
+online_adaptation_scope: output_head
+online_lr: 5.0e-5
+online_lambda_adv: 0.0
+online_lambda_deform: 0.0
+online_lambda_multistep: 0.1
+online_multistep_horizons: [1, 3, 6, 12, 24, 36]
+online_require_improvement_over_initial: true
+online_global_steps: 1000
+global_online_checkpoint_name: vector_mide_online_cuda_global.pt
+initial_global_online_checkpoint_name: vector_mide_online_cuda_global_initial.pt
+last_global_online_checkpoint_name: vector_mide_online_cuda_global_last.pt
+
+checkpoint_dir: outputs/cnn_transformer_new
+offline_checkpoint_name: vector_mide_pair_kernel_offline_cuda.pt
+last_offline_checkpoint_name: vector_mide_pair_kernel_offline_cuda_last.pt
+online_checkpoint_name: vector_mide_pair_kernel_online_cuda.pt
+last_online_checkpoint_name: vector_mide_pair_kernel_online_cuda_last.pt
+checkpoint_stage: joint
+checkpoint_metric: val_loss_forecast
+
+validation_enabled: true
+validation_fraction: 0.15
+validation_window_size: null
+validation_num_windows: 8
+validation_min_windows: 2
+validation_every_epochs: 5
+
+data:
+  offline_measurement_path: data/measurement/wv_h100_180_offline_imputed.mat
+  offline_nwp_path: data/nwp/data_grid_offline.mat
+  online_measurement_path: data/measurement/wv_h100_180_online_imputed.mat
+  online_nwp_path: data/nwp/data_grid_online.mat
+  target_mode: residual_nwp
+  prefer_imputed_measurements: true
+  measurement_missing_policy: error
+  require_complete_target: true
+  use_measurement_station_coords: true
+  station_grid_indices:
+  - [ 18, 18 ]
+  - [ 20, 20 ]
+  - [ 22, 22 ]
+  advection_label_mode: simple
+  deformation_label_mode: nwp_gradient
+  deformation_label_clip: 0.3
+  optical_flow_stride: 2
+  optical_flow_ridge: 1.0e-4
+  patch_radius: 2
+  standardize_x: true
+  standardize_z: false

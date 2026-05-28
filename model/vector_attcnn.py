@@ -139,8 +139,11 @@ class VectorAdvectionNet(nn.Module):
             raise ValueError("VectorAdvectionNet expects output_dim=18")
         if network_type not in {"cnn", "cnn_transformer"}:
             raise ValueError("network_type must be 'cnn' or 'cnn_transformer'")
-        if advection_mode not in {"component", "shared_flow_deformation"}:
-            raise ValueError("advection_mode must be 'component' or 'shared_flow_deformation'")
+        if advection_mode not in {"component", "shared_flow_deformation", "shared_flow_component_kernel"}:
+            raise ValueError(
+                "advection_mode must be 'component', 'shared_flow_deformation', "
+                "or 'shared_flow_component_kernel'"
+            )
         if transformer_d_model % transformer_nhead != 0:
             raise ValueError("transformer_d_model must be divisible by transformer_nhead")
         if not 0.0 <= component_mixing_floor < 0.5:
@@ -213,7 +216,7 @@ class VectorAdvectionNet(nn.Module):
             self.mu_v_head = None
         self.chol_head = nn.Linear(feature_dim, 10) if use_component_heads else None
         self.A_head = nn.Linear(feature_dim, 4) if use_component_heads else None
-        if self.advection_mode == "shared_flow_deformation":
+        if self.advection_mode in {"shared_flow_deformation", "shared_flow_component_kernel"}:
             self.flow_head = nn.Linear(feature_dim, 2)
             self.flow_chol_head = nn.Linear(feature_dim, 3)
             self.deformation_head = nn.Linear(feature_dim, 4)
@@ -420,6 +423,73 @@ class VectorAdvectionNet(nn.Module):
             "flow_Sigma": flow_sigma,
         }
 
+    @staticmethod
+    def _component_kernel_moments(flow_mu: Tensor, flow_sigma: Tensor, B: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Expand one learned 2D flow into component-pair flow moments.
+
+        ``pair_flow_mu[:, i, j]`` is the spatial shift used by the separate
+        kernel for source component ``j`` contributing to target component
+        ``i``. ``mu`` and ``sigma`` are compact 4D summaries for diagnostics:
+        they aggregate the two source contributions for each target component.
+        """
+        pair_flow_mu = B[:, :, :, None] * flow_mu[:, None, None, :]
+        pair_flow_sigma = B[:, :, :, None, None].pow(2) * flow_sigma[:, None, None, :, :]
+
+        row_scale = B.sum(dim=-1)
+        target_mu = row_scale[:, :, None] * flow_mu[:, None, :]
+        mu = target_mu.reshape(flow_mu.shape[0], 4)
+
+        sigma = flow_sigma.new_zeros(flow_mu.shape[0], 4, 4)
+        for i in range(2):
+            for j in range(2):
+                block = row_scale[:, i, None, None] * row_scale[:, j, None, None] * flow_sigma
+                sigma[:, i * 2 : (i + 1) * 2, j * 2 : (j + 1) * 2] = block
+        return pair_flow_mu, pair_flow_sigma, mu, sigma
+
+    def forward_shared_flow_component_kernel(self, features: Tensor) -> dict[str, Tensor]:
+        if self.flow_head is None or self.flow_chol_head is None or self.deformation_head is None:
+            raise RuntimeError("Shared-flow component-kernel heads are not initialized")
+
+        raw_flow = self.flow_head(features)
+        raw_flow_chol = self.flow_chol_head(features)
+        raw_B = self.deformation_head(features)
+        flow_mu = torch.tanh(raw_flow) * self.mu_scale
+        flow_L, flow_sigma = covariance_from_cholesky_raw(
+            raw_flow_chol,
+            dim=2,
+            jitter=self.chol_jitter,
+        )
+
+        eye2 = torch.eye(2, device=features.device, dtype=features.dtype).unsqueeze(0)
+        B_delta = self.deformation_scale * torch.tanh(raw_B.reshape(-1, 2, 2))
+        B = eye2 + B_delta
+        pair_flow_mu, pair_flow_sigma, mu, sigma = self._component_kernel_moments(flow_mu, flow_sigma, B)
+
+        n_time = flow_mu.shape[0]
+        L = flow_L.new_zeros(n_time, 4, 4)
+        L[:, :2, :2] = flow_L
+        L[:, 2:, 2:] = flow_L
+        raw_mu = torch.cat([raw_flow, raw_flow], dim=-1)
+        raw_chol = self._expand_flow_cholesky_raw(raw_flow_chol)
+        raw = torch.cat([raw_mu, raw_chol, raw_B], dim=-1)
+        B_logits = raw_B.reshape(-1, 2, 2)
+
+        return {
+            "raw": raw,
+            "mu": mu,
+            "L": L,
+            "Sigma": sigma,
+            "A": torch.ones_like(B),
+            "A_logits": B_logits,
+            "B": B,
+            "B_delta": B_delta,
+            "flow_mu": flow_mu,
+            "flow_L": flow_L,
+            "flow_Sigma": flow_sigma,
+            "pair_flow_mu": pair_flow_mu,
+            "pair_flow_Sigma": pair_flow_sigma,
+        }
+
     def forward(self, x: Tensor) -> dict[str, Tensor]:
         if x.ndim == 3:
             x = x.unsqueeze(0)
@@ -431,6 +501,30 @@ class VectorAdvectionNet(nn.Module):
 
         if self.advection_mode == "shared_flow_deformation":
             result = self.forward_shared_flow_deformation(features)
+            if self.kernel_weight_head is not None:
+                raw_kernel_weight = self.kernel_weight_head(features)
+                result["raw_kernel_weight"] = raw_kernel_weight
+                result["kernel_weight"] = self._bounded_sigmoid(
+                    raw_kernel_weight,
+                    self.transition_kernel_weight_min,
+                    self.transition_kernel_weight_max,
+                )
+            if self.residual_decay_head is not None:
+                raw_residual_decay = self.residual_decay_head(features)
+                result["raw_residual_decay"] = raw_residual_decay
+                result["residual_decay"] = self._bounded_sigmoid(
+                    raw_residual_decay,
+                    self.transition_residual_decay_min,
+                    self.transition_residual_decay_max,
+                )
+            if self.control_head is not None:
+                raw_control = self.control_head(features)
+                result["raw_transition_control"] = raw_control
+                result["transition_control"] = torch.tanh(raw_control) * self.transition_control_scale
+            return result
+
+        if self.advection_mode == "shared_flow_component_kernel":
+            result = self.forward_shared_flow_component_kernel(features)
             if self.kernel_weight_head is not None:
                 raw_kernel_weight = self.kernel_weight_head(features)
                 result["raw_kernel_weight"] = raw_kernel_weight

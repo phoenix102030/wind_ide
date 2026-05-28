@@ -1853,6 +1853,309 @@ def plot_advection_covariance_anisotropy(
     return summary
 
 
+def plot_advection_uncertainty_interpretation(
+    flow: np.ndarray,
+    advection: dict[str, np.ndarray],
+    forecasts: dict[str, np.ndarray],
+    nwp_vec: np.ndarray,
+    nwp_speed_mean: np.ndarray,
+    out: Path,
+) -> dict[str, Any]:
+    cov = advection_covariance_for_flow(advection, flow)
+    if cov is None:
+        return {"created": False, "reason": "requires learned flow covariance"}
+
+    plt = setup_matplotlib()
+    from matplotlib.patches import Ellipse
+
+    n = min(flow.shape[0], cov.shape[0], forecasts["prediction"].shape[0], forecasts["target"].shape[0], nwp_vec.shape[0], nwp_speed_mean.shape[0])
+    flow = flow[:n].astype(np.float64, copy=False)
+    cov = cov[:n].astype(np.float64, copy=False)
+    pred = forecasts["prediction"][:n].astype(np.float64, copy=False)
+    target = forecasts["target"][:n].astype(np.float64, copy=False)
+    nwp_vec = nwp_vec[:n].astype(np.float64, copy=False)
+    nwp_speed_mean = nwp_speed_mean[:n].astype(np.float64, copy=False)
+
+    cov_trace = np.full(n, np.nan, dtype=np.float64)
+    cov_std = np.full(n, np.nan, dtype=np.float64)
+    cov_det = np.full(n, np.nan, dtype=np.float64)
+    major_lambda = np.full(n, np.nan, dtype=np.float64)
+    minor_lambda = np.full(n, np.nan, dtype=np.float64)
+    anisotropy_ratio = np.full(n, np.nan, dtype=np.float64)
+    major_axis_angle = np.full(n, np.nan, dtype=np.float64)
+    axis_vec = np.full((n, 2), np.nan, dtype=np.float64)
+
+    valid_cov = finite_mask(cov)
+    for t in np.where(valid_cov)[0]:
+        S = 0.5 * (cov[t] + cov[t].T) + 1e-8 * np.eye(2)
+        vals, vecs = np.linalg.eigh(S)
+        vals = np.clip(vals, 1e-12, None)
+        minor_lambda[t] = float(vals[0])
+        major_lambda[t] = float(vals[1])
+        cov_trace[t] = float(vals.sum())
+        cov_std[t] = float(np.sqrt(vals.sum()))
+        cov_det[t] = float(vals.prod())
+        anisotropy_ratio[t] = float(np.sqrt(vals[1] / vals[0]))
+        axis = vecs[:, 1]
+        if np.isfinite(nwp_vec[t]).all() and np.dot(axis, nwp_vec[t]) < 0:
+            axis = -axis
+        axis_vec[t] = axis
+        major_axis_angle[t] = float(np.degrees(np.arctan2(axis[1], axis[0])) % 180.0)
+
+    pred_speed = station_speed(pred)
+    target_speed = station_speed(target)
+    speed_error_station = np.abs(pred_speed - target_speed)
+    speed_error_count = np.sum(np.isfinite(speed_error_station), axis=1)
+    speed_abs_error_station_mean = np.divide(
+        np.nansum(speed_error_station, axis=1),
+        speed_error_count,
+        out=np.full(n, np.nan, dtype=np.float64),
+        where=speed_error_count > 0,
+    )
+    uv_sq_error = (pred - target) ** 2
+    uv_error_count = np.sum(np.isfinite(uv_sq_error), axis=1)
+    uv_rmse_time = np.sqrt(
+        np.divide(
+            np.nansum(uv_sq_error, axis=1),
+            uv_error_count,
+            out=np.full(n, np.nan, dtype=np.float64),
+            where=uv_error_count > 0,
+        )
+    )
+    nwp_angle = vector_angle_deg(nwp_vec)
+    nwp_direction_change = np.full(n, np.nan, dtype=np.float64)
+    if n > 1:
+        nwp_direction_change[1:] = np.abs(angle_diff_deg(nwp_vec[1:], nwp_vec[:-1]))
+
+    nwp_norm = np.linalg.norm(nwp_vec, axis=1)
+    axis_wind_alignment = np.abs(np.nansum(axis_vec * nwp_vec, axis=1)) / (nwp_norm + 1e-8)
+
+    def moving_average_nan(values: np.ndarray, window_size: int) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        finite_values = np.isfinite(values)
+        weights = np.ones(window_size, dtype=np.float64)
+        summed = np.convolve(np.where(finite_values, values, 0.0), weights, mode="same")
+        counts = np.convolve(finite_values.astype(np.float64), weights, mode="same")
+        out_values = summed / np.maximum(counts, 1.0)
+        out_values[counts == 0.0] = np.nan
+        return out_values
+
+    window = min(96, max(8, n // 80))
+    cov_trace_smooth = moving_average_nan(cov_trace, window)
+    speed_error_smooth = moving_average_nan(speed_abs_error_station_mean, window)
+    direction_change_smooth = moving_average_nan(nwp_direction_change, window)
+
+    table = np.column_stack(
+        [
+            np.arange(n),
+            cov_trace,
+            cov_std,
+            major_lambda,
+            minor_lambda,
+            anisotropy_ratio,
+            major_axis_angle,
+            axis_wind_alignment,
+            nwp_angle,
+            nwp_direction_change,
+            nwp_speed_mean,
+            speed_abs_error_station_mean,
+            uv_rmse_time,
+            cov_trace_smooth,
+            speed_error_smooth,
+            direction_change_smooth,
+        ]
+    )
+    np.savetxt(
+        out / "advection_uncertainty_interpretation_timeseries.csv",
+        table,
+        delimiter=",",
+        header=(
+            "time_index,cov_trace_variance,cov_sqrt_trace_spread,cov_lambda_major,cov_lambda_minor,"
+            "anisotropy_ratio,major_axis_angle_deg_mod180,axis_wind_alignment_abs_cos,nwp_wind_angle_deg,"
+            "nwp_direction_change_deg,nwp_speed_mean,forecast_speed_abs_error_station_mean,"
+            "forecast_uv_rmse_time,cov_trace_variance_smooth,forecast_speed_abs_error_smooth,"
+            "nwp_direction_change_smooth"
+        ),
+        comments="",
+        fmt="%.8g",
+    )
+
+    high_var_threshold = float(np.nanpercentile(cov_trace, 90))
+    low_var_threshold = float(np.nanpercentile(cov_trace, 10))
+    high_error_threshold = float(np.nanpercentile(speed_abs_error_station_mean, 75))
+    low_error_threshold = float(np.nanpercentile(speed_abs_error_station_mean, 50))
+
+    fig, axes = plt.subplots(3, 1, figsize=(13.6, 8.8), sharex=True, constrained_layout=True)
+    x = np.arange(n)
+    axes[0].plot(x, cov_trace, color=MODEL_COLOR, alpha=0.24, linewidth=1.0, label="variance trace")
+    axes[0].plot(x, cov_trace_smooth, color=PALETTE["navy"], linestyle="--", linewidth=2.4, label=f"{window}-step smooth")
+    axes[0].axhline(high_var_threshold, color=PALETTE["red"], linestyle=":", linewidth=2.0, label="90th percentile")
+    axes[0].set_title("Learned advection variance over time")
+    axes[0].set_ylabel(r"$trace(\Sigma_t)$")
+    axes[0].legend(loc="upper right", fontsize=9)
+    polish_axes(axes[0])
+    panel_label(axes[0], "a")
+
+    axes[1].plot(x, nwp_direction_change, color=PALETTE["green"], alpha=0.22, linewidth=1.0, label="NWP direction change")
+    axes[1].plot(x, direction_change_smooth, color=PALETTE["green"], linestyle="--", linewidth=2.3, label=f"{window}-step smooth")
+    spike_idx = np.where(cov_trace >= high_var_threshold)[0]
+    if spike_idx.size:
+        axes[1].scatter(spike_idx, nwp_direction_change[spike_idx], s=16, color=PALETTE["red"], alpha=0.45, edgecolors="none", label="high variance times")
+    axes[1].set_title("Variance spikes against wind-direction transition")
+    axes[1].set_ylabel("Direction change (deg)")
+    axes[1].legend(loc="upper right", fontsize=9)
+    polish_axes(axes[1])
+    panel_label(axes[1], "b")
+
+    axes[2].plot(x, speed_abs_error_station_mean, color=NWP_COLOR, alpha=0.22, linewidth=1.0, label="forecast speed error")
+    axes[2].plot(x, speed_error_smooth, color=NWP_COLOR, linestyle="--", linewidth=2.3, label=f"{window}-step smooth")
+    axes[2].set_title("Forecast error over the same period")
+    axes[2].set_xlabel("Time index")
+    axes[2].set_ylabel("Speed MAE")
+    axes[2].legend(loc="upper right", fontsize=9)
+    polish_axes(axes[2])
+    panel_label(axes[2], "c")
+    fig.savefig(out / "advection_uncertainty_variance_timeseries.png")
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16.4, 5.1), constrained_layout=True)
+    sc = axes[0].scatter(cov_trace, speed_abs_error_station_mean, c=nwp_direction_change, cmap="magma", s=15, alpha=0.28, edgecolors="none")
+    axes[0].set_title("Variance vs forecast difficulty")
+    axes[0].set_xlabel(r"$trace(\Sigma_t)$")
+    axes[0].set_ylabel("Mean station speed error")
+    polish_axes(axes[0])
+    panel_label(axes[0], "a")
+    cbar = fig.colorbar(sc, ax=axes[0], shrink=0.9)
+    cbar.set_label("NWP direction change (deg)")
+    cbar.ax.tick_params(labelsize=15, width=1.35, length=5.5)
+    bold_tick_labels(cbar.ax)
+
+    rel_mask = np.isfinite(cov_trace) & np.isfinite(speed_abs_error_station_mean)
+    if int(rel_mask.sum()) >= 20:
+        edges = np.unique(np.nanquantile(cov_trace[rel_mask], np.linspace(0.0, 1.0, 11)))
+        bin_x, bin_y, bin_y_std = [], [], []
+        for i in range(len(edges) - 1):
+            in_bin = rel_mask & (cov_trace >= edges[i]) & (cov_trace <= edges[i + 1] if i == len(edges) - 2 else cov_trace < edges[i + 1])
+            if int(in_bin.sum()) > 0:
+                bin_x.append(float(np.nanmean(cov_trace[in_bin])))
+                bin_y.append(float(np.nanmean(speed_abs_error_station_mean[in_bin])))
+                bin_y_std.append(float(np.nanstd(speed_abs_error_station_mean[in_bin])))
+        if len(bin_x) >= 2:
+            axes[1].fill_between(bin_x, np.asarray(bin_y) - np.asarray(bin_y_std), np.asarray(bin_y) + np.asarray(bin_y_std), color=MODEL_COLOR, alpha=0.14, linewidth=0)
+            axes[1].plot(bin_x, bin_y, color=MODEL_COLOR, marker="o", linewidth=2.7, markersize=5.5)
+            np.savetxt(
+                out / "advection_uncertainty_variance_error_binned.csv",
+                np.column_stack([bin_x, bin_y, bin_y_std]),
+                delimiter=",",
+                header="cov_trace_variance_bin_mean,forecast_speed_abs_error_bin_mean,forecast_speed_abs_error_bin_std",
+                comments="",
+                fmt="%.8g",
+            )
+    axes[1].set_title("Binned error trend")
+    axes[1].set_xlabel(r"$trace(\Sigma_t)$")
+    axes[1].set_ylabel("Mean station speed error")
+    polish_axes(axes[1])
+    panel_label(axes[1], "b")
+
+    finite = rel_mask
+    categories = [
+        ("low\nvariance", finite & (cov_trace <= low_var_threshold)),
+        ("mid\nvariance", finite & (cov_trace > low_var_threshold) & (cov_trace < high_var_threshold)),
+        ("high\nvariance", finite & (cov_trace >= high_var_threshold)),
+        ("high var\nlow error", finite & (cov_trace >= high_var_threshold) & (speed_abs_error_station_mean <= low_error_threshold)),
+        ("high var\nhigh error", finite & (cov_trace >= high_var_threshold) & (speed_abs_error_station_mean >= high_error_threshold)),
+    ]
+    labels = [name.replace("\n", " ") for name, _ in categories]
+    means = [float(np.nanmean(speed_abs_error_station_mean[m])) if np.any(m) else np.nan for _, m in categories]
+    counts = [int(np.sum(m)) for _, m in categories]
+    y = np.arange(len(labels))
+    bars = axes[2].barh(y, means, color=[PALETTE["green"], PALETTE["gray"], PALETTE["red"], PALETTE["cyan"], NWP_COLOR], alpha=0.86)
+    axes[2].set_yticks(y, labels=labels)
+    axes[2].invert_yaxis()
+    for bar, count in zip(bars, counts):
+        if np.isfinite(bar.get_width()):
+            axes[2].text(bar.get_width(), bar.get_y() + bar.get_height() / 2.0, f"  n={count}", ha="left", va="center", fontsize=9, fontweight="bold")
+    axes[2].set_title("Error by variance regime")
+    axes[2].set_xlabel("Mean station speed error")
+    polish_axes(axes[2])
+    panel_label(axes[2], "c")
+    fig.savefig(out / "advection_uncertainty_vs_forecast_error.png")
+    plt.close(fig)
+
+    selected_specs: list[tuple[str, int]] = []
+    finite_idx = np.where(np.isfinite(cov_trace) & np.isfinite(speed_abs_error_station_mean))[0]
+    if finite_idx.size:
+        selected_specs.append(("low variance", int(finite_idx[np.nanargmin(cov_trace[finite_idx])])))
+        selected_specs.append(("high variance", int(finite_idx[np.nanargmax(cov_trace[finite_idx])])))
+        hv_low = finite_idx[(cov_trace[finite_idx] >= high_var_threshold) & (speed_abs_error_station_mean[finite_idx] <= low_error_threshold)]
+        hv_high = finite_idx[(cov_trace[finite_idx] >= high_var_threshold) & (speed_abs_error_station_mean[finite_idx] >= high_error_threshold)]
+        if hv_low.size:
+            selected_specs.append(("high variance\nlow error", int(hv_low[np.nanargmin(speed_abs_error_station_mean[hv_low])])))
+        if hv_high.size:
+            selected_specs.append(("high variance\nhigh error", int(hv_high[np.nanargmax(speed_abs_error_station_mean[hv_high])])))
+    dedup: list[tuple[str, int]] = []
+    seen: set[int] = set()
+    for label, idx in selected_specs:
+        if idx not in seen:
+            dedup.append((label, idx))
+            seen.add(idx)
+    selected_specs = dedup[:4]
+
+    if selected_specs:
+        fig, axes = plt.subplots(1, len(selected_specs), figsize=(4.35 * len(selected_specs), 4.45), constrained_layout=True)
+        axes = np.atleast_1d(axes)
+        for ax, (label, t) in zip(axes, selected_specs):
+            S = 0.5 * (cov[t] + cov[t].T) + 1e-8 * np.eye(2)
+            vals, vecs = np.linalg.eigh(S)
+            vals = np.clip(vals, 1e-12, None)
+            angle = np.degrees(np.arctan2(vecs[1, 1], vecs[0, 1]))
+            width = 4.0 * np.sqrt(vals[1])
+            height = 4.0 * np.sqrt(vals[0])
+            ell = Ellipse((0.0, 0.0), width=width, height=height, angle=angle, facecolor=PALETTE["light_blue"], edgecolor=MODEL_COLOR, linewidth=2.3, alpha=0.55)
+            ax.add_patch(ell)
+            radius = max(width, height) * 0.58
+            wind_unit = nwp_vec[t] / (np.linalg.norm(nwp_vec[t]) + 1e-8)
+            flow_unit = flow[t] / (np.linalg.norm(flow[t]) + 1e-8)
+            ax.arrow(0, 0, wind_unit[0] * radius, wind_unit[1] * radius, color=NWP_COLOR, width=0.018 * radius, head_width=0.10 * radius, length_includes_head=True, label="NWP wind")
+            ax.arrow(0, 0, flow_unit[0] * radius * 0.80, flow_unit[1] * radius * 0.80, color=MODEL_COLOR, width=0.014 * radius, head_width=0.08 * radius, length_includes_head=True, label="learned mean")
+            lim = radius * 1.30
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_title(f"{label}\nt={t}, var={cov_trace[t]:.3g}, err={speed_abs_error_station_mean[t]:.2f}", fontsize=11, fontweight="bold")
+            ax.set_xlabel("U direction")
+            ax.set_ylabel("V direction")
+            polish_axes(ax)
+        axes[0].legend(loc="upper left", fontsize=8)
+        fig.savefig(out / "advection_uncertainty_covariance_ellipse_examples.png")
+        plt.close(fig)
+
+    high_var = np.isfinite(cov_trace) & (cov_trace >= high_var_threshold)
+    high_var_high_error = high_var & np.isfinite(speed_abs_error_station_mean) & (speed_abs_error_station_mean >= high_error_threshold)
+    high_var_low_error = high_var & np.isfinite(speed_abs_error_station_mean) & (speed_abs_error_station_mean <= low_error_threshold)
+    summary = {
+        "created": True,
+        "cov_trace_mean": float(np.nanmean(cov_trace)),
+        "cov_trace_median": float(np.nanmedian(cov_trace)),
+        "cov_trace_p90": high_var_threshold,
+        "corr_cov_trace_vs_speed_error": corrcoef(cov_trace, speed_abs_error_station_mean),
+        "corr_cov_trace_smooth_vs_speed_error_smooth": corrcoef(cov_trace_smooth, speed_error_smooth),
+        "corr_cov_trace_vs_uv_rmse": corrcoef(cov_trace, uv_rmse_time),
+        "corr_cov_trace_vs_nwp_direction_change": corrcoef(cov_trace, nwp_direction_change),
+        "corr_cov_trace_smooth_vs_direction_change_smooth": corrcoef(cov_trace_smooth, direction_change_smooth),
+        "high_variance_fraction": float(np.nanmean(high_var)),
+        "high_variance_high_error_fraction_of_high_variance": float(np.sum(high_var_high_error) / max(np.sum(high_var), 1)),
+        "high_variance_low_error_fraction_of_high_variance": float(np.sum(high_var_low_error) / max(np.sum(high_var), 1)),
+        "axis_wind_alignment_mean_abs_cos": float(np.nanmean(axis_wind_alignment)),
+        "anisotropy_ratio_median": float(np.nanmedian(anisotropy_ratio)),
+    }
+    (out / "advection_uncertainty_interpretation_summary.csv").write_text(
+        "metric,value\n" + "\n".join(f"{key},{value}" for key, value in summary.items() if key != "created") + "\n",
+        encoding="utf-8",
+    )
+    return summary
+
+
 def load_optional_vstar(config_path: Path | None, split: str | None, expected_t: int) -> np.ndarray | None:
     if config_path is None:
         return None
@@ -1984,6 +2287,14 @@ def main() -> None:
     summary["wind_rose"] = plot_direction_speed_roses(nwp_vec, nwp_speed_mean, flow, out)
     summary["advection_physics"] = plot_flow_physics(flow, nwp_vec, nwp_speed_mean, v_star, out)
     summary["advection_covariance"] = plot_advection_covariance_calibration(flow, advection, v_star, out)
+    summary["advection_uncertainty_interpretation"] = plot_advection_uncertainty_interpretation(
+        flow,
+        advection,
+        forecasts,
+        nwp_vec,
+        nwp_speed_mean,
+        out,
+    )
     summary["advection_anisotropy"] = plot_advection_covariance_anisotropy(
         flow,
         advection,

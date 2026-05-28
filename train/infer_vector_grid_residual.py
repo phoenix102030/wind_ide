@@ -134,6 +134,46 @@ def cross_transition_shared_flow(
     return torch.cat(row_blocks, dim=1)
 
 
+def cross_transition_pairwise_flow(
+    model: torch.nn.Module,
+    source_coords: Tensor,
+    target_coords: Tensor,
+    outputs: dict[str, Tensor],
+) -> Tensor:
+    pair_flow_mu = outputs["pair_flow_mu"]
+    pair_flow_sigma = outputs["pair_flow_Sigma"]
+    device = pair_flow_mu.device
+    dtype = pair_flow_mu.dtype
+    source_coords = source_coords.to(device=device, dtype=dtype)
+    target_coords = target_coords.to(device=device, dtype=dtype)
+    eye2 = torch.eye(2, device=device, dtype=dtype)
+    ell = model.kernel.get_ell().to(device=device, dtype=dtype)
+    offsets = target_coords[:, None, :] - source_coords[None, :, :]
+    n_time = pair_flow_mu.shape[0]
+    n_target = target_coords.shape[0]
+    n_source = source_coords.shape[0]
+    n_pairs = n_target * n_source
+
+    row_blocks = []
+    for i in range(2):
+        col_blocks = []
+        for j in range(2):
+            shift = model.kernel.dt * pair_flow_mu[:, i, j, :]
+            D = ell[i, j].pow(2) * eye2 + 2.0 * pair_flow_sigma[:, i, j, :, :]
+            D = D + model.kernel.jitter * eye2
+            L = safe_cholesky(D)
+            offset_prime = offsets.unsqueeze(0) - shift[:, None, None, :]
+            flat = offset_prime.reshape(n_time, n_pairs, 2)
+            alpha = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
+            maha = (flat * alpha).sum(dim=-1).reshape(n_time, n_target, n_source)
+            logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
+            K = torch.exp(-maha - 0.5 * logdet[:, None, None])
+            col_blocks.append(K)
+        row_blocks.append(torch.cat(col_blocks, dim=2))
+    cross = torch.cat(row_blocks, dim=1)
+    return cross / cross.sum(dim=2, keepdim=True).clamp_min(1.0e-8)
+
+
 def apply_cross_modifiers(cross: Tensor, outputs: dict[str, Tensor]) -> Tensor:
     """Optionally apply residual transition scalars that are defined off-station."""
     out = cross
@@ -151,7 +191,9 @@ def build_cross_transition(
     outputs: dict[str, Tensor],
     apply_modifiers: bool = False,
 ) -> Tensor:
-    if "flow_mu" in outputs and "flow_Sigma" in outputs and "B" in outputs:
+    if "pair_flow_mu" in outputs and "pair_flow_Sigma" in outputs:
+        cross = cross_transition_pairwise_flow(model, source_coords, target_coords, outputs)
+    elif "flow_mu" in outputs and "flow_Sigma" in outputs and "B" in outputs:
         cross = cross_transition_shared_flow(model, source_coords, target_coords, outputs)
     else:
         cross = cross_transition_component(model, source_coords, target_coords, outputs)
