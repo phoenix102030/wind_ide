@@ -218,7 +218,10 @@ class VectorAdvectionNet(nn.Module):
         self.A_head = nn.Linear(feature_dim, 4) if use_component_heads else None
         if self.advection_mode in {"shared_flow_deformation", "shared_flow_component_kernel"}:
             self.flow_head = nn.Linear(feature_dim, 2)
-            self.flow_chol_head = nn.Linear(feature_dim, 3)
+            self.flow_chol_head = nn.Linear(
+                feature_dim,
+                10 if self.advection_mode == "shared_flow_component_kernel" else 3,
+            )
             self.deformation_head = nn.Linear(feature_dim, 4)
             nn.init.zeros_(self.deformation_head.weight)
             nn.init.zeros_(self.deformation_head.bias)
@@ -424,54 +427,61 @@ class VectorAdvectionNet(nn.Module):
         }
 
     @staticmethod
-    def _component_kernel_moments(flow_mu: Tensor, flow_sigma: Tensor, B: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def _component_kernel_moments(flow_mu: Tensor, scalar_sigma: Tensor, B: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Expand one learned 2D flow into component-pair flow moments.
 
         ``pair_flow_mu[:, i, j]`` is the spatial shift used by the separate
-        kernel for source component ``j`` contributing to target component
-        ``i``. ``mu`` and ``sigma`` are compact 4D summaries for diagnostics:
-        they aggregate the two source contributions for each target component.
+        kernel for source component ``j`` contributing to target component ``i``.
+        The 4D covariance is over scalar displacements along the learned joint
+        flow direction for ``[UU, UV, VU, VV]``.
         """
-        pair_flow_mu = B[:, :, :, None] * flow_mu[:, None, None, :]
-        pair_flow_sigma = B[:, :, :, None, None].pow(2) * flow_sigma[:, None, None, :, :]
+        flow_norm = flow_mu.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        flow_dir = flow_mu / flow_norm
+        cross_dir = torch.stack([-flow_dir[:, 1], flow_dir[:, 0]], dim=-1)
 
-        row_scale = B.sum(dim=-1)
-        target_mu = row_scale[:, :, None] * flow_mu[:, None, :]
-        mu = target_mu.reshape(flow_mu.shape[0], 4)
+        scalar_mu = (B * flow_norm[:, None, :]).reshape(flow_mu.shape[0], 4)
+        pair_flow_mu = scalar_mu.reshape(flow_mu.shape[0], 2, 2, 1) * flow_dir[:, None, None, :]
 
-        sigma = flow_sigma.new_zeros(flow_mu.shape[0], 4, 4)
-        for i in range(2):
-            for j in range(2):
-                block = row_scale[:, i, None, None] * row_scale[:, j, None, None] * flow_sigma
-                sigma[:, i * 2 : (i + 1) * 2, j * 2 : (j + 1) * 2] = block
-        return pair_flow_mu, pair_flow_sigma, mu, sigma
+        scalar_var = torch.diagonal(scalar_sigma, dim1=-2, dim2=-1).clamp_min(1.0e-8)
+        pair_scalar_var = scalar_var.reshape(flow_mu.shape[0], 2, 2)
+        along = flow_dir[:, :, None] @ flow_dir[:, None, :]
+        cross = cross_dir[:, :, None] @ cross_dir[:, None, :]
+        crosswind_floor = 0.05 * pair_scalar_var.mean(dim=(1, 2), keepdim=True).clamp_min(1.0e-6)
+        pair_flow_sigma = (
+            pair_scalar_var[:, :, :, None, None] * along[:, None, None, :, :]
+            + crosswind_floor[:, :, :, None, None] * cross[:, None, None, :, :]
+        )
+
+        return pair_flow_mu, pair_flow_sigma, scalar_mu, scalar_sigma
 
     def forward_shared_flow_component_kernel(self, features: Tensor) -> dict[str, Tensor]:
         if self.flow_head is None or self.flow_chol_head is None or self.deformation_head is None:
             raise RuntimeError("Shared-flow component-kernel heads are not initialized")
 
         raw_flow = self.flow_head(features)
-        raw_flow_chol = self.flow_chol_head(features)
+        raw_scalar_chol = self.flow_chol_head(features)
         raw_B = self.deformation_head(features)
         flow_mu = torch.tanh(raw_flow) * self.mu_scale
-        flow_L, flow_sigma = covariance_from_cholesky_raw(
-            raw_flow_chol,
-            dim=2,
+        scalar_L, scalar_sigma = covariance_from_cholesky_raw(
+            raw_scalar_chol,
+            dim=4,
             jitter=self.chol_jitter,
         )
 
         eye2 = torch.eye(2, device=features.device, dtype=features.dtype).unsqueeze(0)
         B_delta = self.deformation_scale * torch.tanh(raw_B.reshape(-1, 2, 2))
         B = eye2 + B_delta
-        pair_flow_mu, pair_flow_sigma, mu, sigma = self._component_kernel_moments(flow_mu, flow_sigma, B)
+        pair_flow_mu, pair_flow_sigma, mu, sigma = self._component_kernel_moments(flow_mu, scalar_sigma, B)
 
         n_time = flow_mu.shape[0]
-        L = flow_L.new_zeros(n_time, 4, 4)
-        L[:, :2, :2] = flow_L
-        L[:, 2:, 2:] = flow_L
+        flow_dir = flow_mu / flow_mu.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        flow_var = torch.einsum("ti,tij,tj->t", flow_dir, pair_flow_sigma[:, 0, 0], flow_dir).clamp_min(1.0e-8)
+        flow_sigma = flow_var[:, None, None] * (flow_dir[:, :, None] @ flow_dir[:, None, :])
+        flow_sigma = flow_sigma + self.chol_jitter * torch.eye(2, device=features.device, dtype=features.dtype).unsqueeze(0)
+        flow_L = torch.linalg.cholesky(flow_sigma)
+        L = scalar_L
         raw_mu = torch.cat([raw_flow, raw_flow], dim=-1)
-        raw_chol = self._expand_flow_cholesky_raw(raw_flow_chol)
-        raw = torch.cat([raw_mu, raw_chol, raw_B], dim=-1)
+        raw = torch.cat([raw_mu, raw_scalar_chol, raw_B], dim=-1)
         B_logits = raw_B.reshape(-1, 2, 2)
 
         return {
