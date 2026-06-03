@@ -755,39 +755,58 @@ def load_vector_dataset(
         )
 
     label_grid_indices = [[int(i), int(j)] for i, j in baseline_grid_indices]
-    label_mode = data_cfg.get("advection_label_mode", "simple")
-    if label_mode == "simple":
-        v_star = build_simple_advection_labels_from_uv(
+    label_mode_raw = data_cfg.get("advection_label_mode", "simple")
+    label_mode = None if label_mode_raw is None else str(label_mode_raw).lower()
+
+    nwp_advection_star = build_simple_advection_labels_from_uv(
+        u140,
+        v140,
+        station_grid_indices=label_grid_indices,
+        dt_seconds=float(config.get("dt_seconds", 600.0)),
+        patch_radius=int(data_cfg.get("patch_radius", 2)),
+    )[:T]
+
+    def optical_flow_star(shared: bool = False) -> np.ndarray:
+        if shared:
+            return build_shared_optical_flow_advection_labels_from_uv(
+                u140,
+                v140,
+                lat_grid,
+                lon_grid,
+                dt_seconds=float(config.get("dt_seconds", 600.0)),
+                stride=int(data_cfg.get("optical_flow_stride", 2)),
+                ridge=float(data_cfg.get("optical_flow_ridge", 1.0e-4)),
+            )[:T]
+        return build_optical_flow_advection_labels_from_uv(
             u140,
             v140,
-            station_grid_indices=label_grid_indices,
+            lat_grid,
+            lon_grid,
             dt_seconds=float(config.get("dt_seconds", 600.0)),
-            patch_radius=int(data_cfg.get("patch_radius", 2)),
+            stride=int(data_cfg.get("optical_flow_stride", 2)),
+            ridge=float(data_cfg.get("optical_flow_ridge", 1.0e-4)),
         )[:T]
+
+    optical_advection_star = None
+    if label_mode in {"simple", "nwp", "nwp_wind", "carrier"}:
+        v_star = nwp_advection_star
     elif label_mode in {"shared_optical_flow", "joint_optical_flow"}:
-        v_star = build_shared_optical_flow_advection_labels_from_uv(
-            u140,
-            v140,
-            lat_grid,
-            lon_grid,
-            dt_seconds=float(config.get("dt_seconds", 600.0)),
-            stride=int(data_cfg.get("optical_flow_stride", 2)),
-            ridge=float(data_cfg.get("optical_flow_ridge", 1.0e-4)),
-        )[:T]
+        optical_advection_star = optical_flow_star(shared=True)
+        v_star = optical_advection_star
     elif label_mode == "optical_flow":
-        v_star = build_optical_flow_advection_labels_from_uv(
-            u140,
-            v140,
-            lat_grid,
-            lon_grid,
-            dt_seconds=float(config.get("dt_seconds", 600.0)),
-            stride=int(data_cfg.get("optical_flow_stride", 2)),
-            ridge=float(data_cfg.get("optical_flow_ridge", 1.0e-4)),
-        )[:T]
+        optical_advection_star = optical_flow_star(shared=False)
+        v_star = optical_advection_star
+    elif label_mode in {"hybrid_nwp_optical_flow", "hybrid_optical_flow_nwp", "nwp_optical_flow"}:
+        optical_advection_star = optical_flow_star(shared=False)
+        nwp_weight = float(data_cfg.get("advection_nwp_weight", 0.75))
+        nwp_weight = min(max(nwp_weight, 0.0), 1.0)
+        optical_scale = float(data_cfg.get("optical_flow_label_scale", 1.0))
+        optical_term = optical_scale * optical_advection_star
+        v_star = nwp_weight * nwp_advection_star + (1.0 - nwp_weight) * optical_term
     elif label_mode in {"none", None}:
         v_star = None
     else:
-        raise ValueError(f"Unknown advection_label_mode: {label_mode}")
+        raise ValueError(f"Unknown advection_label_mode: {label_mode_raw}")
 
     deformation_label_mode = data_cfg.get("deformation_label_mode", "none")
     if deformation_label_mode == "nwp_gradient":
@@ -821,6 +840,8 @@ def load_vector_dataset(
         "Y": z.astype(np.float32, copy=False),
         "nwp_baseline": nwp_baseline.astype(np.float32, copy=False),
         "V_star": v_star,
+        "V_nwp_star": nwp_advection_star,
+        "V_optical_star": optical_advection_star,
         "B_star": B_star,
         "coords": coords,
         "station_latlon": station_latlon_arr.astype(np.float32, copy=False),

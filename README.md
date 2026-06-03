@@ -331,11 +331,14 @@ mixing weights `alpha`; the advection itself remains a spatial displacement in t
 same two-dimensional coordinate system as `s_i - s_j`. The optional
 source-side term `dt * gamma * E_source` can be enabled for full
 cross-component projection experiments. The default advection label mode is
-`optical_flow`, which estimates separate component-field motion targets for the
-NWP 140m U and V fields. The older `simple` label mode uses the same local NWP
-wind displacement as the pseudo-target for both component fields and can
-collapse `A_u` and `A_v` toward the same learned mean and covariance; keep it
-only as a shared-flow baseline.
+`hybrid_nwp_optical_flow`: it mixes the local NWP 140m wind displacement
+carrier with component-specific optical-flow labels. This keeps the learned
+advection on a physical km-per-step scale while retaining separate U-field and
+V-field motion corrections. Pure `optical_flow` labels are available as an
+ablation, but they can be too small to visibly affect the station-level kernel.
+The older `simple` label mode uses the same local NWP wind displacement as the
+pseudo-target for both component fields and can collapse `A_u` and `A_v` toward
+the same learned mean and covariance; keep it only as a shared-flow baseline.
 The older `shared_flow_deformation` and `shared_flow_component_kernel` modes
 are retained for ablation experiments.
 

@@ -279,6 +279,7 @@ class VectorMIDE(nn.Module):
         ell_init: float = 1.0,
         ell_min: float = 0.05,
         ell_max: float = 10.0,
+        learnable_ell: bool = True,
         learnable_gamma: bool = False,
         q_init: float = 0.2,
         r_init: float = 0.2,
@@ -334,6 +335,7 @@ class VectorMIDE(nn.Module):
             ell_init=ell_init,
             ell_min=ell_min,
             ell_max=ell_max,
+            learnable_ell=learnable_ell,
             learnable_gamma=learnable_gamma,
         )
         self.dstm = VectorDSTM(

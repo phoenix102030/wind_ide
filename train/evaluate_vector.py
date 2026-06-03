@@ -104,6 +104,32 @@ def improvement(model_metrics: dict[str, float], baseline_metrics: dict[str, flo
     return out
 
 
+def vector_norm(values: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(values, axis=-1)
+
+
+def angle_diff_degrees(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Smallest signed angle from vector ``b`` to vector ``a`` in degrees."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    cross = b[..., 0] * a[..., 1] - b[..., 1] * a[..., 0]
+    dot = b[..., 0] * a[..., 0] + b[..., 1] * a[..., 1]
+    return np.rad2deg(np.arctan2(cross, dot)).astype(np.float32)
+
+
+def corrcoef_finite(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 3:
+        return float("nan")
+    sx = float(np.nanstd(x[mask]))
+    sy = float(np.nanstd(y[mask]))
+    if sx <= 1.0e-12 or sy <= 1.0e-12:
+        return float("nan")
+    return float(np.corrcoef(x[mask], y[mask])[0, 1])
+
+
 def downsample_indices(length: int, max_points: int) -> np.ndarray:
     if length <= max_points:
         return np.arange(length, dtype=np.int64)
@@ -206,11 +232,47 @@ def advection_summary(mu: np.ndarray, Sigma: np.ndarray, alpha: np.ndarray) -> d
     }
 
 
+def advection_validation_summary(
+    Au: np.ndarray,
+    Av: np.ndarray,
+    nwp_displacement: np.ndarray,
+    optical_flow: np.ndarray,
+) -> dict[str, Any]:
+    optical_u = optical_flow[:, :2] if optical_flow.shape[0] == Au.shape[0] else np.empty((0, 2), dtype=np.float32)
+    optical_v = optical_flow[:, 2:] if optical_flow.shape[0] == Av.shape[0] else np.empty((0, 2), dtype=np.float32)
+    nwp_speed = vector_norm(nwp_displacement)
+    summary: dict[str, Any] = {
+        "Au_speed_vs_nwp_speed_corr": corrcoef_finite(vector_norm(Au), nwp_speed),
+        "Av_speed_vs_nwp_speed_corr": corrcoef_finite(vector_norm(Av), nwp_speed),
+        "Au_angle_minus_nwp_mean_deg": float(np.nanmean(np.abs(angle_diff_degrees(Au, nwp_displacement)))),
+        "Av_angle_minus_nwp_mean_deg": float(np.nanmean(np.abs(angle_diff_degrees(Av, nwp_displacement)))),
+    }
+    if optical_u.shape[0] == Au.shape[0]:
+        summary.update(
+            {
+                "Au_speed_vs_optical_flow_u_corr": corrcoef_finite(vector_norm(Au), vector_norm(optical_u)),
+                "Av_speed_vs_optical_flow_v_corr": corrcoef_finite(vector_norm(Av), vector_norm(optical_v)),
+                "Au_angle_minus_optical_flow_u_mean_deg": float(np.nanmean(np.abs(angle_diff_degrees(Au, optical_u)))),
+                "Av_angle_minus_optical_flow_v_mean_deg": float(np.nanmean(np.abs(angle_diff_degrees(Av, optical_v)))),
+            }
+        )
+    return summary
+
+
 def transition_summary(M: np.ndarray, M_base: np.ndarray, ell: np.ndarray) -> dict[str, Any]:
     M_mean = np.nanmean(M, axis=0)
     row_sums = np.nansum(M, axis=2)
-    block_mass = np.zeros((M.shape[0], 2, 2), dtype=np.float32)
+    eye = np.eye(M.shape[1], dtype=bool)
+    diag_values = np.diagonal(M, axis1=1, axis2=2)
+    offdiag_values = M[:, ~eye]
+    same_site_mask = np.zeros((M.shape[1], M.shape[2]), dtype=bool)
     n = M.shape[1] // 2
+    for row in range(M.shape[1]):
+        site = row % n
+        same_site_mask[row, site] = True
+        same_site_mask[row, site + n] = True
+    same_site_mass = M[:, same_site_mask].reshape(M.shape[0], M.shape[1], 2).sum(axis=2)
+    block_mass = np.zeros((M.shape[0], 2, 2), dtype=np.float32)
     for i in range(2):
         for j in range(2):
             block = M[:, i * n : (i + 1) * n, j * n : (j + 1) * n]
@@ -221,6 +283,12 @@ def transition_summary(M: np.ndarray, M_base: np.ndarray, ell: np.ndarray) -> di
         "row_sum_max": float(np.nanmax(row_sums)),
         "transition_mean_min": float(np.nanmin(M_mean)),
         "transition_mean_max": float(np.nanmax(M_mean)),
+        "diagonal_mass_mean": float(np.nanmean(diag_values)),
+        "diagonal_mass_min": float(np.nanmin(diag_values)),
+        "offdiagonal_mass_mean": float(np.nanmean(offdiag_values)),
+        "same_site_mass_mean": float(np.nanmean(same_site_mass)),
+        "temporal_std_mean": float(np.nanmean(np.nanstd(M, axis=0))),
+        "consecutive_change_mean_abs": float(np.nanmean(np.abs(np.diff(M, axis=0)))) if M.shape[0] > 1 else 0.0,
         "block_mass_mean": {
             name: float(value) for name, value in zip(ALPHA_NAMES, np.nanmean(block_mass.reshape(block_mass.shape[0], 4), axis=0))
         },
@@ -236,6 +304,7 @@ def evaluate(
     eval_window_size: int,
     eval_stride: int,
     forecast_horizon: int,
+    dt_seconds: float,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     coords = torch.from_numpy(data["coords"]).to(device)
     outputs = collect_model_outputs(
@@ -267,6 +336,25 @@ def evaluate(
 
     target_np = data.get("Y", data["Z"]).astype(np.float32, copy=False)
     nwp_baseline_np = data.get("nwp_baseline", np.full_like(target_np, np.nan)).astype(np.float32, copy=False)
+    n_sites = nwp_baseline_np.shape[1] // 2
+    nwp_u = np.nanmean(nwp_baseline_np[:, :n_sites], axis=1)
+    nwp_v = np.nanmean(nwp_baseline_np[:, n_sites:], axis=1)
+    nwp_displacement_np = np.stack([nwp_u, nwp_v], axis=-1).astype(np.float32) * float(dt_seconds) / 1000.0
+    training_advection_target_np = data.get("V_star")
+    if training_advection_target_np is None:
+        training_advection_target_np = np.full_like(outputs["mu"], np.nan, dtype=np.float32)
+    else:
+        training_advection_target_np = np.asarray(training_advection_target_np, dtype=np.float32)
+    optical_flow_np = data.get("V_optical_star")
+    if optical_flow_np is None:
+        optical_flow_np = training_advection_target_np
+    else:
+        optical_flow_np = np.asarray(optical_flow_np, dtype=np.float32)
+    nwp_advection_target_np = data.get("V_nwp_star")
+    if nwp_advection_target_np is None:
+        nwp_advection_target_np = np.full_like(outputs["mu"], np.nan, dtype=np.float32)
+    else:
+        nwp_advection_target_np = np.asarray(nwp_advection_target_np, dtype=np.float32)
     one_step_pred_np = measurement_from_model_target(one_step_model, data)
     multi_pred_np = measurement_from_model_target(multi_model, data)
 
@@ -326,6 +414,7 @@ def evaluate(
     with torch.no_grad():
         ell = model.kernel.get_ell().detach().cpu().numpy().astype(np.float32, copy=False)
         gamma = np.asarray(float(model.kernel.gamma_value(device, torch.float32).detach().cpu()), dtype=np.float32)
+        kernel_dt = np.asarray(float(model.kernel.dt), dtype=np.float32)
         Q = model.dstm.process_covariance().detach().cpu().numpy().astype(np.float32, copy=False)
         R = model.dstm.observation_covariance().detach().cpu().numpy().astype(np.float32, copy=False)
 
@@ -355,8 +444,13 @@ def evaluate(
         "Sigma": outputs["Sigma"],
         "Sigma_diag": np.diagonal(outputs["Sigma"], axis1=1, axis2=2),
         "alpha": outputs["alpha"],
+        "advection_training_target": training_advection_target_np,
+        "nwp_wind_displacement": nwp_displacement_np,
+        "nwp_advection_target": nwp_advection_target_np,
+        "optical_flow_advection": optical_flow_np,
         "ell": ell,
         "gamma": gamma,
+        "kernel_dt": kernel_dt,
         "Q": Q,
         "R": R,
         "coords": data["coords"].astype(np.float32, copy=False),
@@ -377,6 +471,12 @@ def evaluate(
         "forecast_horizon": forecast_horizon,
         "multi_step": multi_step,
         "advection": advection_summary(outputs["mu"], outputs["Sigma"], outputs["alpha"]),
+        "advection_validation": advection_validation_summary(
+            outputs["mu"][:, :2],
+            outputs["mu"][:, 2:],
+            nwp_displacement_np,
+            optical_flow_np,
+        ),
         "transition": transition_summary(outputs["M"], outputs["M_base"], ell),
         "eval_window_size": eval_window_size,
         "eval_stride": eval_stride,
@@ -428,8 +528,13 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
         Sigma=artifacts["Sigma"],
         Sigma_diag=artifacts["Sigma_diag"],
         alpha=artifacts["alpha"],
+        advection_training_target=artifacts["advection_training_target"],
+        nwp_wind_displacement=artifacts["nwp_wind_displacement"],
+        nwp_advection_target=artifacts["nwp_advection_target"],
+        optical_flow_advection=artifacts["optical_flow_advection"],
         ell=artifacts["ell"],
         gamma=artifacts["gamma"],
+        kernel_dt=artifacts["kernel_dt"],
         Q=artifacts["Q"],
         R=artifacts["R"],
         coords=artifacts["coords"],
@@ -515,7 +620,14 @@ def horizon_plot(path: Path, horizons: np.ndarray, values: np.ndarray, labels: n
     plt.close(fig)
 
 
-def advection_vector_plot(path: Path, Au: np.ndarray, Av: np.ndarray, max_points: int) -> None:
+def advection_vector_plot(
+    path: Path,
+    Au: np.ndarray,
+    Av: np.ndarray,
+    max_points: int,
+    *,
+    kernel_dt: float = 1.0,
+) -> None:
     """Visualize the learned U-field and V-field advection vectors.
 
     Each point is one time step's learned two-dimensional displacement. The
@@ -527,8 +639,8 @@ def advection_vector_plot(path: Path, Au: np.ndarray, Av: np.ndarray, max_points
     import matplotlib.pyplot as plt
 
     idx = downsample_indices(Au.shape[0], max_points)
-    au = Au[idx]
-    av = Av[idx]
+    au = Au[idx] * float(kernel_dt)
+    av = Av[idx] * float(kernel_dt)
     values = np.concatenate([au, av], axis=0)
     lim = max(float(np.nanmax(np.abs(values))) * 1.1, 1.0e-6)
 
@@ -536,8 +648,8 @@ def advection_vector_plot(path: Path, Au: np.ndarray, Av: np.ndarray, max_points
     color = np.linspace(0.0, 1.0, idx.size)
     sc_u = ax.scatter(au[:, 0], au[:, 1], c=color, cmap="Blues", s=16, alpha=0.55, label="A_u(t)")
     ax.scatter(av[:, 0], av[:, 1], c=color, cmap="Oranges", s=16, alpha=0.55, label="A_v(t)")
-    mean_u = np.nanmean(Au, axis=0)
-    mean_v = np.nanmean(Av, axis=0)
+    mean_u = np.nanmean(Au, axis=0) * float(kernel_dt)
+    mean_v = np.nanmean(Av, axis=0) * float(kernel_dt)
     for vector, label, color_name in [(mean_u, "mean A_u", "tab:blue"), (mean_v, "mean A_v", "tab:orange")]:
         ax.arrow(
             0.0,
@@ -556,19 +668,371 @@ def advection_vector_plot(path: Path, Au: np.ndarray, Av: np.ndarray, max_points
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     ax.set_aspect("equal", adjustable="box")
-    ax.set_title("Component advection vectors")
-    ax.set_xlabel("x displacement / step")
-    ax.set_ylabel("y displacement / step")
+    ax.set_title("Effective component kernel shifts")
+    ax.set_xlabel("x kernel shift (km)")
+    ax.set_ylabel("y kernel shift (km)")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="upper right", fontsize=8)
     cbar = fig.colorbar(sc_u, ax=ax, shrink=0.75)
-    cbar.set_label("relative time")
+    cbar.set_label("normalized time index")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
 
 
-def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: int) -> None:
+def advection_vs_nwp_plot(
+    path: Path,
+    Au: np.ndarray,
+    Av: np.ndarray,
+    nwp_displacement: np.ndarray,
+    max_points: int,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    idx = downsample_indices(Au.shape[0], max_points)
+    nwp = nwp_displacement[idx]
+    au = Au[idx]
+    av = Av[idx]
+    nwp_speed = vector_norm(nwp)
+    au_speed = vector_norm(au)
+    av_speed = vector_norm(av)
+    au_angle = angle_diff_degrees(au, nwp)
+    av_angle = angle_diff_degrees(av, nwp)
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+    axes[0, 0].scatter(nwp_speed, au_speed, s=12, alpha=0.45, color="tab:blue", label="A_u")
+    axes[0, 0].scatter(nwp_speed, av_speed, s=12, alpha=0.45, color="tab:orange", label="A_v")
+    axes[0, 0].set_xlabel("|NWP wind displacement|")
+    axes[0, 0].set_ylabel("|learned A|")
+    axes[0, 0].set_title("Speed alignment")
+    axes[0, 0].grid(True, alpha=0.25)
+    axes[0, 0].legend(fontsize=8)
+
+    axes[0, 1].hist(au_angle[np.isfinite(au_angle)], bins=40, alpha=0.55, color="tab:blue", label="A_u - NWP")
+    axes[0, 1].hist(av_angle[np.isfinite(av_angle)], bins=40, alpha=0.55, color="tab:orange", label="A_v - NWP")
+    axes[0, 1].set_xlabel("angle difference (degrees)")
+    axes[0, 1].set_ylabel("count")
+    axes[0, 1].set_title("Direction alignment")
+    axes[0, 1].grid(True, alpha=0.25)
+    axes[0, 1].legend(fontsize=8)
+
+    axes[1, 0].scatter(nwp[:, 0], au[:, 0], s=12, alpha=0.45, color="tab:blue", label="A_u,x")
+    axes[1, 0].scatter(nwp[:, 0], av[:, 0], s=12, alpha=0.45, color="tab:orange", label="A_v,x")
+    axes[1, 0].axhline(0.0, color="black", linewidth=0.8, alpha=0.35)
+    axes[1, 0].axvline(0.0, color="black", linewidth=0.8, alpha=0.35)
+    axes[1, 0].set_xlabel("NWP x displacement")
+    axes[1, 0].set_ylabel("learned x displacement")
+    axes[1, 0].set_title("x-component comparison")
+    axes[1, 0].grid(True, alpha=0.25)
+    axes[1, 0].legend(fontsize=8)
+
+    axes[1, 1].scatter(nwp[:, 1], au[:, 1], s=12, alpha=0.45, color="tab:blue", label="A_u,y")
+    axes[1, 1].scatter(nwp[:, 1], av[:, 1], s=12, alpha=0.45, color="tab:orange", label="A_v,y")
+    axes[1, 1].axhline(0.0, color="black", linewidth=0.8, alpha=0.35)
+    axes[1, 1].axvline(0.0, color="black", linewidth=0.8, alpha=0.35)
+    axes[1, 1].set_xlabel("NWP y displacement")
+    axes[1, 1].set_ylabel("learned y displacement")
+    axes[1, 1].set_title("y-component comparison")
+    axes[1, 1].grid(True, alpha=0.25)
+    axes[1, 1].legend(fontsize=8)
+
+    fig.suptitle("Learned advection vs NWP 140m wind displacement")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def advection_vs_optical_flow_plot(
+    path: Path,
+    Au: np.ndarray,
+    Av: np.ndarray,
+    optical_flow: np.ndarray,
+    max_points: int,
+) -> None:
+    if optical_flow.shape[0] != Au.shape[0] or optical_flow.shape[1] < 4:
+        return
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    idx = downsample_indices(Au.shape[0], max_points)
+    au = Au[idx]
+    av = Av[idx]
+    of_u = optical_flow[idx, :2]
+    of_v = optical_flow[idx, 2:4]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+    axes[0, 0].scatter(vector_norm(of_u), vector_norm(au), s=12, alpha=0.45, color="tab:blue")
+    axes[0, 0].set_xlabel("|optical-flow U target|")
+    axes[0, 0].set_ylabel("|A_u|")
+    axes[0, 0].set_title("U-field speed")
+    axes[0, 0].grid(True, alpha=0.25)
+
+    axes[0, 1].scatter(vector_norm(of_v), vector_norm(av), s=12, alpha=0.45, color="tab:orange")
+    axes[0, 1].set_xlabel("|optical-flow V target|")
+    axes[0, 1].set_ylabel("|A_v|")
+    axes[0, 1].set_title("V-field speed")
+    axes[0, 1].grid(True, alpha=0.25)
+
+    axes[1, 0].hist(angle_diff_degrees(au, of_u), bins=40, alpha=0.65, color="tab:blue")
+    axes[1, 0].set_xlabel("A_u - optical-flow U angle (degrees)")
+    axes[1, 0].set_ylabel("count")
+    axes[1, 0].set_title("U-field direction")
+    axes[1, 0].grid(True, alpha=0.25)
+
+    axes[1, 1].hist(angle_diff_degrees(av, of_v), bins=40, alpha=0.65, color="tab:orange")
+    axes[1, 1].set_xlabel("A_v - optical-flow V angle (degrees)")
+    axes[1, 1].set_ylabel("count")
+    axes[1, 1].set_title("V-field direction")
+    axes[1, 1].grid(True, alpha=0.25)
+
+    fig.suptitle("Learned advection vs component optical-flow labels")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def kernel_source_center_map(
+    path: Path,
+    coords: np.ndarray,
+    Au: np.ndarray,
+    Av: np.ndarray,
+    *,
+    kernel_dt: float = 1.0,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    mean_au = np.nanmean(Au, axis=0) * float(kernel_dt)
+    mean_av = np.nanmean(Av, axis=0) * float(kernel_dt)
+    all_points = np.concatenate([coords, coords - mean_au[None, :], coords - mean_av[None, :]], axis=0)
+    pad = max(float(np.nanmax(np.ptp(all_points, axis=0))) * 0.15, 0.5)
+    xmin, ymin = np.nanmin(all_points, axis=0) - pad
+    xmax, ymax = np.nanmax(all_points, axis=0) + pad
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.scatter(coords[:, 0], coords[:, 1], color="black", s=42, label="target sites")
+    for idx, site in enumerate(coords):
+        src_u = site - mean_au
+        src_v = site - mean_av
+        ax.scatter([src_u[0]], [src_u[1]], color="tab:blue", s=28, alpha=0.75)
+        ax.scatter([src_v[0]], [src_v[1]], color="tab:orange", s=28, alpha=0.75)
+        ax.arrow(
+            src_u[0],
+            src_u[1],
+            mean_au[0],
+            mean_au[1],
+            color="tab:blue",
+            width=0.008,
+            head_width=0.055,
+            length_includes_head=True,
+            alpha=0.75,
+        )
+        ax.arrow(
+            src_v[0],
+            src_v[1],
+            mean_av[0],
+            mean_av[1],
+            color="tab:orange",
+            width=0.008,
+            head_width=0.055,
+            length_includes_head=True,
+            alpha=0.75,
+        )
+        ax.text(site[0], site[1], f" s{idx + 1}", fontsize=8, va="bottom")
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title("Kernel source-center map: source center -> target site")
+    ax.set_xlabel("x coordinate (km)")
+    ax.set_ylabel("y coordinate (km)")
+    ax.grid(True, alpha=0.25)
+    ax.plot([], [], color="tab:blue", label="U source center -> target")
+    ax.plot([], [], color="tab:orange", label="V source center -> target")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def figure_to_gif_frame(fig: Any) -> Any:
+    from PIL import Image
+
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    return Image.fromarray(rgba).convert("P", palette=Image.ADAPTIVE)
+
+
+def save_gif(path: Path, frames: list[Any], duration: int = 140) -> None:
+    if not frames:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frames[0].save(
+        path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration,
+        loop=0,
+    )
+
+
+def advection_vector_frame(
+    au_t: np.ndarray,
+    av_t: np.ndarray,
+    title: str,
+    axis_limit: float,
+) -> Any:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for vector, label, color in [
+        (au_t, "A_u(t)", "tab:blue"),
+        (av_t, "A_v(t)", "tab:orange"),
+    ]:
+        ax.arrow(
+            0.0,
+            0.0,
+            float(vector[0]),
+            float(vector[1]),
+            color=color,
+            width=0.012 * axis_limit,
+            head_width=0.07 * axis_limit,
+            length_includes_head=True,
+            alpha=0.9,
+        )
+        ax.scatter([vector[0]], [vector[1]], color=color, s=42, label=label)
+    ax.axhline(0.0, color="black", linewidth=0.8, alpha=0.35)
+    ax.axvline(0.0, color="black", linewidth=0.8, alpha=0.35)
+    ax.set_xlim(-axis_limit, axis_limit)
+    ax.set_ylim(-axis_limit, axis_limit)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(title)
+    ax.set_xlabel("x displacement / step")
+    ax.set_ylabel("y displacement / step")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    frame = figure_to_gif_frame(fig)
+    plt.close(fig)
+    return frame
+
+
+def matrix_frame(
+    matrix: np.ndarray,
+    title: str,
+    xlabels: list[str],
+    ylabels: list[str],
+    vmin: float,
+    vmax: float,
+    cmap: str,
+) -> Any:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6, 5.5))
+    im = ax.imshow(matrix, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    ax.set_xticks(np.arange(len(xlabels)))
+    ax.set_yticks(np.arange(len(ylabels)))
+    ax.set_xticklabels(xlabels, rotation=45, ha="right", fontsize=7)
+    ax.set_yticklabels(ylabels, fontsize=7)
+    fig.colorbar(im, ax=ax, shrink=0.78)
+    fig.tight_layout()
+    frame = figure_to_gif_frame(fig)
+    plt.close(fig)
+    return frame
+
+
+def save_time_varying_gifs(output_dir: Path, artifacts: dict[str, np.ndarray], max_gif_frames: int) -> None:
+    if max_gif_frames <= 0:
+        return
+    plots_dir = output_dir / "plots"
+    idx = downsample_indices(artifacts["mu"].shape[0], max_gif_frames)
+
+    adv_values = np.concatenate(
+        [
+            artifacts["Au"],
+            artifacts["Av"],
+        ],
+        axis=0,
+    )
+    axis_limit = max(float(np.nanmax(np.abs(adv_values))) * 1.15, 1.0e-6)
+    frames = [
+        advection_vector_frame(
+            artifacts["Au"][t],
+            artifacts["Av"][t],
+            f"Component advection vectors, t={int(t)}",
+            axis_limit,
+        )
+        for t in idx
+    ]
+    save_gif(plots_dir / "advection_component_vectors.gif", frames)
+
+    sigma = artifacts["Sigma"]
+    sigma_limit = max(float(np.nanmax(np.abs(sigma))), 1.0e-8)
+    frames = [
+        matrix_frame(
+            sigma[t],
+            f"Advection covariance Sigma_A, t={int(t)}",
+            ADV_NAMES,
+            ADV_NAMES,
+            -sigma_limit,
+            sigma_limit,
+            "coolwarm",
+        )
+        for t in idx
+    ]
+    save_gif(plots_dir / "advection_sigma.gif", frames)
+
+    alpha = artifacts["alpha"]
+    frames = [
+        matrix_frame(
+            alpha[t],
+            f"Component mixing alpha, t={int(t)}",
+            ["U source", "V source"],
+            ["U target", "V target"],
+            0.0,
+            max(float(np.nanmax(alpha)), 1.0e-8),
+            "viridis",
+        )
+        for t in idx
+    ]
+    save_gif(plots_dir / "mixing_alpha.gif", frames)
+
+    transition = artifacts["transition_matrices"]
+    signed_transition = bool(np.nanmin(transition) < 0.0)
+    if signed_transition:
+        limit = max(float(np.nanmax(np.abs(transition))), 1.0e-8)
+        vmin, vmax, cmap = -limit, limit, "coolwarm"
+    else:
+        vmin, vmax, cmap = 0.0, max(float(np.nanmax(transition)), 1.0e-8), "viridis"
+    frames = [
+        matrix_frame(
+            transition[t],
+            f"Transition matrix M_t, t={int(t)}",
+            STATE_NAMES,
+            STATE_NAMES,
+            vmin,
+            vmax,
+            cmap,
+        )
+        for t in idx
+    ]
+    save_gif(plots_dir / "transition_matrix.gif", frames)
+
+
+def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: int, max_gif_frames: int) -> None:
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -581,7 +1045,7 @@ def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: i
         )
         return
 
-    line_plot(plots_dir / "advection_mu.png", artifacts["mu"], ADV_NAMES, "Advection mean", "coordinate units / step", max_points)
+    line_plot(plots_dir / "advection_mu.png", artifacts["mu"], ADV_NAMES, "Advection mean", "km / step", max_points)
     line_plot(plots_dir / "advection_sigma_diag.png", artifacts["Sigma_diag"], SIGMA_DIAG_NAMES, "Advection covariance diagonal", "variance", max_points)
     line_plot(
         plots_dir / "advection_speed.png",
@@ -589,15 +1053,41 @@ def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: i
             [
                 np.linalg.norm(artifacts["Au"], axis=1),
                 np.linalg.norm(artifacts["Av"], axis=1),
-                np.linalg.norm(artifacts["Au"] - artifacts["Av"], axis=1),
             ]
         ),
-        ["|A_u|", "|A_v|", "|A_u-A_v|"],
+        ["|A_u|", "|A_v|"],
         "Component advection speeds",
-        "coordinate units / step",
+        "km / step",
         max_points,
     )
-    advection_vector_plot(plots_dir / "advection_component_vectors.png", artifacts["Au"], artifacts["Av"], max_points)
+    advection_vector_plot(
+        plots_dir / "advection_component_vectors.png",
+        artifacts["Au"],
+        artifacts["Av"],
+        max_points,
+        kernel_dt=float(artifacts["kernel_dt"]),
+    )
+    advection_vs_nwp_plot(
+        plots_dir / "advection_vs_nwp_wind.png",
+        artifacts["Au"],
+        artifacts["Av"],
+        artifacts["nwp_wind_displacement"],
+        max_points,
+    )
+    advection_vs_optical_flow_plot(
+        plots_dir / "advection_vs_optical_flow.png",
+        artifacts["Au"],
+        artifacts["Av"],
+        artifacts["optical_flow_advection"],
+        max_points,
+    )
+    kernel_source_center_map(
+        plots_dir / "kernel_source_center_map.png",
+        artifacts["coords"],
+        artifacts["Au"],
+        artifacts["Av"],
+        kernel_dt=float(artifacts["kernel_dt"]),
+    )
     heatmap(
         plots_dir / "advection_sigma_mean.png",
         np.nanmean(artifacts["Sigma"], axis=0),
@@ -655,6 +1145,7 @@ def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: i
         "Multi-step MAE",
         "MAE",
     )
+    save_time_varying_gifs(output_dir, artifacts, max_gif_frames=max_gif_frames)
 
 
 def main() -> None:
@@ -671,6 +1162,7 @@ def main() -> None:
     parser.add_argument("--output", default=None)
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--max-plot-points", type=int, default=2500)
+    parser.add_argument("--max-gif-frames", type=int, default=120)
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -715,6 +1207,7 @@ def main() -> None:
         eval_window_size=eval_window_size,
         eval_stride=eval_stride,
         forecast_horizon=forecast_horizon,
+        dt_seconds=float(config.get("dt_seconds", model_config.get("dt_seconds", 600.0))),
     )
     results["split"] = args.split
     results["checkpoint"] = str(ckpt_path)
@@ -729,7 +1222,12 @@ def main() -> None:
         save_json(Path(args.output), results)
     save_artifact_arrays(output_dir, artifacts)
     if not args.no_plots:
-        save_plots(output_dir, artifacts, max_points=int(args.max_plot_points))
+        save_plots(
+            output_dir,
+            artifacts,
+            max_points=int(args.max_plot_points),
+            max_gif_frames=int(args.max_gif_frames),
+        )
     print(f"Saved evaluation artifacts to {output_dir}")
 
 

@@ -226,6 +226,7 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         ell_init=float(config.get("ell_init", 1.0)),
         ell_min=float(config.get("ell_min", 0.05)),
         ell_max=float(config.get("ell_max", 10.0)),
+        learnable_ell=bool(config.get("learnable_ell", True)),
         learnable_gamma=bool(config.get("learnable_gamma", False)),
         q_init=float(config.get("q_init", 0.2)),
         r_init=float(config.get("r_init", 0.2)),

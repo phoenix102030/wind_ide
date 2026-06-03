@@ -41,6 +41,7 @@ class VectorLagrangianKernel(nn.Module):
         ell_init: float = 1.0,
         ell_min: float = 0.05,
         ell_max: float = 10.0,
+        learnable_ell: bool = True,
         learnable_gamma: bool = False,
     ) -> None:
         super().__init__()
@@ -57,10 +58,12 @@ class VectorLagrangianKernel(nn.Module):
         self.jitter = jitter
         self.ell_min = ell_min
         self.ell_max = ell_max
+        self.learnable_ell = learnable_ell
         self.learnable_gamma = learnable_gamma
 
         ell_frac = (ell_init - ell_min) / (ell_max - ell_min)
         self.raw_ell = nn.Parameter(torch.full((2, 2), _logit(ell_frac), dtype=torch.float32))
+        self.raw_ell.requires_grad_(learnable_ell)
         if learnable_gamma:
             self.raw_gamma = nn.Parameter(torch.tensor(_logit(gamma), dtype=torch.float32))
         else:

@@ -45,9 +45,10 @@ use_spectral_scaling: false
 spectral_radius: 0.98
 kernel_jitter: 1.0e-5
 kalman_jitter: 1.0e-5
-ell_init: 80.0
-ell_min: 5.0
-ell_max: 300.0
+ell_init: 60.0
+ell_min: 60.0
+ell_max: 500.0
+learnable_ell: false
 
 q_init: 0.2
 r_init: 0.2
@@ -140,7 +141,9 @@ data:
     - [18, 18]
     - [20, 20]
     - [22, 22]
-  advection_label_mode: optical_flow
+  advection_label_mode: hybrid_nwp_optical_flow
+  advection_nwp_weight: 0.75
+  optical_flow_label_scale: 1.0
   deformation_label_mode: none
   deformation_label_clip: 0.3
   optical_flow_stride: 2
