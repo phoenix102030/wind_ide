@@ -7,12 +7,14 @@ for 140m wind components. The latent state is ordered as:
 [U(s1), U(s2), U(s3), V(s1), V(s2), V(s3)]
 ```
 
-The neural network maps NWP grids to a four-dimensional random advection
-distribution and a 2x2 component mixing matrix. A Lagrangian kernel turns those
-outputs into a base transition matrix. In residual-NWP mode, the model can then
-blend that base transition with identity persistence, decay the residual toward
-zero, and add a small learned control term before the Cholesky-based Kalman
-filter likelihood.
+The neural network maps NWP grids to a four-dimensional component-advection
+distribution and a 2x2 component mixing matrix. In the default component mode,
+the four advection entries are ordered as `[u_x, u_y, v_x, v_y]`: two
+two-dimensional spatial displacements for the U and V component fields. A
+Lagrangian kernel turns those outputs into a base transition matrix. In
+residual-NWP mode, the model can then blend that base transition with identity
+persistence, decay the residual toward zero, and add a small learned control
+term before the Cholesky-based Kalman filter likelihood.
 
 ## Main Files
 
@@ -317,18 +319,22 @@ prefers a same-directory `*_imputed.mat` sibling by default when a raw
 measurement path is configured. If the resolved measurement file still contains
 missing values, training fails loudly unless `data.measurement_missing_policy:
 interpolate` is set.
-With `advection_mode: shared_flow_deformation`, the model predicts one physical
-advection displacement `flow_mu=(flow_x, flow_y)` shared by U and V, plus a
-signed component deformation matrix `B`. The transition is built as
-`[[B_UU K, B_UV K], [B_VU K, B_VV K]]`, where `K` is the shared spatial
-advection kernel. In this mode `mu` is still saved as `[flow_x, flow_y,
-flow_x, flow_y]` for backward-compatible plots. The default advection label mode
-remains `simple`, which uses the local NWP 140m wind displacement as the shared
-flow target. `shared_optical_flow` is available only as an experimental pattern
-tracking target; it estimates motion of the NWP U/V field texture, not the air
-parcel velocity, and can be near zero when the wind pattern changes slowly.
-`deformation_label_mode: nwp_gradient` gives `B` a near-identity rotation/shear
-target from local NWP velocity gradients.
+With `advection_mode: component`, the model predicts
+`mu=[u_x,u_y,v_x,v_y]` and a full 4x4 advection covariance. The U rows of the
+transition matrix use the U-field 2D shift, and the V rows use the V-field 2D
+shift. With the default one-step `time_mode: target_only`, cross-component
+blocks also use the target component's projected advection, corresponding to
+the relative-time convention `t1=dt, t2=0`. The same projection is used for both
+the kernel mean shift and the projected covariance inside the dispersion
+matrix. Cross-component interaction strength is represented by the learned 2x2
+mixing weights `A`; the advection itself remains a spatial displacement in the
+same two-dimensional coordinate system as `s_i - s_j`. The optional
+source-side term `dt * gamma * E_source` can be enabled for full
+cross-component projection experiments. The default advection label mode
+remains `simple`, which uses the local NWP 140m wind displacement as a
+pseudo-target for both component fields.
+The older `shared_flow_deformation` and `shared_flow_component_kernel` modes
+are retained for ablation experiments.
 
 The measurement `.mat` files include `LatValue_vec` and `LonValue_vec`, and the
 loader uses them by default for the three station coordinates. You can override

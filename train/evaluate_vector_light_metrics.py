@@ -93,10 +93,51 @@ def gaussian_crps(mean: torch.Tensor, var: torch.Tensor, target: torch.Tensor) -
     return torch.where(std > 1.0e-6, crps, torch.abs(target - mean))
 
 
+def angle_diff_rad(pred_angle: torch.Tensor, target_angle: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(
+        torch.sin(pred_angle - target_angle),
+        torch.cos(pred_angle - target_angle),
+    )
+
+
+def wind_direction_rad(values: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(values[:, 3:6], values[:, :3])
+
+
+def direction_error_deg(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    mask = torch.isfinite(pred[:, :3]) & torch.isfinite(pred[:, 3:6]) & torch.isfinite(target[:, :3]) & torch.isfinite(target[:, 3:6])
+    diff = angle_diff_rad(wind_direction_rad(pred), wind_direction_rad(target))
+    diff_deg = torch.rad2deg(diff)
+    return diff_deg, mask
+
+
+def direction_gaussian_crps_deg(pred: torch.Tensor, target: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
+    pred_angle = wind_direction_rad(pred)
+    target_angle = wind_direction_rad(target)
+    diff_deg = torch.rad2deg(angle_diff_rad(target_angle, pred_angle))
+    out = torch.full_like(diff_deg, float("nan"))
+    for station_idx in range(3):
+        u = pred[:, station_idx]
+        v = pred[:, station_idx + 3]
+        speed_sq = (u * u + v * v).clamp_min(1.0e-6)
+        grad = torch.stack([-v / speed_sq, u / speed_sq], dim=1)
+        uv_idx = [station_idx, station_idx + 3]
+        uv_cov = cov[:, uv_idx][:, :, uv_idx]
+        var_rad = torch.einsum("ni,nij,nj->n", grad, uv_cov, grad).clamp_min(1.0e-12)
+        var_deg = var_rad * (180.0 / math.pi) ** 2
+        out[:, station_idx] = gaussian_crps(
+            torch.zeros_like(diff_deg[:, station_idx]),
+            var_deg,
+            diff_deg[:, station_idx],
+        )
+    return out
+
+
 def metric_block(
     pred: torch.Tensor,
     target: torch.Tensor,
     crps: torch.Tensor | None = None,
+    direction_crps: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     mask = torch.isfinite(pred) & torch.isfinite(target)
     err = pred - target
@@ -113,6 +154,12 @@ def metric_block(
     v_mask = mask[:, 3:]
     u_err = safe_err[:, :3]
     v_err = safe_err[:, 3:]
+    dir_err_deg, dir_mask = direction_error_deg(pred, target)
+    safe_dir_err = torch.where(dir_mask, dir_err_deg, torch.zeros_like(dir_err_deg))
+    dir_count_by_station = dir_mask.sum(dim=0).clamp_min(1)
+    dir_count = dir_mask.sum().clamp_min(1)
+    dir_rmse_by_station = torch.sqrt(safe_dir_err.pow(2).sum(dim=0) / dir_count_by_station)
+    dir_mae_by_station = safe_dir_err.abs().sum(dim=0) / dir_count_by_station
     out: dict[str, Any] = {
         "rmse": float(rmse.detach().cpu()),
         "mae": float(mae.detach().cpu()),
@@ -120,6 +167,16 @@ def metric_block(
         "mae_u": float((u_err.abs().sum() / u_mask.sum().clamp_min(1)).detach().cpu()),
         "rmse_v": float(torch.sqrt(v_err.pow(2).sum() / v_mask.sum().clamp_min(1)).detach().cpu()),
         "mae_v": float((v_err.abs().sum() / v_mask.sum().clamp_min(1)).detach().cpu()),
+        "direction_rmse_deg": float(torch.sqrt(safe_dir_err.pow(2).sum() / dir_count).detach().cpu()),
+        "direction_mae_deg": float((safe_dir_err.abs().sum() / dir_count).detach().cpu()),
+        "direction_rmse_deg_by_station": {
+            name: float(value.detach().cpu())
+            for name, value in zip(STATION_NAMES, dir_rmse_by_station)
+        },
+        "direction_mae_deg_by_station": {
+            name: float(value.detach().cpu())
+            for name, value in zip(STATION_NAMES, dir_mae_by_station)
+        },
         "rmse_by_dim": {
             name: float(value.detach().cpu())
             for name, value in zip(STATE_NAMES, rmse_by_dim)
@@ -142,6 +199,17 @@ def metric_block(
         out["crps_by_dim"] = {
             name: float(value.detach().cpu())
             for name, value in zip(STATE_NAMES, crps_by_dim)
+        }
+    if direction_crps is not None:
+        dir_crps_mask = dir_mask & torch.isfinite(direction_crps)
+        safe_dir_crps = torch.where(dir_crps_mask, direction_crps, torch.zeros_like(direction_crps))
+        dir_crps_count_by_station = dir_crps_mask.sum(dim=0).clamp_min(1)
+        dir_crps_count = dir_crps_mask.sum().clamp_min(1)
+        dir_crps_by_station = safe_dir_crps.sum(dim=0) / dir_crps_count_by_station
+        out["direction_crps_deg"] = float((safe_dir_crps.sum() / dir_crps_count).detach().cpu())
+        out["direction_crps_deg_by_station"] = {
+            name: float(value.detach().cpu())
+            for name, value in zip(STATION_NAMES, dir_crps_by_station)
         }
     return out
 
@@ -431,6 +499,9 @@ def run_light_eval(
         rmse_curve = np.full((max_horizon, len(CURVE_COLUMNS)), np.nan, dtype=np.float32)
         mae_curve = np.full((max_horizon, len(CURVE_COLUMNS)), np.nan, dtype=np.float32)
         crps_curve = np.full((max_horizon, len(CURVE_COLUMNS)), np.nan, dtype=np.float32)
+        direction_rmse_curve = np.full((max_horizon, len(CURVE_COLUMNS)), np.nan, dtype=np.float32)
+        direction_mae_curve = np.full((max_horizon, len(CURVE_COLUMNS)), np.nan, dtype=np.float32)
+        direction_crps_curve = np.full((max_horizon, len(CURVE_COLUMNS)), np.nan, dtype=np.float32)
         interval_payload: dict[str, np.ndarray] | None = None
 
         for horizon in range(1, max_horizon + 1):
@@ -456,15 +527,16 @@ def run_light_eval(
             )
             target_h = target[horizon:T]
             crps_h = gaussian_crps(pred_measurement, pred_var, target_h)
-            model_metrics = metric_block(pred_measurement, target_h, crps=crps_h)
+            pred_cov_measurement = model_cov_to_measurement_cov(
+                pred_cov_model,
+                data,
+                device,
+                pred_measurement.dtype,
+            )
+            direction_crps_h = direction_gaussian_crps_deg(pred_measurement, target_h, pred_cov_measurement)
+            model_metrics = metric_block(pred_measurement, target_h, crps=crps_h, direction_crps=direction_crps_h)
 
             if horizon == 1:
-                pred_cov_measurement = model_cov_to_measurement_cov(
-                    pred_cov_model,
-                    data,
-                    device,
-                    pred_measurement.dtype,
-                )
                 interval_payload = {
                     "prediction": pred_measurement.detach().cpu().numpy(),
                     "target": target_h.detach().cpu().numpy(),
@@ -478,12 +550,26 @@ def run_light_eval(
             persistence_pred = target[:n]
             nwp_pred = nwp[horizon:T]
             residual_persistence_pred = nwp[horizon:T] + (target[:n] - nwp[:n])
-            persistence_metrics = metric_block(persistence_pred, target_h, crps=torch.abs(persistence_pred - target_h))
-            nwp_metrics = metric_block(nwp_pred, target_h, crps=torch.abs(nwp_pred - target_h))
+            persistence_dir_err, persistence_dir_mask = direction_error_deg(persistence_pred, target_h)
+            nwp_dir_err, nwp_dir_mask = direction_error_deg(nwp_pred, target_h)
+            residual_dir_err, residual_dir_mask = direction_error_deg(residual_persistence_pred, target_h)
+            persistence_metrics = metric_block(
+                persistence_pred,
+                target_h,
+                crps=torch.abs(persistence_pred - target_h),
+                direction_crps=torch.where(persistence_dir_mask, persistence_dir_err.abs(), torch.full_like(persistence_dir_err, float("nan"))),
+            )
+            nwp_metrics = metric_block(
+                nwp_pred,
+                target_h,
+                crps=torch.abs(nwp_pred - target_h),
+                direction_crps=torch.where(nwp_dir_mask, nwp_dir_err.abs(), torch.full_like(nwp_dir_err, float("nan"))),
+            )
             residual_persistence_metrics = metric_block(
                 residual_persistence_pred,
                 target_h,
                 crps=torch.abs(residual_persistence_pred - target_h),
+                direction_crps=torch.where(residual_dir_mask, residual_dir_err.abs(), torch.full_like(residual_dir_err, float("nan"))),
             )
 
             rmse_curve[horizon - 1] = [
@@ -503,6 +589,24 @@ def run_light_eval(
                 persistence_metrics["crps"],
                 nwp_metrics["crps"],
                 residual_persistence_metrics["crps"],
+            ]
+            direction_rmse_curve[horizon - 1] = [
+                model_metrics["direction_rmse_deg"],
+                persistence_metrics["direction_rmse_deg"],
+                nwp_metrics["direction_rmse_deg"],
+                residual_persistence_metrics["direction_rmse_deg"],
+            ]
+            direction_mae_curve[horizon - 1] = [
+                model_metrics["direction_mae_deg"],
+                persistence_metrics["direction_mae_deg"],
+                nwp_metrics["direction_mae_deg"],
+                residual_persistence_metrics["direction_mae_deg"],
+            ]
+            direction_crps_curve[horizon - 1] = [
+                model_metrics["direction_crps_deg"],
+                persistence_metrics["direction_crps_deg"],
+                nwp_metrics["direction_crps_deg"],
+                residual_persistence_metrics["direction_crps_deg"],
             ]
             multi_step[str(horizon)] = {
                 "model": model_metrics,
@@ -552,6 +656,9 @@ def run_light_eval(
             "rmse_curve": rmse_curve.tolist(),
             "mae_curve": mae_curve.tolist(),
             "crps_curve": crps_curve.tolist(),
+            "direction_rmse_curve": direction_rmse_curve.tolist(),
+            "direction_mae_curve": direction_mae_curve.tolist(),
+            "direction_crps_curve": direction_crps_curve.tolist(),
             "curve_columns": CURVE_COLUMNS,
         },
     }
@@ -654,18 +761,36 @@ def write_horizon_csv(results: dict[str, Any], path: Path, index_name: str = "ho
     rmse = np.asarray(curves.get("rmse_curve", []), dtype=float)
     mae = np.asarray(curves.get("mae_curve", []), dtype=float)
     crps = np.asarray(curves.get("crps_curve", []), dtype=float)
+    direction_rmse = np.asarray(curves.get("direction_rmse_curve", []), dtype=float)
+    direction_mae = np.asarray(curves.get("direction_mae_curve", []), dtype=float)
+    direction_crps = np.asarray(curves.get("direction_crps_curve", []), dtype=float)
     if rmse.ndim == 1 and rmse.size:
         rmse = rmse[:, None]
     if mae.ndim == 1 and mae.size:
         mae = mae[:, None]
     if crps.ndim == 1 and crps.size:
         crps = crps[:, None]
+    if direction_rmse.ndim == 1 and direction_rmse.size:
+        direction_rmse = direction_rmse[:, None]
+    if direction_mae.ndim == 1 and direction_mae.size:
+        direction_mae = direction_mae[:, None]
+    if direction_crps.ndim == 1 and direction_crps.size:
+        direction_crps = direction_crps[:, None]
 
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         header = [index_name]
         for name in columns:
-            header.extend([f"{name}_rmse", f"{name}_mae", f"{name}_crps"])
+            header.extend(
+                [
+                    f"{name}_rmse",
+                    f"{name}_mae",
+                    f"{name}_crps",
+                    f"{name}_direction_rmse_deg",
+                    f"{name}_direction_mae_deg",
+                    f"{name}_direction_crps_deg",
+                ]
+            )
         writer.writerow(header)
         for i, horizon in enumerate(horizons):
             row: list[Any] = [horizon]
@@ -675,6 +800,21 @@ def write_horizon_csv(results: dict[str, Any], path: Path, index_name: str = "ho
                 row.append(
                     float(crps[i, j])
                     if crps.ndim == 2 and i < crps.shape[0] and j < crps.shape[1] and np.isfinite(crps[i, j])
+                    else ""
+                )
+                row.append(
+                    float(direction_rmse[i, j])
+                    if direction_rmse.ndim == 2 and i < direction_rmse.shape[0] and j < direction_rmse.shape[1] and np.isfinite(direction_rmse[i, j])
+                    else ""
+                )
+                row.append(
+                    float(direction_mae[i, j])
+                    if direction_mae.ndim == 2 and i < direction_mae.shape[0] and j < direction_mae.shape[1] and np.isfinite(direction_mae[i, j])
+                    else ""
+                )
+                row.append(
+                    float(direction_crps[i, j])
+                    if direction_crps.ndim == 2 and i < direction_crps.shape[0] and j < direction_crps.shape[1] and np.isfinite(direction_crps[i, j])
                     else ""
                 )
             writer.writerow(row)
@@ -689,7 +829,7 @@ def hourly_mean_curves(results: dict[str, Any], group_size: int = 6) -> dict[str
     hour_ids = ((horizons - 1) // group_size) + 1
     hours = np.unique(hour_ids)
     grouped: dict[str, Any] = {"horizons": hours.astype(int).tolist(), "curve_columns": columns}
-    for key in ("rmse_curve", "mae_curve", "crps_curve"):
+    for key in ("rmse_curve", "mae_curve", "crps_curve", "direction_rmse_curve", "direction_mae_curve", "direction_crps_curve"):
         values = np.asarray(curves.get(key, []), dtype=float)
         if values.size == 0:
             continue
@@ -714,12 +854,21 @@ def curve_records(curves: dict[str, Any], index_name: str) -> list[dict[str, Any
     rmse = np.asarray(curves.get("rmse_curve", []), dtype=float)
     mae = np.asarray(curves.get("mae_curve", []), dtype=float)
     crps = np.asarray(curves.get("crps_curve", []), dtype=float)
+    direction_rmse = np.asarray(curves.get("direction_rmse_curve", []), dtype=float)
+    direction_mae = np.asarray(curves.get("direction_mae_curve", []), dtype=float)
+    direction_crps = np.asarray(curves.get("direction_crps_curve", []), dtype=float)
     if rmse.ndim == 1 and rmse.size:
         rmse = rmse[:, None]
     if mae.ndim == 1 and mae.size:
         mae = mae[:, None]
     if crps.ndim == 1 and crps.size:
         crps = crps[:, None]
+    if direction_rmse.ndim == 1 and direction_rmse.size:
+        direction_rmse = direction_rmse[:, None]
+    if direction_mae.ndim == 1 and direction_mae.size:
+        direction_mae = direction_mae[:, None]
+    if direction_crps.ndim == 1 and direction_crps.size:
+        direction_crps = direction_crps[:, None]
 
     records: list[dict[str, Any]] = []
     for i, value in enumerate(indices):
@@ -739,6 +888,30 @@ def curve_records(curves: dict[str, Any], index_name: str) -> list[dict[str, Any
             method["crps"] = (
                 float(crps[i, j])
                 if crps.ndim == 2 and i < crps.shape[0] and j < crps.shape[1] and np.isfinite(crps[i, j])
+                else None
+            )
+            method["direction_rmse_deg"] = (
+                float(direction_rmse[i, j])
+                if direction_rmse.ndim == 2
+                and i < direction_rmse.shape[0]
+                and j < direction_rmse.shape[1]
+                and np.isfinite(direction_rmse[i, j])
+                else None
+            )
+            method["direction_mae_deg"] = (
+                float(direction_mae[i, j])
+                if direction_mae.ndim == 2
+                and i < direction_mae.shape[0]
+                and j < direction_mae.shape[1]
+                and np.isfinite(direction_mae[i, j])
+                else None
+            )
+            method["direction_crps_deg"] = (
+                float(direction_crps[i, j])
+                if direction_crps.ndim == 2
+                and i < direction_crps.shape[0]
+                and j < direction_crps.shape[1]
+                and np.isfinite(direction_crps[i, j])
                 else None
             )
             record[name] = method
@@ -769,6 +942,7 @@ def plot_curves(results: dict[str, Any], output_dir: Path) -> None:
         "nwp": "nwp",
         "nwp_residual_persistence": "nwp residual persistence",
     }
+    exclude_columns = {"nwp_residual_persistence"}
     markers = ["o", "s", "^", "D", "v", "P"]
     title_font = {"fontsize": 16, "fontweight": "bold"}
     label_font = {"fontsize": 14, "fontweight": "bold"}
@@ -790,6 +964,79 @@ def plot_curves(results: dict[str, Any], output_dir: Path) -> None:
             tick.set_fontweight("bold")
         ax.legend(prop=legend_font)
 
+    def plot_metric_triplet(curves: dict[str, Any], xlabel: str, title_prefix: str, filename: str) -> None:
+        x_values = np.asarray(curves.get("horizons", []), dtype=float)
+        if x_values.size == 0:
+            return
+        columns = [str(x) for x in curves.get("curve_columns", CURVE_COLUMNS)]
+        metric_specs = [
+            ("rmse_curve", "Speed RMSE", "Wind speed RMSE (m/s)"),
+            ("mae_curve", "Speed MAE", "Wind speed MAE (m/s)"),
+            ("crps_curve", "Speed CRPS", "Wind speed CRPS (m/s)"),
+        ]
+        arrays = [
+            (key, title, ylabel, normalize_curve(curves.get(key, [])))
+            for key, title, ylabel in metric_specs
+        ]
+        if not any(arr.size and np.isfinite(arr).any() for _, _, _, arr in arrays):
+            return
+        fig, axes = plt.subplots(1, 3, figsize=(17.2, 4.8), constrained_layout=True)
+        for ax, (_, title, ylabel, values) in zip(axes, arrays):
+            if not (values.size and np.isfinite(values).any()):
+                ax.set_visible(False)
+                continue
+            for j, name in enumerate(columns):
+                if name in exclude_columns or j >= values.shape[1] or not np.isfinite(values[:, j]).any():
+                    continue
+                ax.plot(
+                    x_values,
+                    values[:, j],
+                    marker=markers[j % len(markers)],
+                    markersize=4.8,
+                    linewidth=2.1,
+                    label=labels.get(name, name),
+                )
+            ax.set_title(f"{title_prefix} {title}", **title_font)
+            ax.set_ylabel(ylabel, **label_font)
+            style_axis(ax, xlabel)
+        fig.savefig(output_dir / filename, dpi=220)
+        plt.close(fig)
+
+    def plot_direction_triplet(curves: dict[str, Any], xlabel: str, title_prefix: str, filename: str) -> None:
+        x_values = np.asarray(curves.get("horizons", []), dtype=float)
+        if x_values.size == 0:
+            return
+        columns = [str(x) for x in curves.get("curve_columns", CURVE_COLUMNS)]
+        metric_specs = [
+            ("direction_rmse_curve", "Direction RMSE"),
+            ("direction_mae_curve", "Direction MAE"),
+            ("direction_crps_curve", "Direction CRPS"),
+        ]
+        arrays = [(key, ylabel, normalize_curve(curves.get(key, []))) for key, ylabel in metric_specs]
+        if not any(arr.size and np.isfinite(arr).any() for _, _, arr in arrays):
+            return
+        fig, axes = plt.subplots(1, 3, figsize=(17.2, 4.8), constrained_layout=True)
+        for ax, (_, ylabel, values) in zip(axes, arrays):
+            if not (values.size and np.isfinite(values).any()):
+                ax.set_visible(False)
+                continue
+            for j, name in enumerate(columns):
+                if name in exclude_columns or j >= values.shape[1] or not np.isfinite(values[:, j]).any():
+                    continue
+                ax.plot(
+                    x_values,
+                    values[:, j],
+                    marker=markers[j % len(markers)],
+                    markersize=4.8,
+                    linewidth=2.1,
+                    label=labels.get(name, name),
+                )
+            ax.set_title(f"{title_prefix} {ylabel}", **title_font)
+            ax.set_ylabel("Degrees", **label_font)
+            style_axis(ax, xlabel)
+        fig.savefig(output_dir / filename, dpi=220)
+        plt.close(fig)
+
     def plot_rmse_mae(curves: dict[str, Any], xlabel: str, title_prefix: str, filename: str) -> None:
         x_values = np.asarray(curves.get("horizons", []), dtype=float)
         if x_values.size == 0:
@@ -801,6 +1048,8 @@ def plot_curves(results: dict[str, Any], output_dir: Path) -> None:
             return
         fig, axes = plt.subplots(1, 2, figsize=(12.6, 4.8), constrained_layout=True)
         for j, name in enumerate(columns):
+            if name in exclude_columns:
+                continue
             if rmse.size and j < rmse.shape[1]:
                 axes[0].plot(
                     x_values,
@@ -838,7 +1087,7 @@ def plot_curves(results: dict[str, Any], output_dir: Path) -> None:
             return
         fig, ax = plt.subplots(figsize=(7.4, 4.6), constrained_layout=True)
         for j, name in enumerate(columns):
-            if j >= crps.shape[1] or not np.isfinite(crps[:, j]).any():
+            if name in exclude_columns or j >= crps.shape[1] or not np.isfinite(crps[:, j]).any():
                 continue
             ax.plot(
                 x_values,
@@ -856,6 +1105,30 @@ def plot_curves(results: dict[str, Any], output_dir: Path) -> None:
 
     horizon_curves = results.get("_curves", {})
     hour_curves = hourly_mean_curves(results)
+    plot_metric_triplet(
+        horizon_curves,
+        xlabel="forecast horizon (10 min steps)",
+        title_prefix="Per-Horizon Mean",
+        filename="rmse_mae_crps_curves_by_horizon.png",
+    )
+    plot_metric_triplet(
+        hour_curves,
+        xlabel="forecast hour",
+        title_prefix="Hourly Mean",
+        filename="rmse_mae_crps_curves.png",
+    )
+    plot_direction_triplet(
+        horizon_curves,
+        xlabel="forecast horizon (10 min steps)",
+        title_prefix="Per-Horizon Mean",
+        filename="direction_rmse_mae_crps_curves_by_horizon.png",
+    )
+    plot_direction_triplet(
+        hour_curves,
+        xlabel="forecast hour",
+        title_prefix="Hourly Mean",
+        filename="direction_rmse_mae_crps_curves.png",
+    )
     plot_rmse_mae(
         horizon_curves,
         xlabel="forecast horizon (10 min steps)",

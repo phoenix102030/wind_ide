@@ -1,0 +1,188 @@
+\subsection{Component-Wise Stochastic Advection Kernel}
+\label{subsec:component_advection_kernel}
+
+The key quantity in the Lagrangian IDE kernel is the spatial displacement
+between a source location and a target location. Let
+\[
+\mathbf h_{ij}=s_i^\ast-s_j^\ast\in\mathbb R^2
+\]
+denote the two-dimensional displacement from source location \(s_j^\ast\) to
+target location \(s_i^\ast\). Since this displacement is defined in physical
+space, the advection term that shifts the kernel must also be a
+two-dimensional spatial displacement. We therefore model advection at the level
+of the two component fields rather than as four scalar component-pair
+displacements.
+
+Let \(u\) and \(v\) denote the zonal and meridional wind-component fields. At
+time \(t\), VectorWIDE represents the stochastic advection of these two fields
+by
+\begin{equation}
+\boldsymbol a_t
+=
+\left[
+\left(\boldsymbol a_t^{(u)}\right)^\top,
+\left(\boldsymbol a_t^{(v)}\right)^\top
+\right]^\top
+\in\mathbb R^4,
+\qquad
+\boldsymbol a_t^{(u)},\boldsymbol a_t^{(v)}\in\mathbb R^2 .
+\end{equation}
+The four-dimensional vector is thus the stacking of two two-dimensional
+spatial advections:
+\[
+\boldsymbol a_t =
+(a_{u,x,t},a_{u,y,t},a_{v,x,t},a_{v,y,t})^\top .
+\]
+We assume
+\begin{equation}
+\boldsymbol a_t
+\sim
+\mathcal N(\boldsymbol\mu_t,\boldsymbol\Sigma_t),
+\qquad
+\boldsymbol\mu_t\in\mathbb R^4,\quad
+\boldsymbol\Sigma_t\in\mathbb R^{4\times4}.
+\label{eq:component_advection_distribution}
+\end{equation}
+The covariance matrix \(\boldsymbol\Sigma_t\) captures uncertainty within each
+component-field advection and dependence between the two component-field
+advections.
+
+Define the component selectors
+\[
+\mathbf E_u =
+\begin{bmatrix}
+1 & 0 & 0 & 0\\
+0 & 1 & 0 & 0
+\end{bmatrix},
+\qquad
+\mathbf E_v =
+\begin{bmatrix}
+0 & 0 & 1 & 0\\
+0 & 0 & 0 & 1
+\end{bmatrix}.
+\]
+For a transition from source component \(q\) to target component \(p\), the
+stacked advection vector is projected to physical two-dimensional space by a
+matrix \(\mathbf P_{pq}\in\mathbb R^{2\times4}\). Following the Lagrangian
+cross-covariance construction, the diagonal and off-diagonal blocks use
+different time projections. For within-component propagation,
+\begin{equation}
+\mathbf P_{pp}(u)=u\mathbf E_p,
+\end{equation}
+where \(u\) is the time lag. For cross-component propagation,
+\begin{equation}
+\mathbf P_{pq}(t_1,t_2)=t_1\mathbf E_p-t_2\mathbf E_q,
+\qquad p\neq q .
+\label{eq:component_cross_projection}
+\end{equation}
+This is the analogue of the \(T(t_1,t_2)\widetilde{\mathbf d}_{ij}\)
+projection in the multivariate Lagrangian theorem: the target component
+advection and source component advection both contribute to the cross block.
+The same projection must be used for the mean displacement and for the
+covariance-induced dispersion.
+
+Using \(\mathbf P_{pq}\), define
+\begin{equation}
+\mathbf h_{ij,t}^{\prime(pq)}
+=
+\mathbf h_{ij}
+-
+\mathbf P_{pq}\boldsymbol\mu_t .
+\label{eq:component_pairwise_hprime}
+\end{equation}
+The effective dispersion matrix is
+\begin{equation}
+\mathbf D_t^{(pq)}
+=
+\ell_{pq}^2\mathbf I_2
++
+2\mathbf P_{pq}\boldsymbol\Sigma_t\mathbf P_{pq}^{\top},
+\label{eq:component_effective_dispersion}
+\end{equation}
+where \(\ell_{pq}>0\) is a component-pair baseline spatial spread. In the
+one-step implementation, \(u=\Delta t\), \(t_1=\Delta t\), and
+\(t_2=0\), so the cross block is shifted by the target component's effective
+advection. More generally, retaining \(t_2>0\) gives the full
+cross-component projection \(t_1\mathbf E_p-t_2\mathbf E_q\). The same
+projection appears in both \(\mathbf h_{ij,t}^{\prime(pq)}\) and
+\(\mathbf D_t^{(pq)}\). The discretized redistribution kernel is
+\begin{equation}
+\widetilde{k}_t^{(pq)}(s_i^\ast,s_j^\ast)
+=
+\alpha_t^{(pq)}
+\left|\mathbf D_t^{(pq)}\right|^{-1/2}
+\exp
+\left\{
+-
+\left(\mathbf h_{ij,t}^{\prime(pq)}\right)^\top
+\left(\mathbf D_t^{(pq)}\right)^{-1}
+\mathbf h_{ij,t}^{\prime(pq)}
+\right\},
+\label{eq:component_pairwise_kernel}
+\end{equation}
+where \(\alpha_t^{(pq)}\) is a learned component-mixing weight. The diagonal
+blocks describe within-component propagation, while the off-diagonal blocks
+describe cross-component transfer. In all cases, the geometry of the spatial
+kernel is governed by a two-dimensional advection displacement.
+
+Evaluating \eqref{eq:component_pairwise_kernel} over all source-target pairs
+gives the four unnormalized blocks
+\[
+\widetilde{\mathbf K}_t^{(pq)}
+=
+\left[
+\widetilde{k}_t^{(pq)}(s_i^\ast,s_j^\ast)
+\right]_{i,j=1}^n,
+\qquad p,q\in\{u,v\}.
+\]
+The full transition matrix is assembled as
+\begin{equation}
+\widetilde{\mathbf K}_t
+=
+\begin{bmatrix}
+\widetilde{\mathbf K}_t^{(uu)} & \widetilde{\mathbf K}_t^{(uv)}\\
+\widetilde{\mathbf K}_t^{(vu)} & \widetilde{\mathbf K}_t^{(vv)}
+\end{bmatrix}.
+\end{equation}
+We then row-normalize the full block matrix:
+\begin{equation}
+\left[\mathbf K_t\right]_{ij}
+=
+\frac{
+\left[\widetilde{\mathbf K}_t\right]_{ij}
+}{
+\sum_{j'=1}^{2n}
+\left[\widetilde{\mathbf K}_t\right]_{ij'}
+},
+\qquad i,j=1,\ldots,2n.
+\end{equation}
+This normalization yields a stable redistribution operator while preserving the
+relative spatial asymmetry and component-mixing structure induced by the
+learned stochastic advection moments.
+
+\subsection{Learning Component Advection from Exogenous Wind Fields}
+\label{subsec:component_advection_learning}
+
+Let \(\mathbf X_t\) denote the exogenous NWP wind-field input available at time
+\(t\). VectorWIDE uses a neural mapping to convert recent NWP fields into the
+low-dimensional stochastic advection moments that parameterize the IDE kernel:
+\begin{equation}
+(\boldsymbol\mu_t,\boldsymbol\Sigma_t,\mathbf A_t)
+=
+\psi(\mathbf X_{1:t};\boldsymbol\Phi),
+\label{eq:component_deep_mapping}
+\end{equation}
+where \(\mathbf A_t=\{\alpha_t^{(pq)}\}_{p,q\in\{u,v\}}\) contains the
+component-mixing weights. In the implementation, a CNN first encodes the
+spatial structure of each NWP field and a causal transformer then models the
+temporal evolution of the encoded features. The output heads produce the
+component-wise mean advection \(\boldsymbol\mu_t\), a positive-definite
+covariance matrix \(\boldsymbol\Sigma_t\), and the component-mixing weights
+\(\mathbf A_t\).
+
+The neural network therefore does not directly replace the state-space wind
+forecast. Instead, it supplies physically interpretable, time-varying
+advection moments to the probabilistic IDE transition operator. This separation
+keeps the transport geometry explicit: advection shifts the spatial field in
+two-dimensional physical space, while the multi-output IDE structure models
+within-component propagation and cross-component exchange.

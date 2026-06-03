@@ -42,7 +42,7 @@ nwp_channel_names:
   - u180
   - v180
 component_specific_mu: false
-advection_mode: shared_flow_deformation
+advection_mode: component
 deformation_scale: 0.3
 
 dt: 1.0
@@ -68,15 +68,15 @@ rolling_window_size: 24
 batch_size: 1
 steps_per_epoch: 50
 forecast_horizon: 12
-transition_kernel_weight: true
+transition_kernel_weight: false
 transition_kernel_weight_init: 0.2
 transition_kernel_weight_min: 0.0
 transition_kernel_weight_max: 1.0
-transition_residual_decay: true
+transition_residual_decay: false
 transition_residual_decay_init: 0.97
 transition_residual_decay_min: 0.0
 transition_residual_decay_max: 1.0
-transition_control: true
+transition_control: false
 transition_control_scale: 0.5
 
 lr_cnn: 1.0e-4
@@ -87,7 +87,7 @@ weight_decay: 1.0e-4
 grad_clip: 1.0
 
 lambda_adv: 0.1
-lambda_deform: 0.05
+lambda_deform: 0.0
 lambda_smooth: 0.001
 lambda_reg: 0.0001
 lambda_multistep: 0.2
@@ -165,7 +165,7 @@ data:
   #   ASOW6: [lat, lon]
 
   advection_label_mode: simple
-  deformation_label_mode: nwp_gradient
+  deformation_label_mode: none
   deformation_label_clip: 0.3
   optical_flow_stride: 2
   optical_flow_ridge: 1.0e-4

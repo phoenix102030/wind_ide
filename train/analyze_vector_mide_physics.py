@@ -1389,6 +1389,44 @@ def plot_deepmide_style_advection_figure(
     }
 
 
+def plot_deepmide_style_advection_norm_only(flow: np.ndarray, out: Path) -> dict[str, Any]:
+    """Save the standalone time-series panel from the DeepMIDE-style figure."""
+    plt = setup_matplotlib()
+    flow_norm = np.linalg.norm(flow, axis=1)
+    valid = np.where(np.isfinite(flow_norm))[0]
+    if valid.size < 2:
+        return {"created": False, "reason": "not enough finite flow values"}
+
+    high_t = int(valid[np.nanargmax(flow_norm[valid])])
+    low_candidates = valid[valid > max(10, int(0.05 * len(valid)))]
+    low_t = (
+        int(low_candidates[np.nanargmin(flow_norm[low_candidates])])
+        if low_candidates.size
+        else int(valid[np.nanargmin(flow_norm[valid])])
+    )
+
+    fig, ax = plt.subplots(figsize=(13.2, 4.8), constrained_layout=True)
+    x = np.arange(flow.shape[0])
+    ax.plot(x, flow_norm, color=MODEL_COLOR, linewidth=1.85)
+    top = float(np.nanmax(flow_norm) * 1.16)
+    ax.set_ylim(float(np.nanmin(flow_norm) - 0.2), top)
+    ax.set_title("Norm of learned advection parameter", fontsize=13.5, fontweight="bold")
+    ax.set_xlabel("Time index", fontsize=11.5, fontweight="bold")
+    ax.set_ylabel("Norm", fontsize=11.5, fontweight="bold", labelpad=7)
+    polish_axes(ax)
+    ax.tick_params(axis="both", labelsize=10, pad=2)
+    normal_tick_labels(ax)
+    fig.savefig(out / "deepmide_style_advection_norm_only.png", bbox_inches="tight", pad_inches=0.10)
+    plt.close(fig)
+    return {
+        "created": True,
+        "high_advection_time_index": high_t,
+        "low_advection_time_index": low_t,
+        "high_advection_norm": float(flow_norm[high_t]),
+        "low_advection_norm": float(flow_norm[low_t]),
+    }
+
+
 def advection_covariance_for_flow(
     advection: dict[str, np.ndarray],
     flow: np.ndarray,
@@ -2234,26 +2272,39 @@ def main() -> None:
         choices=["processed", "raw"],
         help="Use B @ flow when available, otherwise raw shared flow.",
     )
+    parser.add_argument(
+        "--only-deepmide-style-c",
+        action="store_true",
+        help="Only save the standalone advection-norm time-series panel from the DeepMIDE-style figure.",
+    )
     args = parser.parse_args()
 
     eval_dir = args.eval_dir
     out = args.output_dir or (eval_dir / "physics_analysis")
     out.mkdir(parents=True, exist_ok=True)
 
-    forecasts = load_npz(eval_dir / "forecasts.npz")
     advection = load_npz(eval_dir / "advection_parameters.npz")
+    flow = advection.get("flow_mu")
+    if args.flow_kind == "processed" and advection.get("processed_flow_mu") is not None and advection["processed_flow_mu"].size:
+        flow = advection["processed_flow_mu"]
+    if flow is None or flow.size == 0:
+        raise ValueError("No learned flow found in advection_parameters.npz")
+    if args.only_deepmide_style_c:
+        summary = {"deepmide_style_advection_norm_only": plot_deepmide_style_advection_norm_only(flow, out)}
+        (out / "physics_analysis_summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"Wrote standalone DeepMIDE-style panel c to {out}")
+        return
+
+    forecasts = load_npz(eval_dir / "forecasts.npz")
     transitions = load_npz(eval_dir / "transition_matrices.npz")
     metrics = load_npz(eval_dir / "multi_step_metrics.npz")
     results = None
     results_path = eval_dir / "results.json"
     if results_path.exists():
         results = json.loads(results_path.read_text(encoding="utf-8"))
-
-    flow = advection.get("flow_mu")
-    if args.flow_kind == "processed" and advection.get("processed_flow_mu") is not None and advection["processed_flow_mu"].size:
-        flow = advection["processed_flow_mu"]
-    if flow is None or flow.size == 0:
-        raise ValueError("No learned flow found in advection_parameters.npz")
 
     optional_data = load_optional_dataset(args.config, args.split, expected_t=flow.shape[0])
     v_star = optional_data.get("V_star")
@@ -2323,6 +2374,7 @@ def main() -> None:
         optional_data,
         out,
     )
+    summary["deepmide_style_advection_norm_only"] = plot_deepmide_style_advection_norm_only(flow, out)
 
     (out / "physics_analysis_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False),

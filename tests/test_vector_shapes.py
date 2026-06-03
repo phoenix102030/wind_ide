@@ -132,6 +132,57 @@ def test_vector_kernel_transition_shape_and_row_sums():
     assert torch.all(M >= 0)
 
 
+def test_component_advection_uses_two_dimensional_target_field_shifts():
+    coords = torch.tensor([[0.0, 0.0], [3.0, 0.5], [1.5, 2.0]])
+    mu = torch.tensor([0.5, 0.1, -0.4, 0.2])
+    sigma = 0.01 * torch.eye(4)
+    A = torch.ones(2, 2)
+
+    kernel = VectorLagrangianKernel(n_dim=3, dt=1.0, gamma=0.0, row_normalize=False)
+    M = kernel(coords, mu, sigma, A)
+
+    uu = M[:3, :3]
+    uv = M[:3, 3:]
+    vu = M[3:, :3]
+    vv = M[3:, 3:]
+
+    assert torch.allclose(uu, uv, atol=1.0e-6)
+    assert torch.allclose(vu, vv, atol=1.0e-6)
+    assert not torch.allclose(uu, vu)
+
+
+def test_component_projection_uses_source_selector_only_for_cross_blocks():
+    kernel = VectorLagrangianKernel(n_dim=3, dt=1.0, gamma=1.0, row_normalize=False)
+    selectors = kernel.selectors(torch.device("cpu"), torch.float32)
+    gamma = torch.tensor(1.0)
+
+    uu = kernel.component_projection(0, 0, selectors, gamma)
+    uv = kernel.component_projection(0, 1, selectors, gamma)
+    vu = kernel.component_projection(1, 0, selectors, gamma)
+
+    expected_uu = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+    expected_uv = torch.tensor([[1.0, 0.0, -1.0, 0.0], [0.0, 1.0, 0.0, -1.0]])
+    expected_vu = torch.tensor([[-1.0, 0.0, 1.0, 0.0], [0.0, -1.0, 0.0, 1.0]])
+
+    assert torch.allclose(uu, expected_uu)
+    assert torch.allclose(uv, expected_uv)
+    assert torch.allclose(vu, expected_vu)
+
+
+def test_component_projection_target_only_for_one_step_cross_blocks():
+    kernel = VectorLagrangianKernel(n_dim=3, dt=1.0, gamma=0.0, row_normalize=False)
+    selectors = kernel.selectors(torch.device("cpu"), torch.float32)
+    gamma = torch.tensor(0.0)
+
+    uu = kernel.component_projection(0, 0, selectors, gamma)
+    uv = kernel.component_projection(0, 1, selectors, gamma)
+    vv = kernel.component_projection(1, 1, selectors, gamma)
+    vu = kernel.component_projection(1, 0, selectors, gamma)
+
+    assert torch.allclose(uu, uv)
+    assert torch.allclose(vv, vu)
+
+
 def test_vector_kernel_vectorized_matches_single_step():
     T = 5
     coords = torch.tensor([[0.0, 0.0], [3.0, 0.5], [1.5, 2.0]])

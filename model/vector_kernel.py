@@ -14,7 +14,20 @@ def _logit(value: float) -> float:
 
 
 class VectorLagrangianKernel(nn.Module):
-    """Build vector-wind transition matrices from advection distributions."""
+    """Build vector-wind transition matrices from advection distributions.
+
+    In the component-advection mode, ``mu`` is ordered as
+    ``[u_x, u_y, v_x, v_y]``. The first two entries are the 2D spatial
+    displacement of the U-component field and the last two entries are the 2D
+    spatial displacement of the V-component field. For within-component blocks,
+    the kernel uses the component's two-dimensional time-lag shift. For
+    cross-component blocks, the default one-step IDE convention sets the
+    source-side time term to zero, so the projection is also the target
+    component shift. Setting ``gamma`` above zero activates the full
+    cross-component projection ``dt * (E_target - gamma * E_source)``. The same
+    projection is used for the mean shift and for projecting the 4x4 advection
+    covariance into the 2D spatial dispersion matrix.
+    """
 
     def __init__(
         self,
@@ -61,6 +74,24 @@ class VectorLagrangianKernel(nn.Module):
             return torch.sigmoid(self.raw_gamma).to(device=device, dtype=dtype)
         return self.fixed_gamma.to(device=device, dtype=dtype)
 
+    def component_projection(
+        self,
+        target_idx: int,
+        source_idx: int,
+        selectors: tuple[Tensor, Tensor],
+        gamma: Tensor,
+    ) -> Tensor:
+        """Project stacked component advection to a 2D kernel displacement.
+
+        Diagonal blocks use the stationary same-component time-lag projection
+        ``dt * E_target``. Off-diagonal blocks use the target-component
+        projection when ``gamma=0`` and the full cross-component projection
+        ``dt * (E_target - gamma * E_source)`` when ``gamma`` is positive.
+        """
+        if target_idx == source_idx:
+            return self.dt * selectors[target_idx]
+        return self.dt * (selectors[target_idx] - gamma * selectors[source_idx])
+
     @staticmethod
     def selectors(device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
         E_u = torch.tensor(
@@ -97,9 +128,9 @@ class VectorLagrangianKernel(nn.Module):
         for i in range(2):
             col_blocks = []
             for j in range(2):
-                B = self.dt * (Es[i] - gamma * Es[j])
-                shift = B @ mu
-                D = ell[i, j].pow(2) * eye2 + 2.0 * B @ Sigma @ B.T
+                projection = self.component_projection(i, j, Es, gamma)
+                shift = projection @ mu
+                D = ell[i, j].pow(2) * eye2 + 2.0 * projection @ Sigma @ projection.T
                 D = D + self.jitter * eye2
                 L = safe_cholesky(D)
 
@@ -152,10 +183,10 @@ class VectorLagrangianKernel(nn.Module):
         for i in range(2):
             col_blocks = []
             for j in range(2):
-                B = self.dt * (Es[i] - gamma * Es[j])
-                shift = mu_seq @ B.T
-                B_sigma = torch.matmul(B.unsqueeze(0), Sigma_seq)
-                D = ell[i, j].pow(2) * eye2 + 2.0 * torch.matmul(B_sigma, B.T)
+                projection = self.component_projection(i, j, Es, gamma)
+                shift = mu_seq @ projection.T
+                projected_sigma = torch.matmul(projection.unsqueeze(0), Sigma_seq)
+                D = ell[i, j].pow(2) * eye2 + 2.0 * torch.matmul(projected_sigma, projection.T)
                 D = D + self.jitter * eye2
                 L = safe_cholesky(D)
 

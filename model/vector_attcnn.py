@@ -97,7 +97,12 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 class VectorAdvectionNet(nn.Module):
-    """Map NWP maps to ``mu``, full 4x4 covariance, and 2x2 mixing weights.
+    """Map NWP maps to component-wise spatial advection moments.
+
+    In ``advection_mode='component'``, the network predicts ``mu`` in the order
+    ``[u_x, u_y, v_x, v_y]`` with a full 4x4 covariance. The two pairs are 2D
+    spatial displacements for the U and V component fields, not four scalar
+    component-pair displacements.
 
     ``network_type='cnn'`` treats each time independently. ``'cnn_transformer'``
     first encodes each NWP map with a CNN and then models temporal context with
