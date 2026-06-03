@@ -56,7 +56,7 @@ class VectorMIDETrainingModule(torch.nn.Module):
             loss_adv = self.model.advection_supervision_loss(v_star, outputs)
             loss_deform = self.model.deformation_supervision_loss(B_star, outputs)
             smooth_mu = outputs.get("flow_mu", outputs["mu"])
-            smooth_matrix = outputs.get("B", outputs["A"])
+            smooth_matrix = outputs.get("B", outputs["alpha"])
             loss_smooth = smoothness_loss(smooth_mu, smooth_matrix)
             loss = (
                 loss_adv

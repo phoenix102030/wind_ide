@@ -167,18 +167,18 @@ Let \(\mathbf X_t\) denote the exogenous NWP wind-field input available at time
 \(t\). VectorWIDE uses a neural mapping to convert recent NWP fields into the
 low-dimensional stochastic advection moments that parameterize the IDE kernel:
 \begin{equation}
-(\boldsymbol\mu_t,\boldsymbol\Sigma_t,\mathbf A_t)
+(\boldsymbol\mu_t,\boldsymbol\Sigma_t,\boldsymbol\alpha_t)
 =
 \psi(\mathbf X_{1:t};\boldsymbol\Phi),
 \label{eq:component_deep_mapping}
 \end{equation}
-where \(\mathbf A_t=\{\alpha_t^{(pq)}\}_{p,q\in\{u,v\}}\) contains the
+where \(\boldsymbol\alpha_t=\{\alpha_t^{(pq)}\}_{p,q\in\{u,v\}}\) contains the
 component-mixing weights. In the implementation, a CNN first encodes the
 spatial structure of each NWP field and a causal transformer then models the
 temporal evolution of the encoded features. The output heads produce the
 component-wise mean advection \(\boldsymbol\mu_t\), a positive-definite
 covariance matrix \(\boldsymbol\Sigma_t\), and the component-mixing weights
-\(\mathbf A_t\).
+\(\boldsymbol\alpha_t\).
 
 The neural network therefore does not directly replace the state-space wind
 forecast. Instead, it supplies physically interpretable, time-varying

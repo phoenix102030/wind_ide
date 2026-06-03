@@ -83,8 +83,8 @@ def cholesky_logdet_quad(cov: Tensor, residual: Tensor, jitter: float = 1.0e-5) 
     cov = add_jitter(cov, jitter)
     L = safe_cholesky(cov)
     rhs = residual.unsqueeze(-1)
-    alpha = solve_linear_system(cov, rhs).squeeze(-1)
-    quad = (residual * alpha).sum(dim=-1)
+    solved = solve_linear_system(cov, rhs).squeeze(-1)
+    quad = (residual * solved).sum(dim=-1)
     logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
     return logdet, quad
 

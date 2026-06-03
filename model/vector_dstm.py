@@ -118,8 +118,8 @@ class VectorDSTM(nn.Module):
                 d_t = F_t.shape[0]
                 F_t = F_t + self.jitter * torch.eye(d_t, device=device, dtype=dtype)
                 L_t = safe_cholesky(F_t)
-                alpha = solve_linear_system(F_t, innovation.unsqueeze(-1)).squeeze(-1)
-                quad = innovation @ alpha
+                solved_innovation = solve_linear_system(F_t, innovation.unsqueeze(-1)).squeeze(-1)
+                quad = innovation @ solved_innovation
                 logdet = 2.0 * torch.log(torch.diagonal(L_t)).sum()
                 total_nll = total_nll + 0.5 * (
                     logdet + quad + d_t * math.log(2.0 * math.pi)
@@ -382,7 +382,7 @@ class VectorMIDE(nn.Module):
                 outputs["B"],
             )
         else:
-            base_M = self.kernel(coords, outputs["mu"], outputs["Sigma"], outputs["A"])
+            base_M = self.kernel(coords, outputs["mu"], outputs["Sigma"], outputs["alpha"])
         M = self.shape_transition_matrix(base_M, outputs)
         outputs["M_base"] = base_M
         outputs["M"] = M
@@ -550,7 +550,7 @@ class VectorMIDE(nn.Module):
         loss_adv = self.advection_supervision_loss(v_star, outputs)
         loss_deform = self.deformation_supervision_loss(B_star, outputs)
         smooth_mu = outputs.get("flow_mu", outputs["mu"])
-        smooth_matrix = outputs.get("B", outputs["A"])
+        smooth_matrix = outputs.get("B", outputs["alpha"])
         loss_smooth = smoothness_loss(smooth_mu, smooth_matrix) + self.transition_modifier_smoothness(outputs)
         reg_params = list(self.kernel.parameters()) + list(self.qr_params.parameters())
         loss_reg = l2_regularization(reg_params)

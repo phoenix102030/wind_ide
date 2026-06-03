@@ -54,7 +54,7 @@ def cross_transition_component(
     """Cross IDE matrix from station residual state to arbitrary target coords."""
     mu_seq = outputs["mu"]
     sigma_seq = outputs["Sigma"]
-    A_seq = outputs["A"]
+    alpha_seq = outputs["alpha"]
     device = mu_seq.device
     dtype = mu_seq.dtype
     source_coords = source_coords.to(device=device, dtype=dtype)
@@ -73,21 +73,21 @@ def cross_transition_component(
     for i in range(2):
         col_blocks = []
         for j in range(2):
-            B = model.kernel.dt * (selectors[i] - gamma * selectors[j])
-            shift = mu_seq @ B.T
-            B_sigma = torch.matmul(B.unsqueeze(0), sigma_seq)
-            D = ell[i, j].pow(2) * eye2 + 2.0 * torch.matmul(B_sigma, B.T)
+            projection = model.kernel.component_projection(i, j, selectors, gamma)
+            shift = mu_seq @ projection.T
+            projected_sigma = torch.matmul(projection.unsqueeze(0), sigma_seq)
+            D = ell[i, j].pow(2) * eye2 + 2.0 * torch.matmul(projected_sigma, projection.T)
             D = D + model.kernel.jitter * eye2
             L = safe_cholesky(D)
 
             offset_prime = offsets.unsqueeze(0) - shift[:, None, None, :]
             flat = offset_prime.reshape(n_time, n_pairs, 2)
-            alpha = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
-            maha = (flat * alpha).sum(dim=-1).reshape(n_time, n_target, n_source)
+            solved = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
+            maha = (flat * solved).sum(dim=-1).reshape(n_time, n_target, n_source)
             logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
             K = torch.exp(-maha - 0.5 * logdet[:, None, None])
             K = K / K.sum(dim=2, keepdim=True).clamp_min(1.0e-8)
-            col_blocks.append(A_seq[:, i, j, None, None] * K)
+            col_blocks.append(alpha_seq[:, i, j, None, None] * K)
         row_blocks.append(torch.cat(col_blocks, dim=2))
     return torch.cat(row_blocks, dim=1)
 
@@ -119,8 +119,8 @@ def cross_transition_shared_flow(
     L = safe_cholesky(D)
     offset_prime = offsets.unsqueeze(0) - shift[:, None, None, :]
     flat = offset_prime.reshape(n_time, n_pairs, 2)
-    alpha = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
-    maha = (flat * alpha).sum(dim=-1).reshape(n_time, n_target, n_source)
+    solved = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
+    maha = (flat * solved).sum(dim=-1).reshape(n_time, n_target, n_source)
     logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
     K = torch.exp(-maha - 0.5 * logdet[:, None, None])
     K = K / K.sum(dim=2, keepdim=True).clamp_min(1.0e-8)
@@ -164,8 +164,8 @@ def cross_transition_pairwise_flow(
             L = safe_cholesky(D)
             offset_prime = offsets.unsqueeze(0) - shift[:, None, None, :]
             flat = offset_prime.reshape(n_time, n_pairs, 2)
-            alpha = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
-            maha = (flat * alpha).sum(dim=-1).reshape(n_time, n_target, n_source)
+            solved = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
+            maha = (flat * solved).sum(dim=-1).reshape(n_time, n_target, n_source)
             logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
             K = torch.exp(-maha - 0.5 * logdet[:, None, None])
             col_blocks.append(K)

@@ -8,7 +8,7 @@ for 140m wind components. The latent state is ordered as:
 ```
 
 The neural network maps NWP grids to a four-dimensional component-advection
-distribution and a 2x2 component mixing matrix. In the default component mode,
+distribution and a 2x2 component mixing matrix `alpha`. In the default component mode,
 the four advection entries are ordered as `[u_x, u_y, v_x, v_y]`: two
 two-dimensional spatial displacements for the U and V component fields. A
 Lagrangian kernel turns those outputs into a base transition matrix. In
@@ -18,7 +18,7 @@ term before the Cholesky-based Kalman filter likelihood.
 
 ## Main Files
 
-- `model/vector_attcnn.py`: CNN/attention head for `(mu, Sigma, A)` plus optional transition modifiers.
+- `model/vector_attcnn.py`: CNN/attention head for `(mu, Sigma, alpha)` plus optional transition modifiers.
 - `model/vector_kernel.py`: 4D random-advection Lagrangian transition kernel.
 - `model/vector_dstm.py`: Kalman filtering, losses, and the combined model.
 - `model/covariance.py`: Cholesky covariance utilities and losses.
@@ -88,7 +88,7 @@ Key files:
 - `forecasts.npz`: measurement target, residual target, NWP baseline, model prediction, and baselines.
 - `multi_step_metrics.npz`: RMSE/MAE curves for model vs persistence/NWP baselines by horizon.
 - `transition_matrices.npz`: all evaluated transition matrices `M[t,6,6]`.
-- `advection_parameters.npz`: `mu`, `Sigma`, `A`, optional shared-flow `flow_mu`/`flow_Sigma`, deformation `B`, transition modifiers, `ell`, `Q`, `R`, station coordinates.
+- `advection_parameters.npz`: `mu`, `Sigma`, component mixing `alpha`, optional shared-flow `flow_mu`/`flow_Sigma`, deformation `B`, transition modifiers, `ell`, `Q`, `R`, station coordinates.
 - `time_parameters.csv`: flattened time-series parameters for quick inspection.
 - `plots/transition_matrix.gif`: animated transition matrix over sampled times.
 - `plots/*.png`: parameter time-series and heatmaps.
@@ -290,7 +290,7 @@ The default encoder is now:
 NWP maps [T,C,H,W]
   -> CNN spatial encoder
   -> temporal Transformer encoder
-  -> separate mu / Cholesky / A heads
+  -> separate mu / Cholesky / alpha heads
 ```
 
 Use `network_type: cnn_transformer` for the temporal model or `network_type:
@@ -327,12 +327,15 @@ blocks also use the target component's projected advection, corresponding to
 the relative-time convention `t1=dt, t2=0`. The same projection is used for both
 the kernel mean shift and the projected covariance inside the dispersion
 matrix. Cross-component interaction strength is represented by the learned 2x2
-mixing weights `A`; the advection itself remains a spatial displacement in the
+mixing weights `alpha`; the advection itself remains a spatial displacement in the
 same two-dimensional coordinate system as `s_i - s_j`. The optional
 source-side term `dt * gamma * E_source` can be enabled for full
-cross-component projection experiments. The default advection label mode
-remains `simple`, which uses the local NWP 140m wind displacement as a
-pseudo-target for both component fields.
+cross-component projection experiments. The default advection label mode is
+`optical_flow`, which estimates separate component-field motion targets for the
+NWP 140m U and V fields. The older `simple` label mode uses the same local NWP
+wind displacement as the pseudo-target for both component fields and can
+collapse `A_u` and `A_v` toward the same learned mean and covariance; keep it
+only as a shared-flow baseline.
 The older `shared_flow_deformation` and `shared_flow_component_kernel` modes
 are retained for ablation experiments.
 

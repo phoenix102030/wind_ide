@@ -30,8 +30,8 @@ def test_advection_net_shapes_and_constraints():
     assert out["mu"].shape == (T, 4)
     assert out["L"].shape == (T, 4, 4)
     assert out["Sigma"].shape == (T, 4, 4)
-    assert out["A"].shape == (T, 2, 2)
-    assert torch.allclose(out["A"].sum(dim=-1), torch.ones(T, 2), atol=1.0e-5)
+    assert out["alpha"].shape == (T, 2, 2)
+    assert torch.allclose(out["alpha"].sum(dim=-1), torch.ones(T, 2), atol=1.0e-5)
     assert torch.all(torch.linalg.eigvalsh(out["Sigma"]) > 0)
 
 
@@ -41,7 +41,7 @@ def test_advection_net_cnn_mode_still_works():
     out = net(x)
 
     assert out["mu"].shape == (3, 4)
-    assert out["A"].shape == (3, 2, 2)
+    assert out["alpha"].shape == (3, 2, 2)
 
 
 def test_component_specific_mu_uses_shared_full_input_with_separate_heads():
@@ -122,10 +122,10 @@ def test_vector_kernel_transition_shape_and_row_sums():
     mu = torch.randn(T, 4) * 0.1
     raw = torch.randn(T, 4, 4)
     sigma = raw @ raw.transpose(-1, -2) + 0.05 * torch.eye(4)
-    A = torch.softmax(torch.randn(T, 2, 2), dim=-1)
+    alpha_weights = torch.softmax(torch.randn(T, 2, 2), dim=-1)
 
     kernel = VectorLagrangianKernel(n_dim=3, dt=1.0, gamma=0.0)
-    M = kernel(coords, mu, sigma, A)
+    M = kernel(coords, mu, sigma, alpha_weights)
 
     assert M.shape == (T, 6, 6)
     assert torch.allclose(M.sum(dim=-1), torch.ones(T, 6), atol=1.0e-4)
@@ -136,10 +136,10 @@ def test_component_advection_uses_two_dimensional_target_field_shifts():
     coords = torch.tensor([[0.0, 0.0], [3.0, 0.5], [1.5, 2.0]])
     mu = torch.tensor([0.5, 0.1, -0.4, 0.2])
     sigma = 0.01 * torch.eye(4)
-    A = torch.ones(2, 2)
+    alpha_weights = torch.ones(2, 2)
 
     kernel = VectorLagrangianKernel(n_dim=3, dt=1.0, gamma=0.0, row_normalize=False)
-    M = kernel(coords, mu, sigma, A)
+    M = kernel(coords, mu, sigma, alpha_weights)
 
     uu = M[:3, :3]
     uv = M[:3, 3:]
@@ -189,12 +189,12 @@ def test_vector_kernel_vectorized_matches_single_step():
     mu = torch.randn(T, 4) * 0.1
     raw = torch.randn(T, 4, 4)
     sigma = raw @ raw.transpose(-1, -2) + 0.05 * torch.eye(4)
-    A = torch.softmax(torch.randn(T, 2, 2), dim=-1)
+    alpha_weights = torch.softmax(torch.randn(T, 2, 2), dim=-1)
 
     kernel = VectorLagrangianKernel(n_dim=3, dt=1.0, gamma=0.0)
-    vectorized = kernel(coords, mu, sigma, A)
+    vectorized = kernel(coords, mu, sigma, alpha_weights)
     stepwise = torch.stack(
-        [kernel.forward_single(coords, mu[t], sigma[t], A[t]) for t in range(T)],
+        [kernel.forward_single(coords, mu[t], sigma[t], alpha_weights[t]) for t in range(T)],
         dim=0,
     )
 

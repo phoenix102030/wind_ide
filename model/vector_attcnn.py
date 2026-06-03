@@ -220,7 +220,7 @@ class VectorAdvectionNet(nn.Module):
             self.mu_u_head = None
             self.mu_v_head = None
         self.chol_head = nn.Linear(feature_dim, 10) if use_component_heads else None
-        self.A_head = nn.Linear(feature_dim, 4) if use_component_heads else None
+        self.alpha_head = nn.Linear(feature_dim, 4) if use_component_heads else None
         if self.advection_mode in {"shared_flow_deformation", "shared_flow_component_kernel"}:
             self.flow_head = nn.Linear(feature_dim, 2)
             self.flow_chol_head = nn.Linear(
@@ -295,8 +295,8 @@ class VectorAdvectionNet(nn.Module):
             yield from self.mu_v_head.parameters()
         if self.chol_head is not None:
             yield from self.chol_head.parameters()
-        if self.A_head is not None:
-            yield from self.A_head.parameters()
+        if self.alpha_head is not None:
+            yield from self.alpha_head.parameters()
         if self.flow_head is not None:
             yield from self.flow_head.parameters()
         if self.flow_chol_head is not None:
@@ -327,8 +327,8 @@ class VectorAdvectionNet(nn.Module):
             yield from self.mu_v_head.parameters()
         if self.chol_head is not None:
             yield from self.chol_head.parameters()
-        if self.A_head is not None:
-            yield from self.A_head.parameters()
+        if self.alpha_head is not None:
+            yield from self.alpha_head.parameters()
         if self.flow_head is not None:
             yield from self.flow_head.parameters()
         if self.flow_chol_head is not None:
@@ -422,8 +422,8 @@ class VectorAdvectionNet(nn.Module):
             "mu": mu,
             "L": L,
             "Sigma": sigma,
-            "A": B,
-            "A_logits": B_logits,
+            "alpha": B,
+            "alpha_logits": B_logits,
             "B": B,
             "B_delta": B_delta,
             "flow_mu": flow_mu,
@@ -494,8 +494,8 @@ class VectorAdvectionNet(nn.Module):
             "mu": mu,
             "L": L,
             "Sigma": sigma,
-            "A": torch.ones_like(B),
-            "A_logits": B_logits,
+            "alpha": torch.ones_like(B),
+            "alpha_logits": B_logits,
             "B": B,
             "B_delta": B_delta,
             "flow_mu": flow_mu,
@@ -563,11 +563,11 @@ class VectorAdvectionNet(nn.Module):
             return result
 
         raw_mu = self.predict_raw_mu(features)
-        if self.chol_head is None or self.A_head is None:
+        if self.chol_head is None or self.alpha_head is None:
             raise RuntimeError("Component advection heads are not initialized")
         raw_chol = self.chol_head(features)
-        raw_A = self.A_head(features)
-        raw = torch.cat([raw_mu, raw_chol, raw_A], dim=-1)
+        raw_alpha = self.alpha_head(features)
+        raw = torch.cat([raw_mu, raw_chol, raw_alpha], dim=-1)
 
         mu = torch.tanh(raw_mu) * self.mu_scale
         L, sigma = covariance_from_cholesky_raw(
@@ -575,18 +575,18 @@ class VectorAdvectionNet(nn.Module):
             dim=4,
             jitter=self.chol_jitter,
         )
-        A_logits = raw_A.reshape(-1, 2, 2)
-        A = torch.softmax(A_logits, dim=-1)
+        alpha_logits = raw_alpha.reshape(-1, 2, 2)
+        alpha = torch.softmax(alpha_logits, dim=-1)
         if self.component_mixing_floor > 0.0:
-            A = self.component_mixing_floor + (1.0 - 2.0 * self.component_mixing_floor) * A
+            alpha = self.component_mixing_floor + (1.0 - 2.0 * self.component_mixing_floor) * alpha
 
         result = {
             "raw": raw,
             "mu": mu,
             "L": L,
             "Sigma": sigma,
-            "A": A,
-            "A_logits": A_logits,
+            "alpha": alpha,
+            "alpha_logits": alpha_logits,
         }
         if self.kernel_weight_head is not None:
             raw_kernel_weight = self.kernel_weight_head(features)

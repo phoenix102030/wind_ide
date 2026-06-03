@@ -106,7 +106,7 @@ class VectorLagrangianKernel(nn.Module):
         )
         return E_u, E_v
 
-    def forward_single(self, S: Tensor, mu: Tensor, Sigma: Tensor, A: Tensor) -> Tensor:
+    def forward_single(self, S: Tensor, mu: Tensor, Sigma: Tensor, alpha_weights: Tensor) -> Tensor:
         """Return one transition matrix with shape ``[2*n_dim, 2*n_dim]``."""
         if S.shape != (self.n_dim, 2):
             raise ValueError(f"Expected S shape {(self.n_dim, 2)}, got {tuple(S.shape)}")
@@ -114,8 +114,8 @@ class VectorLagrangianKernel(nn.Module):
             raise ValueError("mu must have trailing size 4")
         if Sigma.shape[-2:] != (4, 4):
             raise ValueError("Sigma must have trailing shape [4, 4]")
-        if A.shape[-2:] != (2, 2):
-            raise ValueError("A must have trailing shape [2, 2]")
+        if alpha_weights.shape[-2:] != (2, 2):
+            raise ValueError("alpha_weights must have trailing shape [2, 2]")
 
         S = S.to(device=mu.device, dtype=mu.dtype)
         Es = self.selectors(mu.device, mu.dtype)
@@ -136,11 +136,11 @@ class VectorLagrangianKernel(nn.Module):
 
                 H_prime = H - shift.view(1, 1, 2)
                 flat = H_prime.reshape(-1, 2)
-                alpha = solve_linear_system(D, flat.T).T
-                maha = (flat * alpha).sum(dim=-1).reshape(self.n_dim, self.n_dim)
+                solved = solve_linear_system(D, flat.T).T
+                maha = (flat * solved).sum(dim=-1).reshape(self.n_dim, self.n_dim)
                 logdet = 2.0 * torch.log(torch.diagonal(L)).sum()
                 K = torch.exp(-maha - 0.5 * logdet)
-                col_blocks.append(A[i, j] * K)
+                col_blocks.append(alpha_weights[i, j] * K)
             row_blocks.append(torch.cat(col_blocks, dim=1))
 
         M = torch.cat(row_blocks, dim=0)
@@ -153,12 +153,12 @@ class VectorLagrangianKernel(nn.Module):
             M = M / scale
         return M
 
-    def forward(self, S: Tensor, mu_seq: Tensor, Sigma_seq: Tensor, A_seq: Tensor) -> Tensor:
+    def forward(self, S: Tensor, mu_seq: Tensor, Sigma_seq: Tensor, alpha_seq: Tensor) -> Tensor:
         single = mu_seq.ndim == 1
         if single:
             mu_seq = mu_seq.unsqueeze(0)
             Sigma_seq = Sigma_seq.unsqueeze(0)
-            A_seq = A_seq.unsqueeze(0)
+            alpha_seq = alpha_seq.unsqueeze(0)
 
         if S.shape != (self.n_dim, 2):
             raise ValueError(f"Expected S shape {(self.n_dim, 2)}, got {tuple(S.shape)}")
@@ -166,10 +166,10 @@ class VectorLagrangianKernel(nn.Module):
             raise ValueError("mu_seq must have shape [T,4]")
         if Sigma_seq.ndim != 3 or Sigma_seq.shape[-2:] != (4, 4):
             raise ValueError("Sigma_seq must have shape [T,4,4]")
-        if A_seq.ndim != 3 or A_seq.shape[-2:] != (2, 2):
-            raise ValueError("A_seq must have shape [T,2,2]")
-        if not (mu_seq.shape[0] == Sigma_seq.shape[0] == A_seq.shape[0]):
-            raise ValueError("mu_seq, Sigma_seq, and A_seq must have matching time dimension")
+        if alpha_seq.ndim != 3 or alpha_seq.shape[-2:] != (2, 2):
+            raise ValueError("alpha_seq must have shape [T,2,2]")
+        if not (mu_seq.shape[0] == Sigma_seq.shape[0] == alpha_seq.shape[0]):
+            raise ValueError("mu_seq, Sigma_seq, and alpha_seq must have matching time dimension")
 
         S = S.to(device=mu_seq.device, dtype=mu_seq.dtype)
         Es = self.selectors(mu_seq.device, mu_seq.dtype)
@@ -192,11 +192,11 @@ class VectorLagrangianKernel(nn.Module):
 
                 H_prime = H.unsqueeze(0) - shift[:, None, None, :]
                 flat = H_prime.reshape(mu_seq.shape[0], n_pairs, 2)
-                alpha = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
-                maha = (flat * alpha).sum(dim=-1).reshape(mu_seq.shape[0], self.n_dim, self.n_dim)
+                solved = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
+                maha = (flat * solved).sum(dim=-1).reshape(mu_seq.shape[0], self.n_dim, self.n_dim)
                 logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
                 K = torch.exp(-maha - 0.5 * logdet[:, None, None])
-                col_blocks.append(A_seq[:, i, j, None, None] * K)
+                col_blocks.append(alpha_seq[:, i, j, None, None] * K)
             row_blocks.append(torch.cat(col_blocks, dim=2))
 
         out = torch.cat(row_blocks, dim=1)
@@ -252,8 +252,8 @@ class VectorLagrangianKernel(nn.Module):
 
         H_prime = H.unsqueeze(0) - shift[:, None, None, :]
         flat = H_prime.reshape(flow_mu_seq.shape[0], n_pairs, 2)
-        alpha = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
-        maha = (flat * alpha).sum(dim=-1).reshape(flow_mu_seq.shape[0], self.n_dim, self.n_dim)
+        solved = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
+        maha = (flat * solved).sum(dim=-1).reshape(flow_mu_seq.shape[0], self.n_dim, self.n_dim)
         logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
         K = torch.exp(-maha - 0.5 * logdet[:, None, None])
         if self.row_normalize:
@@ -319,8 +319,8 @@ class VectorLagrangianKernel(nn.Module):
 
                 H_prime = H.unsqueeze(0) - shift[:, None, None, :]
                 flat = H_prime.reshape(pair_flow_mu_seq.shape[0], n_pairs, 2)
-                alpha = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
-                maha = (flat * alpha).sum(dim=-1).reshape(pair_flow_mu_seq.shape[0], self.n_dim, self.n_dim)
+                solved = solve_linear_system(D, flat.transpose(-1, -2)).transpose(-1, -2)
+                maha = (flat * solved).sum(dim=-1).reshape(pair_flow_mu_seq.shape[0], self.n_dim, self.n_dim)
                 logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
                 K = torch.exp(-maha - 0.5 * logdet[:, None, None])
                 col_blocks.append(K)
