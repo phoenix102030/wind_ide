@@ -128,6 +128,8 @@ class VectorAdvectionNet(nn.Module):
         component_specific_mu: bool = False,
         advection_mode: str = "component",
         deformation_scale: float = 0.3,
+        anchored_advection: bool = False,
+        advection_residual_scale: float = 1.0,
         transition_kernel_weight: bool = False,
         transition_kernel_weight_init: float = 1.0,
         transition_kernel_weight_min: float = 0.0,
@@ -168,6 +170,8 @@ class VectorAdvectionNet(nn.Module):
         self.component_specific_mu = bool(component_specific_mu)
         self.advection_mode = advection_mode
         self.deformation_scale = float(deformation_scale)
+        self.anchored_advection = bool(anchored_advection)
+        self.advection_residual_scale = float(advection_residual_scale)
 
         self.backbone = ConvBackbone(in_channels=in_channels, hidden_dim=hidden_dim)
         self.attention = ChannelSpatialAttention(hidden_dim=hidden_dim)
@@ -505,7 +509,16 @@ class VectorAdvectionNet(nn.Module):
             "pair_flow_Sigma": pair_flow_sigma,
         }
 
-    def forward(self, x: Tensor) -> dict[str, Tensor]:
+    @staticmethod
+    def _expand_anchor(advection_anchor: Tensor, target: Tensor) -> Tensor:
+        anchor = advection_anchor.to(device=target.device, dtype=target.dtype)
+        if anchor.ndim == 1:
+            anchor = anchor.unsqueeze(0).expand(target.shape[0], -1)
+        if anchor.shape != target.shape:
+            raise ValueError(f"Expected advection_anchor shape {tuple(target.shape)}, got {tuple(anchor.shape)}")
+        return anchor
+
+    def forward(self, x: Tensor, advection_anchor: Tensor | None = None) -> dict[str, Tensor]:
         if x.ndim == 3:
             x = x.unsqueeze(0)
         if x.ndim != 4:
@@ -569,7 +582,17 @@ class VectorAdvectionNet(nn.Module):
         raw_alpha = self.alpha_head(features)
         raw = torch.cat([raw_mu, raw_chol, raw_alpha], dim=-1)
 
-        mu = torch.tanh(raw_mu) * self.mu_scale
+        if self.anchored_advection:
+            delta_mu = torch.tanh(raw_mu) * self.advection_residual_scale
+            if advection_anchor is None:
+                anchor = torch.zeros_like(delta_mu)
+            else:
+                anchor = self._expand_anchor(advection_anchor, delta_mu)
+            mu = anchor + delta_mu
+        else:
+            delta_mu = None
+            anchor = None
+            mu = torch.tanh(raw_mu) * self.mu_scale
         L, sigma = covariance_from_cholesky_raw(
             raw_chol,
             dim=4,
@@ -588,6 +611,9 @@ class VectorAdvectionNet(nn.Module):
             "alpha": alpha,
             "alpha_logits": alpha_logits,
         }
+        if delta_mu is not None and anchor is not None:
+            result["delta_mu"] = delta_mu
+            result["advection_anchor"] = anchor
         if self.kernel_weight_head is not None:
             raw_kernel_weight = self.kernel_weight_head(features)
             result["raw_kernel_weight"] = raw_kernel_weight

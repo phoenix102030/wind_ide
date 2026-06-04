@@ -1,5 +1,6 @@
 from .vector_data_utils import (
     build_deformation_labels_from_uv,
+    build_pattern_tracking_advection_labels_from_uv,
     build_shared_optical_flow_advection_labels_from_uv,
     build_simple_advection_labels,
     build_x_from_nwp_grid,
@@ -17,6 +18,7 @@ __all__ = [
     "build_grid_residual_features",
     "build_simple_advection_labels",
     "build_shared_optical_flow_advection_labels_from_uv",
+    "build_pattern_tracking_advection_labels_from_uv",
     "build_deformation_labels_from_uv",
     "build_x_from_nwp_grid",
     "build_z_from_measurements",

@@ -37,36 +37,44 @@ class VectorMIDETrainingModule(torch.nn.Module):
         nwp_baseline: torch.Tensor | None,
         coords: torch.Tensor,
         v_star: torch.Tensor | None,
+        advection_anchor: torch.Tensor | None,
         B_star: torch.Tensor | None,
         stage: str,
         loss_kwargs: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
         if stage == "adv":
             if v_star is None:
-                outputs = self.model(x, coords)
+                outputs = self.model(x, coords, advection_anchor=advection_anchor)
                 zero = outputs["M"].new_tensor(0.0)
                 return {
                     "loss": zero,
                     "loss_adv": zero,
                     "loss_deform": zero,
+                    "loss_advection_residual": zero,
                     "loss_smooth": zero,
                     **outputs,
                 }
-            outputs = self.model(x, coords)
+            outputs = self.model(x, coords, advection_anchor=advection_anchor)
             loss_adv = self.model.advection_supervision_loss(v_star, outputs)
             loss_deform = self.model.deformation_supervision_loss(B_star, outputs)
+            delta_mu = outputs.get("delta_mu")
+            loss_advection_residual = (
+                delta_mu.pow(2).mean() if delta_mu is not None else loss_adv.new_tensor(0.0)
+            )
             smooth_mu = outputs.get("flow_mu", outputs["mu"])
             smooth_matrix = outputs.get("B", outputs["alpha"])
             loss_smooth = smoothness_loss(smooth_mu, smooth_matrix)
             loss = (
                 loss_adv
                 + float(loss_kwargs.get("lambda_deform", 0.0)) * loss_deform
+                + float(loss_kwargs.get("lambda_advection_residual", 0.0)) * loss_advection_residual
                 + float(loss_kwargs.get("lambda_smooth", 0.001)) * loss_smooth
             )
             return {
                 "loss": loss,
                 "loss_adv": loss_adv,
                 "loss_deform": loss_deform,
+                "loss_advection_residual": loss_advection_residual,
                 "loss_smooth": loss_smooth,
                 **outputs,
             }
@@ -75,6 +83,7 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 x=x,
                 z=z,
                 coords=coords,
+                advection_anchor=advection_anchor,
                 v_star=None,
                 lambda_adv=0.0,
                 lambda_smooth=0.0,
@@ -92,6 +101,7 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 z=z,
                 coords=coords,
                 v_star=v_star,
+                advection_anchor=advection_anchor,
                 B_star=B_star,
                 nwp_baseline=nwp_baseline,
                 **loss_kwargs,
@@ -218,6 +228,8 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         component_specific_mu=bool(config.get("component_specific_mu", False)),
         advection_mode=str(config.get("advection_mode", "component")),
         deformation_scale=float(config.get("deformation_scale", 0.3)),
+        anchored_advection=bool(config.get("anchored_advection", False)),
+        advection_residual_scale=float(config.get("advection_residual_scale", 1.0)),
         dt=float(config.get("dt", 1.0)),
         gamma=gamma,
         row_normalize=bool(config.get("row_normalize", True)),
@@ -274,7 +286,14 @@ def sample_window(
     arrays: dict[str, np.ndarray | None],
     window_size: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     T = arrays["X"].shape[0]
     if T <= window_size:
         start = 0
@@ -288,9 +307,11 @@ def sample_window(
     nwp_baseline = torch.from_numpy(nwp_np[start:end]).to(device) if nwp_np is not None else None
     v_star_np = arrays.get("V_star")
     v_star = torch.from_numpy(v_star_np[start:end]).to(device) if v_star_np is not None else None
+    anchor_np = arrays.get("A_anchor")
+    advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
     B_star_np = arrays.get("B_star")
     B_star = torch.from_numpy(B_star_np[start:end]).to(device) if B_star_np is not None else None
-    return x, z, nwp_baseline, v_star, B_star
+    return x, z, nwp_baseline, v_star, advection_anchor, B_star
 
 
 def slice_arrays(
@@ -394,6 +415,12 @@ def training_loss_kwargs(config: dict[str, Any], stage: str) -> dict[str, Any]:
         "lambda_adv": float(config.get(f"{prefix}lambda_adv", config.get("lambda_adv", 0.1))),
         "lambda_deform": float(config.get(f"{prefix}lambda_deform", config.get("lambda_deform", 0.0))),
         "lambda_smooth": float(config.get(f"{prefix}lambda_smooth", config.get("lambda_smooth", 0.001))),
+        "lambda_advection_residual": float(
+            config.get(
+                f"{prefix}lambda_advection_residual",
+                config.get("lambda_advection_residual", 0.0),
+            )
+        ),
         "lambda_reg": float(config.get(f"{prefix}lambda_reg", config.get("lambda_reg", 0.0001))),
         "lambda_multistep": float(
             config.get(f"{prefix}lambda_multistep", lambda_multistep_for_stage(config, stage))
@@ -441,6 +468,8 @@ def validation_losses(
             nwp_baseline = torch.from_numpy(nwp_np[start:end]).to(device) if nwp_np is not None else None
             v_star_np = val_arrays.get("V_star")
             v_star = torch.from_numpy(v_star_np[start:end]).to(device) if v_star_np is not None else None
+            anchor_np = val_arrays.get("A_anchor")
+            advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
             B_star_np = val_arrays.get("B_star")
             B_star = torch.from_numpy(B_star_np[start:end]).to(device) if B_star_np is not None else None
             losses = base_model.training_losses(
@@ -448,6 +477,7 @@ def validation_losses(
                 z=z,
                 coords=coords,
                 v_star=v_star,
+                advection_anchor=advection_anchor,
                 B_star=B_star,
                 nwp_baseline=nwp_baseline,
                 **training_loss_kwargs(config, "joint"),
@@ -478,7 +508,7 @@ def run_epoch(
     sums: dict[str, float] = {}
 
     for _ in range(steps):
-        x, z, nwp_baseline, v_star, B_star = sample_window(arrays, window_size, device)
+        x, z, nwp_baseline, v_star, advection_anchor, B_star = sample_window(arrays, window_size, device)
         optimizer.zero_grad(set_to_none=True)
 
         if isinstance(model, (VectorMIDETrainingModule, DistributedDataParallel)):
@@ -488,6 +518,7 @@ def run_epoch(
                 nwp_baseline=nwp_baseline,
                 coords=coords,
                 v_star=v_star,
+                advection_anchor=advection_anchor,
                 B_star=B_star,
                 stage=stage,
                 loss_kwargs=training_loss_kwargs(config, stage),
@@ -498,6 +529,7 @@ def run_epoch(
                 z=z,
                 coords=coords,
                 v_star=v_star,
+                advection_anchor=advection_anchor,
                 B_star=B_star,
                 nwp_baseline=nwp_baseline,
                 stage=stage,
@@ -569,6 +601,7 @@ def main() -> None:
         "Z": data["Z"],
         "nwp_baseline": data.get("nwp_baseline"),
         "V_star": data["V_star"],
+        "A_anchor": data.get("A_anchor"),
         "B_star": data.get("B_star"),
     }
     train_arrays, val_arrays, val_starts = split_train_validation(arrays, config)
@@ -593,13 +626,18 @@ def main() -> None:
     optimizer = build_optimizer(train_model, config)
 
     if args.dry_run:
-        x, z, nwp_baseline, v_star, B_star = sample_window(arrays, min(16, arrays["X"].shape[0]), device)
+        x, z, nwp_baseline, v_star, advection_anchor, B_star = sample_window(
+            arrays,
+            min(16, arrays["X"].shape[0]),
+            device,
+        )
         with torch.enable_grad():
             losses = unwrap_model(train_model).training_losses(
                 x=x,
                 z=z,
                 coords=coords,
                 v_star=v_star,
+                advection_anchor=advection_anchor,
                 B_star=B_star,
                 nwp_baseline=nwp_baseline,
                 **training_loss_kwargs(config, "joint"),

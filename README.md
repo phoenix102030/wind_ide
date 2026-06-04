@@ -151,7 +151,7 @@ data:
   target_mode: residual_nwp
 ```
 
-For residual targets, the default transition is:
+For residual targets, optional transition modifiers can be enabled:
 
 ```text
 r_{t+1} = rho_t * ((1 - pi_t) I + pi_t M_base,t) r_t + c_t + noise
@@ -160,22 +160,26 @@ r_{t+1} = rho_t * ((1 - pi_t) I + pi_t M_base,t) r_t + c_t + noise
 `M_base,t` is still the original Lagrangian spatial kernel. `pi_t` lets the
 model keep short horizons close to persistence, `rho_t` lets long horizons
 return toward the NWP baseline, and `c_t` is a small NWP-dependent residual
-control initialized to zero. The defaults are conservative:
+control initialized to zero. These modifiers are available for ablation, but
+the current VectorMIDE configs keep them off while the anchored advection
+kernel is being evaluated:
 
 ```yaml
-transition_kernel_weight: true
+transition_kernel_weight: false
 transition_kernel_weight_init: 0.2
-transition_residual_decay: true
+transition_residual_decay: false
 transition_residual_decay_init: 0.97
-transition_control: true
+transition_control: false
 transition_control_scale: 0.5
 ```
 
 ## Online Adaptation
 
 Online adaptation starts from an offline checkpoint and updates only the
-adaptation-sensitive parameters by default: neural output heads, `Q/R`, and
-optionally `ell`.
+adaptation-sensitive parameters by default. In the current anchored-advection
+configs, `ell` is fixed offline and online (`learnable_ell: false`,
+`online_update_ell: false`) so the spatial kernel scale cannot collapse back
+toward a near-identity transition.
 
 ```bash
 python train/train_vector_online.py \
@@ -319,7 +323,7 @@ prefers a same-directory `*_imputed.mat` sibling by default when a raw
 measurement path is configured. If the resolved measurement file still contains
 missing values, training fails loudly unless `data.measurement_missing_policy:
 interpolate` is set.
-With `advection_mode: component`, the model predicts
+With `advection_mode: component`, the model uses
 `mu=[u_x,u_y,v_x,v_y]` and a full 4x4 advection covariance. The U rows of the
 transition matrix use the U-field 2D shift, and the V rows use the V-field 2D
 shift. With the default one-step `time_mode: target_only`, cross-component
@@ -327,15 +331,26 @@ blocks also use the target component's projected advection, corresponding to
 the relative-time convention `t1=dt, t2=0`. The same projection is used for both
 the kernel mean shift and the projected covariance inside the dispersion
 matrix. Cross-component interaction strength is represented by the learned 2x2
-mixing weights `alpha`; the advection itself remains a spatial displacement in the
-same two-dimensional coordinate system as `s_i - s_j`. The optional
-source-side term `dt * gamma * E_source` can be enabled for full
-cross-component projection experiments. The default advection label mode is
-`hybrid_nwp_optical_flow`: it mixes the local NWP 140m wind displacement
-carrier with component-specific optical-flow labels. This keeps the learned
-advection on a physical km-per-step scale while retaining separate U-field and
-V-field motion corrections. Pure `optical_flow` labels are available as an
-ablation, but they can be too small to visibly affect the station-level kernel.
+mixing weights `alpha`; the advection itself remains a spatial displacement in
+the same two-dimensional coordinate system as `s_i - s_j`.
+
+The current default is an NWP-anchored residual advection architecture:
+
+```yaml
+anchored_advection: true
+advection_residual_scale: 1.0
+data:
+  advection_anchor_mode: pattern_tracking
+  advection_label_mode: anchor
+```
+
+The loader constructs `A_anchor` by tracking the time-to-time displacement of
+the NWP U-field and V-field patterns. The neural network predicts a bounded
+component-specific correction `delta_mu`, and the kernel receives
+`mu = A_anchor + delta_mu`. This treats NWP as a physical advection anchor
+rather than as the latent advection itself. Pure `optical_flow` labels and
+hybrid NWP/optical-flow labels remain available as ablations, but optical-flow
+labels alone can be too small to visibly affect the station-level kernel.
 The older `simple` label mode uses the same local NWP wind displacement as the
 pseudo-target for both component fields and can collapse `A_u` and `A_v` toward
 the same learned mean and covariance; keep it only as a shared-flow baseline.

@@ -591,6 +591,118 @@ def build_shared_optical_flow_advection_labels_from_uv(
     return labels
 
 
+def _shifted_correlation_score(prev: np.ndarray, curr: np.ndarray, shift_y: int, shift_x: int) -> float:
+    """Correlation between ``curr`` and ``prev`` shifted forward by integer grid cells."""
+    height, width = prev.shape
+    if shift_y >= 0:
+        prev_y = slice(0, height - shift_y)
+        curr_y = slice(shift_y, height)
+    else:
+        prev_y = slice(-shift_y, height)
+        curr_y = slice(0, height + shift_y)
+    if shift_x >= 0:
+        prev_x = slice(0, width - shift_x)
+        curr_x = slice(shift_x, width)
+    else:
+        prev_x = slice(-shift_x, width)
+        curr_x = slice(0, width + shift_x)
+    prev_crop = prev[prev_y, prev_x]
+    curr_crop = curr[curr_y, curr_x]
+    if prev_crop.size < 4 or curr_crop.size < 4:
+        return -np.inf
+    a = prev_crop.reshape(-1)
+    b = curr_crop.reshape(-1)
+    valid = np.isfinite(a) & np.isfinite(b)
+    if valid.sum() < 4:
+        return -np.inf
+    a = a[valid] - np.nanmean(a[valid])
+    b = b[valid] - np.nanmean(b[valid])
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 1.0e-12:
+        return -np.inf
+    return float(np.dot(a, b) / denom)
+
+
+def _tracking_roi(
+    shape: tuple[int, int],
+    station_grid_indices: Optional[list[list[int]]],
+    patch_radius: int,
+    max_shift_cells: int,
+) -> tuple[slice, slice]:
+    height, width = shape
+    if not station_grid_indices:
+        return slice(0, height), slice(0, width)
+    rows = [int(i) for i, _ in station_grid_indices]
+    cols = [int(j) for _, j in station_grid_indices]
+    margin = int(patch_radius) + int(max_shift_cells)
+    r0 = max(min(rows) - margin, 0)
+    r1 = min(max(rows) + margin + 1, height)
+    c0 = max(min(cols) - margin, 0)
+    c1 = min(max(cols) + margin + 1, width)
+    return slice(r0, r1), slice(c0, c1)
+
+
+def _best_integer_pattern_shift(
+    prev: np.ndarray,
+    curr: np.ndarray,
+    max_shift_cells: int,
+) -> tuple[int, int]:
+    best_score = -np.inf
+    best_shift = (0, 0)
+    max_shift = int(max_shift_cells)
+    for shift_y in range(-max_shift, max_shift + 1):
+        for shift_x in range(-max_shift, max_shift + 1):
+            score = _shifted_correlation_score(prev, curr, shift_y, shift_x)
+            if score > best_score:
+                best_score = score
+                best_shift = (shift_y, shift_x)
+    return best_shift
+
+
+def build_pattern_tracking_advection_labels_from_uv(
+    u140: np.ndarray,
+    v140: np.ndarray,
+    lat_grid: np.ndarray,
+    lon_grid: np.ndarray,
+    station_grid_indices: Optional[list[list[int]]] = None,
+    patch_radius: int = 6,
+    max_shift_cells: int = 4,
+) -> np.ndarray:
+    """Estimate component-field pattern displacements from NWP U/V maps.
+
+    Returns ``[T,4]`` in km per time step with order
+    ``[A_u,x, A_u,y, A_v,x, A_v,y]``. The labels track how the NWP U-field
+    and V-field patterns move between adjacent time steps; they are therefore
+    closer to the IDE component-advection interpretation than raw NWP wind
+    vectors.
+    """
+    dx, dy = _latlon_grid_spacing_km(lat_grid, lon_grid)
+    u = u140.astype(np.float64)
+    v = v140.astype(np.float64)
+    T = u.shape[2]
+    labels = np.zeros((T, 4), dtype=np.float32)
+    roi_y, roi_x = _tracking_roi(u.shape[:2], station_grid_indices, patch_radius, max_shift_cells)
+
+    def track_component(field: np.ndarray, t: int) -> np.ndarray:
+        prev = field[roi_y, roi_x, t]
+        curr = field[roi_y, roi_x, t + 1]
+        shift_y, shift_x = _best_integer_pattern_shift(prev, curr, max_shift_cells)
+        return np.asarray([shift_x * dx, shift_y * dy], dtype=np.float32)
+
+    for t in range(T - 1):
+        au = track_component(u, t)
+        av = track_component(v, t)
+        labels[t] = [au[0], au[1], av[0], av[1]]
+    if T > 1:
+        labels[-1] = labels[-2]
+    return labels
+
+
+def blend_advection_labels(first: np.ndarray, second: np.ndarray, first_weight: float) -> np.ndarray:
+    weight = min(max(float(first_weight), 0.0), 1.0)
+    return (weight * first + (1.0 - weight) * second).astype(np.float32, copy=False)
+
+
 def build_deformation_labels_from_uv(
     u140: np.ndarray,
     v140: np.ndarray,
@@ -766,6 +878,37 @@ def load_vector_dataset(
         patch_radius=int(data_cfg.get("patch_radius", 2)),
     )[:T]
 
+    pattern_advection_star: Optional[np.ndarray] = None
+
+    def pattern_tracking_star() -> np.ndarray:
+        nonlocal pattern_advection_star
+        if pattern_advection_star is None:
+            pattern_advection_star = build_pattern_tracking_advection_labels_from_uv(
+                u140,
+                v140,
+                lat_grid,
+                lon_grid,
+                station_grid_indices=label_grid_indices,
+                patch_radius=int(data_cfg.get("pattern_tracking_patch_radius", data_cfg.get("patch_radius", 6))),
+                max_shift_cells=int(data_cfg.get("pattern_tracking_max_shift_cells", 4)),
+            )[:T]
+        return pattern_advection_star
+
+    anchor_mode_raw = data_cfg.get("advection_anchor_mode", "none")
+    anchor_mode = None if anchor_mode_raw is None else str(anchor_mode_raw).lower()
+    if anchor_mode in {"none", "off", "false", None}:
+        advection_anchor = None
+    elif anchor_mode in {"simple", "nwp", "nwp_mean", "mean_flow", "carrier"}:
+        advection_anchor = nwp_advection_star
+    elif anchor_mode in {"pattern", "pattern_tracking", "shift_tracking"}:
+        advection_anchor = pattern_tracking_star()
+    elif anchor_mode in {"hybrid_nwp_pattern", "hybrid_pattern_nwp", "nwp_pattern"}:
+        pattern_term = pattern_tracking_star()
+        nwp_weight = float(data_cfg.get("advection_anchor_nwp_weight", 0.5))
+        advection_anchor = blend_advection_labels(nwp_advection_star, pattern_term, nwp_weight)
+    else:
+        raise ValueError(f"Unknown advection_anchor_mode: {anchor_mode_raw}")
+
     def optical_flow_star(shared: bool = False) -> np.ndarray:
         if shared:
             return build_shared_optical_flow_advection_labels_from_uv(
@@ -788,8 +931,14 @@ def load_vector_dataset(
         )[:T]
 
     optical_advection_star = None
-    if label_mode in {"simple", "nwp", "nwp_wind", "carrier"}:
+    if label_mode in {"anchor", "anchored", "advection_anchor"}:
+        if advection_anchor is None:
+            raise ValueError("advection_label_mode='anchor' requires data.advection_anchor_mode to be enabled.")
+        v_star = advection_anchor
+    elif label_mode in {"simple", "nwp", "nwp_wind", "carrier"}:
         v_star = nwp_advection_star
+    elif label_mode in {"pattern", "pattern_tracking", "shift_tracking"}:
+        v_star = pattern_tracking_star()
     elif label_mode in {"shared_optical_flow", "joint_optical_flow"}:
         optical_advection_star = optical_flow_star(shared=True)
         v_star = optical_advection_star
@@ -799,10 +948,15 @@ def load_vector_dataset(
     elif label_mode in {"hybrid_nwp_optical_flow", "hybrid_optical_flow_nwp", "nwp_optical_flow"}:
         optical_advection_star = optical_flow_star(shared=False)
         nwp_weight = float(data_cfg.get("advection_nwp_weight", 0.75))
-        nwp_weight = min(max(nwp_weight, 0.0), 1.0)
         optical_scale = float(data_cfg.get("optical_flow_label_scale", 1.0))
         optical_term = optical_scale * optical_advection_star
-        v_star = nwp_weight * nwp_advection_star + (1.0 - nwp_weight) * optical_term
+        v_star = blend_advection_labels(nwp_advection_star, optical_term, nwp_weight)
+    elif label_mode in {"hybrid_pattern_optical_flow", "hybrid_optical_flow_pattern", "pattern_optical_flow"}:
+        optical_advection_star = optical_flow_star(shared=False)
+        pattern_weight = float(data_cfg.get("advection_pattern_weight", 0.75))
+        optical_scale = float(data_cfg.get("optical_flow_label_scale", 1.0))
+        optical_term = optical_scale * optical_advection_star
+        v_star = blend_advection_labels(pattern_tracking_star(), optical_term, pattern_weight)
     elif label_mode in {"none", None}:
         v_star = None
     else:
@@ -840,7 +994,9 @@ def load_vector_dataset(
         "Y": z.astype(np.float32, copy=False),
         "nwp_baseline": nwp_baseline.astype(np.float32, copy=False),
         "V_star": v_star,
+        "A_anchor": advection_anchor,
         "V_nwp_star": nwp_advection_star,
+        "V_pattern_star": pattern_advection_star,
         "V_optical_star": optical_advection_star,
         "B_star": B_star,
         "coords": coords,

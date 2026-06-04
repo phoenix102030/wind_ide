@@ -271,6 +271,8 @@ class VectorMIDE(nn.Module):
         component_specific_mu: bool = False,
         advection_mode: str = "component",
         deformation_scale: float = 0.3,
+        anchored_advection: bool = False,
+        advection_residual_scale: float = 1.0,
         dt: float = 1.0,
         gamma: float = 0.0,
         row_normalize: bool = True,
@@ -314,6 +316,8 @@ class VectorMIDE(nn.Module):
             component_specific_mu=component_specific_mu,
             advection_mode=advection_mode,
             deformation_scale=deformation_scale,
+            anchored_advection=anchored_advection,
+            advection_residual_scale=advection_residual_scale,
             transition_kernel_weight=transition_kernel_weight,
             transition_kernel_weight_init=transition_kernel_weight_init,
             transition_kernel_weight_min=transition_kernel_weight_min,
@@ -368,8 +372,8 @@ class VectorMIDE(nn.Module):
             return outputs["mu"].new_tensor(0.0)
         return torch.stack(terms).mean()
 
-    def forward(self, x: Tensor, coords: Tensor) -> dict[str, Tensor]:
-        outputs = self.net(x)
+    def forward(self, x: Tensor, coords: Tensor, advection_anchor: Optional[Tensor] = None) -> dict[str, Tensor]:
+        outputs = self.net(x, advection_anchor=advection_anchor)
         if "pair_flow_mu" in outputs and "pair_flow_Sigma" in outputs:
             base_M = self.kernel.forward_pairwise_flow(
                 coords,
@@ -390,8 +394,15 @@ class VectorMIDE(nn.Module):
         outputs["M"] = M
         return outputs
 
-    def kalman_nll(self, x: Tensor, z: Tensor, coords: Tensor, H: Optional[Tensor] = None) -> Tensor:
-        outputs = self.forward(x, coords)
+    def kalman_nll(
+        self,
+        x: Tensor,
+        z: Tensor,
+        coords: Tensor,
+        H: Optional[Tensor] = None,
+        advection_anchor: Optional[Tensor] = None,
+    ) -> Tensor:
+        outputs = self.forward(x, coords, advection_anchor=advection_anchor)
         return self.dstm.kalman_nll(
             z=z,
             M_seq=outputs["M"],
@@ -505,11 +516,13 @@ class VectorMIDE(nn.Module):
         z: Tensor,
         coords: Tensor,
         v_star: Optional[Tensor] = None,
+        advection_anchor: Optional[Tensor] = None,
         B_star: Optional[Tensor] = None,
         H: Optional[Tensor] = None,
         lambda_adv: float = 0.1,
         lambda_deform: float = 0.0,
         lambda_smooth: float = 0.001,
+        lambda_advection_residual: float = 0.0,
         lambda_reg: float = 0.0001,
         lambda_multistep: float = 0.0,
         multistep_horizons: Optional[Sequence[int]] = None,
@@ -518,7 +531,7 @@ class VectorMIDE(nn.Module):
         hybrid_first_horizon_direct: bool = False,
         hybrid_direct_horizon_steps: int = 1,
     ) -> dict[str, Tensor]:
-        outputs = self.forward(x, coords)
+        outputs = self.forward(x, coords, advection_anchor=advection_anchor)
         use_multistep = lambda_multistep > 0.0 and bool(multistep_horizons)
         if use_multistep:
             kf = self.dstm.kalman_filter(
@@ -551,6 +564,10 @@ class VectorMIDE(nn.Module):
             loss_multistep = loss_kf.new_tensor(0.0)
         loss_adv = self.advection_supervision_loss(v_star, outputs)
         loss_deform = self.deformation_supervision_loss(B_star, outputs)
+        delta_mu = outputs.get("delta_mu")
+        loss_advection_residual = (
+            delta_mu.pow(2).mean() if delta_mu is not None else loss_kf.new_tensor(0.0)
+        )
         smooth_mu = outputs.get("flow_mu", outputs["mu"])
         smooth_matrix = outputs.get("B", outputs["alpha"])
         loss_smooth = smoothness_loss(smooth_mu, smooth_matrix) + self.transition_modifier_smoothness(outputs)
@@ -561,6 +578,7 @@ class VectorMIDE(nn.Module):
             + lambda_adv * loss_adv
             + lambda_deform * loss_deform
             + lambda_smooth * loss_smooth
+            + lambda_advection_residual * loss_advection_residual
             + lambda_reg * loss_reg
             + lambda_multistep * loss_multistep
         )
@@ -571,6 +589,7 @@ class VectorMIDE(nn.Module):
             "loss_kf": loss_kf,
             "loss_adv": loss_adv,
             "loss_deform": loss_deform,
+            "loss_advection_residual": loss_advection_residual,
             "loss_smooth": loss_smooth,
             "loss_reg": loss_reg,
             "loss_multistep": loss_multistep,

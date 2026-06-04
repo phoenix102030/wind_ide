@@ -162,7 +162,9 @@ def collect_model_outputs(
             if end <= start:
                 continue
             x = torch.from_numpy(data["X"][start:end]).to(device)
-            outputs = model(x, coords)
+            anchor_np = data.get("A_anchor")
+            advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
+            outputs = model(x, coords, advection_anchor=advection_anchor)
             sums["M"][start:end] += outputs["M"].detach().cpu().numpy()
             sums["M_base"][start:end] += outputs.get("M_base", outputs["M"]).detach().cpu().numpy()
             sums["mu"][start:end] += outputs["mu"].detach().cpu().numpy()
@@ -355,6 +357,11 @@ def evaluate(
         nwp_advection_target_np = np.full_like(outputs["mu"], np.nan, dtype=np.float32)
     else:
         nwp_advection_target_np = np.asarray(nwp_advection_target_np, dtype=np.float32)
+    advection_anchor_np = data.get("A_anchor")
+    if advection_anchor_np is None:
+        advection_anchor_np = np.full_like(outputs["mu"], np.nan, dtype=np.float32)
+    else:
+        advection_anchor_np = np.asarray(advection_anchor_np, dtype=np.float32)
     one_step_pred_np = measurement_from_model_target(one_step_model, data)
     multi_pred_np = measurement_from_model_target(multi_model, data)
 
@@ -448,6 +455,7 @@ def evaluate(
         "nwp_wind_displacement": nwp_displacement_np,
         "nwp_advection_target": nwp_advection_target_np,
         "optical_flow_advection": optical_flow_np,
+        "advection_anchor": advection_anchor_np,
         "ell": ell,
         "gamma": gamma,
         "kernel_dt": kernel_dt,
@@ -529,6 +537,7 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
         Sigma_diag=artifacts["Sigma_diag"],
         alpha=artifacts["alpha"],
         advection_training_target=artifacts["advection_training_target"],
+        advection_anchor=artifacts["advection_anchor"],
         nwp_wind_displacement=artifacts["nwp_wind_displacement"],
         nwp_advection_target=artifacts["nwp_advection_target"],
         optical_flow_advection=artifacts["optical_flow_advection"],
@@ -751,6 +760,7 @@ def advection_vs_optical_flow_plot(
     Av: np.ndarray,
     optical_flow: np.ndarray,
     max_points: int,
+    label_name: str = "optical-flow",
 ) -> None:
     if optical_flow.shape[0] != Au.shape[0] or optical_flow.shape[1] < 4:
         return
@@ -767,30 +777,30 @@ def advection_vs_optical_flow_plot(
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 9))
     axes[0, 0].scatter(vector_norm(of_u), vector_norm(au), s=12, alpha=0.45, color="tab:blue")
-    axes[0, 0].set_xlabel("|optical-flow U target|")
+    axes[0, 0].set_xlabel(f"|{label_name} U target|")
     axes[0, 0].set_ylabel("|A_u|")
     axes[0, 0].set_title("U-field speed")
     axes[0, 0].grid(True, alpha=0.25)
 
     axes[0, 1].scatter(vector_norm(of_v), vector_norm(av), s=12, alpha=0.45, color="tab:orange")
-    axes[0, 1].set_xlabel("|optical-flow V target|")
+    axes[0, 1].set_xlabel(f"|{label_name} V target|")
     axes[0, 1].set_ylabel("|A_v|")
     axes[0, 1].set_title("V-field speed")
     axes[0, 1].grid(True, alpha=0.25)
 
     axes[1, 0].hist(angle_diff_degrees(au, of_u), bins=40, alpha=0.65, color="tab:blue")
-    axes[1, 0].set_xlabel("A_u - optical-flow U angle (degrees)")
+    axes[1, 0].set_xlabel(f"A_u - {label_name} U angle (degrees)")
     axes[1, 0].set_ylabel("count")
     axes[1, 0].set_title("U-field direction")
     axes[1, 0].grid(True, alpha=0.25)
 
     axes[1, 1].hist(angle_diff_degrees(av, of_v), bins=40, alpha=0.65, color="tab:orange")
-    axes[1, 1].set_xlabel("A_v - optical-flow V angle (degrees)")
+    axes[1, 1].set_xlabel(f"A_v - {label_name} V angle (degrees)")
     axes[1, 1].set_ylabel("count")
     axes[1, 1].set_title("V-field direction")
     axes[1, 1].grid(True, alpha=0.25)
 
-    fig.suptitle("Learned advection vs component optical-flow labels")
+    fig.suptitle(f"Learned advection vs component {label_name} labels")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -1080,6 +1090,15 @@ def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: i
         artifacts["Av"],
         artifacts["optical_flow_advection"],
         max_points,
+        label_name="optical-flow",
+    )
+    advection_vs_optical_flow_plot(
+        plots_dir / "advection_vs_anchor.png",
+        artifacts["Au"],
+        artifacts["Av"],
+        artifacts["advection_anchor"],
+        max_points,
+        label_name="anchor",
     )
     kernel_source_center_map(
         plots_dir / "kernel_source_center_map.png",

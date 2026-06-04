@@ -231,7 +231,9 @@ def run_station_filter_and_grid_extension(
             if end <= start:
                 continue
             x_chunk = torch.from_numpy(data["X"][start:end]).to(device)
-            outputs = model(x_chunk, coords)
+            anchor_np = data.get("A_anchor")
+            advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
+            outputs = model(x_chunk, coords, advection_anchor=advection_anchor)
             M_sum[start:end] += outputs["M"].detach().cpu().numpy()
             counts[start:end] += 1.0
             if "transition_control" in outputs:
@@ -269,7 +271,9 @@ def run_station_filter_and_grid_extension(
             if end <= start:
                 continue
             x_chunk = torch.from_numpy(data["X"][start:end]).to(device)
-            outputs = model(x_chunk, coords)
+            anchor_np = data.get("A_anchor")
+            advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
+            outputs = model(x_chunk, coords, advection_anchor=advection_anchor)
             cross = build_cross_transition(
                 model,
                 source_coords=coords,

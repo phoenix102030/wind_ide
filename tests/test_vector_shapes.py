@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 from dataset.vector_data_utils import (
+    build_pattern_tracking_advection_labels_from_uv,
     build_z_from_measurements,
     impute_time_series_columns,
     imputed_measurement_path,
@@ -60,6 +61,31 @@ def test_component_specific_mu_uses_shared_full_input_with_separate_heads():
     assert net.mu_v_head is not None
     assert net.mu_u_head is not net.mu_v_head
     assert net.mu_u_head.in_features == net.mu_v_head.in_features
+
+
+def test_anchored_component_advection_adds_residual_to_anchor():
+    T = 3
+    x = torch.randn(T, 6, 40, 40)
+    anchor = torch.tensor(
+        [
+            [1.0, 0.5, 1.0, 0.5],
+            [2.0, -0.5, 2.0, -0.5],
+            [0.0, 1.5, 0.0, 1.5],
+        ]
+    )
+    net = VectorAdvectionNet(
+        in_channels=6,
+        hidden_dim=32,
+        network_type="cnn",
+        anchored_advection=True,
+        advection_residual_scale=0.25,
+    )
+    out = net(x, advection_anchor=anchor)
+
+    assert out["mu"].shape == (T, 4)
+    assert out["delta_mu"].shape == (T, 4)
+    assert torch.allclose(out["mu"], anchor + out["delta_mu"], atol=1.0e-6)
+    assert torch.max(torch.abs(out["delta_mu"])) <= 0.25 + 1.0e-6
 
 
 def test_shared_flow_deformation_outputs_and_transition_are_finite():
@@ -384,3 +410,33 @@ def test_online_training_loss_kwargs_can_override_offline_objective():
     assert online["lambda_deform"] == 0.0
     assert online["lambda_multistep"] == 0.0
     assert online["multistep_horizons"] == [1]
+
+
+def test_pattern_tracking_advection_recovers_integer_component_shift():
+    T = 3
+    height = width = 12
+    lat = np.repeat(np.arange(height, dtype=np.float32)[:, None], width, axis=1)
+    lon = np.repeat(np.arange(width, dtype=np.float32)[None, :], height, axis=0)
+    base = np.zeros((height, width), dtype=np.float32)
+    base[4:7, 5:8] = 1.0
+    u = np.zeros((height, width, T), dtype=np.float32)
+    v = np.zeros((height, width, T), dtype=np.float32)
+    for t in range(T):
+        u[:, :, t] = np.roll(base, shift=(t, 1 * t), axis=(0, 1))
+        v[:, :, t] = np.roll(base, shift=(-t, 0), axis=(0, 1))
+
+    labels = build_pattern_tracking_advection_labels_from_uv(
+        u,
+        v,
+        lat,
+        lon,
+        station_grid_indices=None,
+        max_shift_cells=2,
+    )
+
+    np.testing.assert_allclose(labels[0, :2], labels[1, :2], atol=1.0e-6)
+    np.testing.assert_allclose(labels[0, 2:], labels[1, 2:], atol=1.0e-6)
+    assert labels[0, 0] > 0.0
+    assert labels[0, 1] > 0.0
+    assert labels[0, 2] == 0.0
+    assert labels[0, 3] < 0.0

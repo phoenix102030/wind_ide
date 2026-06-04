@@ -248,7 +248,9 @@ def compute_transition_sequences(
             if end <= start:
                 continue
             x_chunk = torch.from_numpy(data["X"][start:end]).to(device)
-            outputs = model(x_chunk, coords)
+            anchor_np = data.get("A_anchor")
+            advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
+            outputs = model(x_chunk, coords, advection_anchor=advection_anchor)
             M_sum[start:end] += outputs["M"].detach().cpu().numpy()
             if "transition_control" in outputs:
                 values = outputs["transition_control"].detach().cpu().numpy()

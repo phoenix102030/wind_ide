@@ -119,16 +119,25 @@ def window_tensors(
     start: int,
     end: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     x = torch.from_numpy(data["X"][start:end]).to(device)
     z = torch.from_numpy(data["Z"][start:end]).to(device)
     nwp = data.get("nwp_baseline")
     nwp_baseline = torch.from_numpy(nwp[start:end]).to(device) if nwp is not None else None
     v_star = data["V_star"]
     v = torch.from_numpy(v_star[start:end]).to(device) if v_star is not None else None
+    anchor_np = data.get("A_anchor")
+    advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
     B_star = data.get("B_star")
     B = torch.from_numpy(B_star[start:end]).to(device) if B_star is not None else None
-    return x, z, nwp_baseline, v, B
+    return x, z, nwp_baseline, v, advection_anchor, B
 
 
 def evaluate_window_loss(
@@ -144,12 +153,13 @@ def evaluate_window_loss(
         return {}
     model.eval()
     with torch.no_grad():
-        x, z, nwp_baseline, v_star, B_star = window_tensors(data, start, end, device)
+        x, z, nwp_baseline, v_star, advection_anchor, B_star = window_tensors(data, start, end, device)
         losses = model.training_losses(
             x=x,
             z=z,
             coords=coords,
             v_star=v_star,
+            advection_anchor=advection_anchor,
             B_star=B_star,
             nwp_baseline=nwp_baseline,
             **training_loss_kwargs(config, "online"),
@@ -182,7 +192,9 @@ def evaluate_forecast_metrics(
     with torch.no_grad():
         x = torch.from_numpy(data["X"][start:end]).to(device)
         z = torch.from_numpy(data["Z"][start:end]).to(device)
-        outputs = model(x, coords)
+        anchor_np = data.get("A_anchor")
+        advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
+        outputs = model(x, coords, advection_anchor=advection_anchor)
         control_seq = outputs.get("transition_control")
         kf = model.dstm.kalman_filter(
             z=z,
@@ -300,13 +312,14 @@ def train_one_window(
     lambda_anchor: float,
     grad_clip: float,
 ) -> dict[str, torch.Tensor]:
-    x, z, nwp_baseline, v_star, B_star = window_tensors(data, start, end, device)
+    x, z, nwp_baseline, v_star, advection_anchor, B_star = window_tensors(data, start, end, device)
     optimizer.zero_grad(set_to_none=True)
     losses = model.training_losses(
         x=x,
         z=z,
         coords=coords,
         v_star=v_star,
+        advection_anchor=advection_anchor,
         B_star=B_star,
         nwp_baseline=nwp_baseline,
         **training_loss_kwargs(config, "online"),
@@ -576,7 +589,8 @@ def main() -> None:
     if unexpected:
         print(f"Ignored checkpoint parameters not used by this config: {unexpected}")
     adaptation_scope = str(args.adaptation_scope or config.get("online_adaptation_scope", "full_head"))
-    configure_online_trainable(model, update_ell=not args.no_update_ell, scope=adaptation_scope)
+    update_ell = bool(config.get("online_update_ell", config.get("learnable_ell", True))) and not args.no_update_ell
+    configure_online_trainable(model, update_ell=update_ell, scope=adaptation_scope)
     print(f"Online adaptation scope: {adaptation_scope}; {trainable_parameter_summary(model)}")
     anchor = {name: param.detach().cpu().clone() for name, param in trainable_named_parameters(model).items()}
     optimizer = build_online_optimizer(model, config)
