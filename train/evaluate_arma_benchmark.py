@@ -31,7 +31,7 @@ from train.evaluate_vector_light_metrics import (
 
 
 STATE_DIM = 6
-DEFAULT_COLUMNS = ["arma", "persistence", "nwp"]
+BASELINE_COLUMNS = ["persistence", "nwp"]
 
 
 @dataclass
@@ -99,7 +99,24 @@ def design_matrix(series: np.ndarray, residuals: np.ndarray, p: int, q: int) -> 
         target.append(float(series[t]))
     if not rows:
         return np.empty((0, 1 + p + q), dtype=np.float64), np.empty((0,), dtype=np.float64)
-    return np.asarray(rows, dtype=np.float64), np.asarray(target, dtype=np.float64)
+    X = np.asarray(rows, dtype=np.float64)
+    y = np.asarray(target, dtype=np.float64)
+    finite = np.isfinite(y) & np.isfinite(X).all(axis=1)
+    return X[finite], y[finite]
+
+
+def least_squares_coeff(X: np.ndarray, target: np.ndarray, ridge: float) -> np.ndarray:
+    if X.size == 0:
+        return np.zeros((X.shape[1] if X.ndim == 2 else 1,), dtype=np.float64)
+    lhs = X.T @ X + ridge * np.eye(X.shape[1], dtype=np.float64)
+    rhs = X.T @ target
+    try:
+        coeff = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        coeff = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
+    if not np.isfinite(coeff).all():
+        coeff = np.linalg.lstsq(X, target, rcond=None)[0]
+    return np.nan_to_num(coeff, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def one_step_residuals(series: np.ndarray, intercept: float, ar: np.ndarray, ma: np.ndarray) -> np.ndarray:
@@ -142,15 +159,28 @@ def fit_arma_1d(
         X, target = design_matrix(y, residuals, p, q)
         if X.size == 0:
             break
-        lhs = X.T @ X + ridge * np.eye(X.shape[1], dtype=np.float64)
-        rhs = X.T @ target
-        coeff = np.linalg.solve(lhs, rhs)
+        coeff = least_squares_coeff(X, target, ridge)
+        residuals = one_step_residuals(y, coeff[0], coeff[1 : 1 + p], coeff[1 + p :])
+        if not np.isfinite(residuals).all() or np.nanmax(np.abs(residuals)) > 1.0e6:
+            break
+    if not np.isfinite(coeff).all():
+        coeff = np.zeros(1 + p + q, dtype=np.float64)
+    residuals = one_step_residuals(y, coeff[0], coeff[1 : 1 + p], coeff[1 + p :])
+    if (
+        not np.isfinite(residuals).all()
+        or not np.isfinite(coeff).all()
+        or (residuals.size and np.nanmax(np.abs(residuals)) > 1.0e6)
+    ):
+        X, target = design_matrix(y, np.zeros_like(y), p, 0)
+        ar_coeff = least_squares_coeff(X, target, ridge)
+        coeff = np.zeros(1 + p + q, dtype=np.float64)
+        coeff[: 1 + p] = ar_coeff[: 1 + p]
         residuals = one_step_residuals(y, coeff[0], coeff[1 : 1 + p], coeff[1 + p :])
     ar = coeff[1 : 1 + p].copy()
     ma = coeff[1 + p :].copy()
-    residuals = one_step_residuals(y, coeff[0], ar, ma)
     valid_start = max(p, q, 1)
-    sigma2 = float(np.nanmean(residuals[valid_start:] ** 2)) if residuals.size > valid_start else 0.0
+    resid_tail = residuals[valid_start:]
+    sigma2 = float(np.nanmean(resid_tail ** 2)) if resid_tail.size else 0.0
     return ArmaModel(
         p=p,
         q=q,
@@ -338,9 +368,12 @@ def run_benchmark(
         clip_bounds=clip_bounds,
     )
 
+    model_name = "ARIMA" if d > 0 else "ARMA"
+    model_key = model_name.lower()
+    curve_columns = [model_key, *BASELINE_COLUMNS]
     curves = {
         "horizons": list(range(1, max_horizon + 1)),
-        "curve_columns": DEFAULT_COLUMNS,
+        "curve_columns": curve_columns,
         "rmse_curve": [],
         "mae_curve": [],
         "crps_curve": [],
@@ -358,6 +391,7 @@ def run_benchmark(
         arma_metrics = deterministic_metrics(arma_h, target_h)
         persistence_metrics = deterministic_metrics(persistence_h, target_h)
         nwp_metrics = deterministic_metrics(nwp_h, target_h)
+        model_persistence_abs_diff = np.abs(arma_h - persistence_h)
         curves["rmse_curve"].append([arma_metrics["rmse"], persistence_metrics["rmse"], nwp_metrics["rmse"]])
         curves["mae_curve"].append([arma_metrics["mae"], persistence_metrics["mae"], nwp_metrics["mae"]])
         curves["crps_curve"].append([arma_metrics["crps"], persistence_metrics["crps"], nwp_metrics["crps"]])
@@ -383,22 +417,23 @@ def run_benchmark(
             ]
         )
         multi_step[str(horizon)] = {
-            "arma": arma_metrics,
+            model_key: arma_metrics,
             "persistence_baseline": persistence_metrics,
             "nwp_baseline": nwp_metrics,
-            "arma_vs_persistence_improvement": improvement(arma_metrics, persistence_metrics),
-            "arma_vs_nwp_improvement": improvement(arma_metrics, nwp_metrics),
+            "mean_abs_model_minus_persistence": float(np.nanmean(model_persistence_abs_diff)),
+            "max_abs_model_minus_persistence": float(np.nanmax(model_persistence_abs_diff)),
+            f"{model_key}_vs_persistence_improvement": improvement(arma_metrics, persistence_metrics),
+            f"{model_key}_vs_nwp_improvement": improvement(arma_metrics, nwp_metrics),
         }
 
-    model_name = "ARIMA" if d > 0 else "ARMA"
     results: dict[str, Any] = {
         "model_name": model_name,
         "order": {"p": p, "d": d, "q": q},
-        "model": multi_step["1"]["arma"],
+        "model": multi_step["1"][model_key],
         "persistence_baseline": multi_step["1"]["persistence_baseline"],
         "nwp_baseline": multi_step["1"]["nwp_baseline"],
-        "model_vs_persistence_improvement": multi_step["1"]["arma_vs_persistence_improvement"],
-        "model_vs_nwp_improvement": multi_step["1"]["arma_vs_nwp_improvement"],
+        "model_vs_persistence_improvement": multi_step["1"][f"{model_key}_vs_persistence_improvement"],
+        "model_vs_nwp_improvement": multi_step["1"][f"{model_key}_vs_nwp_improvement"],
         "target_mode": "measurement",
         "train_split": train_split,
         "eval_split": eval_split,
@@ -414,6 +449,16 @@ def run_benchmark(
         "_curves": curves,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_dir / "benchmark_forecasts.npz",
+        prediction=arma_preds,
+        target=eval_y,
+        persistence=eval_y,
+        nwp=eval_nwp,
+        model_name=np.asarray(model_name),
+        curve_columns=np.asarray(curve_columns),
+        horizons=np.arange(1, max_horizon + 1, dtype=np.int64),
+    )
     write_horizon_csv(results, output_dir / "metrics_by_horizon.csv")
     write_hourly_csv(results, output_dir / "metrics_by_hour.csv")
     add_public_metric_curves(results)
