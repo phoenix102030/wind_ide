@@ -272,13 +272,15 @@ def block_wind_rose(
     v: np.ndarray,
     bins: np.ndarray,
     title: str,
+    blocks: int = 4,
 ) -> None:
-    sub = outer_spec.subgridspec(4, 4, wspace=0.18, hspace=0.18)
+    spacing = 0.08 if blocks <= 2 else 0.04 if blocks <= 4 else 0.015
+    sub = outer_spec.subgridspec(blocks, blocks, wspace=spacing, hspace=spacing)
     h, w = u.shape[-2:]
-    row_edges = np.linspace(0, h, 5).round().astype(int)
-    col_edges = np.linspace(0, w, 5).round().astype(int)
-    for r in range(4):
-        for c in range(4):
+    row_edges = np.linspace(0, h, blocks + 1).round().astype(int)
+    col_edges = np.linspace(0, w, blocks + 1).round().astype(int)
+    for r in range(blocks):
+        for c in range(blocks):
             ax = fig.add_subplot(sub[r, c], projection="polar")
             uu = u[:, row_edges[r] : row_edges[r + 1], col_edges[c] : col_edges[c + 1]].reshape(-1)
             vv = v[:, row_edges[r] : row_edges[r + 1], col_edges[c] : col_edges[c + 1]].reshape(-1)
@@ -289,8 +291,9 @@ def block_wind_rose(
             ax.bar(edges[:-1], hist, width=widths, align="edge", color="#4c78a8", alpha=0.75)
             ax.set_xticks([])
             ax.set_yticks([])
-            ax.set_title(f"{r+1},{c+1}", fontsize=7, pad=1)
-    fig.text(0.27, 0.965, title, ha="center", va="top", fontsize=13)
+            label_size = 7 if blocks <= 2 else 6 if blocks <= 4 else 4
+            ax.text(0.5, 1.01, f"{r+1},{c+1}", transform=ax.transAxes, ha="center", va="bottom", fontsize=label_size)
+    fig.text(0.24, 0.965, title, ha="center", va="top", fontsize=12)
 
 
 def plot_window_rose_and_advection(
@@ -311,14 +314,14 @@ def plot_window_rose_and_advection(
         v = np.asarray(grid[V140_INDEX, start:end, :, :], dtype=np.float64)
     bins = np.linspace(-np.pi, np.pi, 17)
     fig = plt.figure(figsize=(16, 8), constrained_layout=True)
-    gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 1.0])
+    gs = fig.add_gridspec(1, 2, width_ratios=[0.92, 1.08])
     block_wind_rose(
         fig,
         gs[0],
         u,
         v,
         bins,
-        f"NWP 140m wind-from roses, {time_range_label(start, end - 1, start_time, dt_seconds)}",
+        f"NWP mid-scale wind direction, {time_range_label(start, end - 1, start_time, dt_seconds)}",
     )
     ax = fig.add_subplot(gs[1])
     times = np.arange(start, end)
@@ -391,6 +394,8 @@ def plot_window_gif(
     nwp_disp: np.ndarray,
     start_time: datetime,
     dt_seconds: float,
+    blocks: int = 4,
+    show_nwp_vector: bool = True,
     duration_ms: int = 450,
 ) -> dict[str, float]:
     end = min(start + frames, len(au))
@@ -406,14 +411,15 @@ def plot_window_gif(
     images: list[Image.Image] = []
     for local_t, t in enumerate(range(start, end)):
         fig = plt.figure(figsize=(16, 8), constrained_layout=True)
-        gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 1.0])
+        gs = fig.add_gridspec(1, 2, width_ratios=[0.92, 1.08])
         block_wind_rose(
             fig,
             gs[0],
             u[local_t : local_t + 1],
             v[local_t : local_t + 1],
             bins,
-            f"NWP 140m 4x4 regional wind-from direction, {time_label(t, start_time, dt_seconds)}",
+            f"NWP mid-scale wind direction, {time_label(t, start_time, dt_seconds)}",
+            blocks=blocks,
         )
         ax = fig.add_subplot(gs[1])
         trace = slice(start, t + 1)
@@ -421,11 +427,13 @@ def plot_window_gif(
         ax.plot(av[trace, 0], av[trace, 1], color="tab:orange", linewidth=1.8, alpha=0.75)
         ax.scatter(au[trace, 0], au[trace, 1], color="tab:blue", s=30, alpha=0.35)
         ax.scatter(av[trace, 0], av[trace, 1], color="tab:orange", s=30, alpha=0.35)
-        for vec, label, color in [
+        vectors = [
             (au[t], "A_u-like current", "tab:blue"),
             (av[t], "A_v-like current", "tab:orange"),
-            (nwp_disp[t], "NWP station displacement current", "tab:green"),
-        ]:
+        ]
+        if show_nwp_vector:
+            vectors.append((nwp_disp[t], "NWP station displacement current", "tab:green"))
+        for vec, label, color in vectors:
             ax.arrow(
                 0,
                 0,
@@ -586,7 +594,7 @@ def main() -> None:
         "posthoc_direction_bias": direction_bias,
         "interpretation_notes": [
             "A_u_like and A_v_like are reconstructed from the legacy transition outputs.",
-            "4x4 roses aggregate meteorological NWP 140m wind-from directions over one hour; bars are speed-weighted.",
+            "Mid-scale roses aggregate meteorological NWP 140m wind-from directions; bars are speed-weighted.",
             "The right panel compares legacy component advection with NWP station displacement.",
         ],
     }
