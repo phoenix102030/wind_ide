@@ -715,6 +715,21 @@ def checkpoint_name_with_suffix(filename: str, suffix: str) -> str:
     return f"{path.stem}{suffix}{path.suffix or '.pt'}"
 
 
+def periodic_checkpoint_path(base_path: Path, stage: str, epoch: int) -> Path:
+    suffix = f"_{stage}_epoch{epoch:04d}"
+    return base_path.with_name(checkpoint_name_with_suffix(base_path.name, suffix))
+
+
+def prune_periodic_checkpoints(base_path: Path, keep: int) -> None:
+    if keep <= 0:
+        return
+    pattern = f"{base_path.stem}_*_epoch*{base_path.suffix or '.pt'}"
+    checkpoints = sorted(base_path.parent.glob(pattern), key=lambda p: p.stat().st_mtime)
+    excess = len(checkpoints) - keep
+    for path in checkpoints[: max(excess, 0)]:
+        path.unlink(missing_ok=True)
+
+
 def checkpoint_score(metrics: dict[str, float], monitor: str) -> float:
     if monitor in metrics:
         return float(metrics[monitor])
@@ -819,6 +834,8 @@ def main() -> None:
     monitor_stage = str(config.get("checkpoint_stage", active_stages[-1] if active_stages else "joint"))
     monitor_metric = str(config.get("checkpoint_metric", "val_loss_kf"))
     validation_every = int(config.get("validation_every_epochs", 5))
+    offline_checkpoint_every = int(config.get("offline_checkpoint_every_epochs", 0))
+    offline_checkpoint_keep = int(config.get("offline_checkpoint_keep", 0))
     ckpt_dir = Path(config.get("checkpoint_dir", "checkpoints"))
     best_ckpt_path = ckpt_dir / config.get("offline_checkpoint_name", "vector_mide_offline.pt")
     last_ckpt_path = ckpt_dir / config.get(
@@ -847,6 +864,24 @@ def main() -> None:
                     rank_zero_print(f"{stage} epoch {epoch + 1}/{epochs}: {metrics}")
                     record = {"stage": stage, "epoch": epoch + 1, "epochs": epochs, **metrics}
                     history.append(record)
+
+                    if offline_checkpoint_every > 0 and (epoch + 1) % offline_checkpoint_every == 0:
+                        periodic_path = periodic_checkpoint_path(best_ckpt_path, stage, epoch + 1)
+                        save_checkpoint(
+                            train_model,
+                            config,
+                            periodic_path,
+                            extra={
+                                "stage": stage,
+                                "epoch": epoch + 1,
+                                "metrics": metrics,
+                                "best": best_info,
+                                "history": history,
+                                "checkpoint_role": "periodic_offline",
+                            },
+                        )
+                        prune_periodic_checkpoints(best_ckpt_path, offline_checkpoint_keep)
+                        rank_zero_print(f"Saved periodic checkpoint to {periodic_path}")
 
                     if stage == monitor_stage and monitor_metric in metrics:
                         score = checkpoint_score(metrics, monitor_metric)

@@ -145,6 +145,8 @@ last_global_online_checkpoint_name: vector_mide_online_mps_global_last.pt
 checkpoint_dir: checkpoints
 offline_checkpoint_name: vector_mide_offline_mps.pt
 last_offline_checkpoint_name: vector_mide_offline_mps_last.pt
+offline_checkpoint_every_epochs: 1
+offline_checkpoint_keep: 4
 online_checkpoint_name: vector_mide_online_mps.pt
 last_online_checkpoint_name: vector_mide_online_mps_last.pt
 checkpoint_stage: joint

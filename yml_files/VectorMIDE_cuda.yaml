@@ -149,6 +149,8 @@ last_global_online_checkpoint_name: vector_mide_online_cuda_global_last.pt
 checkpoint_dir: outputs/cnn_transformer_new
 offline_checkpoint_name: vector_mide_offline_cuda.pt
 last_offline_checkpoint_name: vector_mide_offline_cuda_last.pt
+offline_checkpoint_every_epochs: 25
+offline_checkpoint_keep: 12
 online_checkpoint_name: vector_mide_online_cuda.pt
 last_online_checkpoint_name: vector_mide_online_cuda_last.pt
 checkpoint_stage: joint
