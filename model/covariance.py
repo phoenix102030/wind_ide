@@ -193,6 +193,62 @@ class ComponentSiteCovariance(nn.Module):
         return torch.kron(component, eye_sites)
 
 
+class BoundedComponentSiteCovariance(nn.Module):
+    """Bounded 2-component covariance expanded across sites.
+
+    The two component standard deviations are constrained to configured ranges
+    and the correlation is bounded away from +/-1. This keeps Q/R identifiable
+    enough that they cannot absorb all transport uncertainty during Kalman
+    likelihood optimization.
+    """
+
+    def __init__(
+        self,
+        n_sites: int = 3,
+        std_init: float = 0.2,
+        std_min: float = 0.01,
+        std_max: float = 1.0,
+        corr_init: float = 0.0,
+        corr_limit: float = 0.95,
+    ) -> None:
+        super().__init__()
+        if not 0.0 <= std_min < std_max:
+            raise ValueError("Require 0 <= std_min < std_max")
+        if not 0.0 < corr_limit < 1.0:
+            raise ValueError("corr_limit must be in (0, 1)")
+        self.n_sites = n_sites
+        self.std_min = float(std_min)
+        self.std_max = float(std_max)
+        self.corr_limit = float(corr_limit)
+
+        frac = (float(std_init) - self.std_min) / (self.std_max - self.std_min)
+        frac = min(max(frac, 1.0e-6), 1.0 - 1.0e-6)
+        raw_std = torch.full((2,), math.log(frac / (1.0 - frac)), dtype=torch.float32)
+        corr_frac = min(max(float(corr_init) / self.corr_limit, -0.999999), 0.999999)
+        raw_corr = 0.5 * math.log((1.0 + corr_frac) / (1.0 - corr_frac))
+        self.raw_std = nn.Parameter(raw_std)
+        self.raw_corr = nn.Parameter(torch.tensor(raw_corr, dtype=torch.float32))
+
+    def component_covariance(self) -> Tensor:
+        std = self.std_min + (self.std_max - self.std_min) * torch.sigmoid(self.raw_std)
+        corr = self.corr_limit * torch.tanh(self.raw_corr)
+        cov = std.new_zeros(2, 2)
+        cov[0, 0] = std[0].pow(2)
+        cov[1, 1] = std[1].pow(2)
+        cov[0, 1] = corr * std[0] * std[1]
+        cov[1, 0] = cov[0, 1]
+        return cov
+
+    def forward(self) -> Tensor:
+        component = self.component_covariance()
+        eye_sites = torch.eye(
+            self.n_sites,
+            device=component.device,
+            dtype=component.dtype,
+        )
+        return torch.kron(component, eye_sites)
+
+
 class QRParameters(nn.Module):
     """Learnable process and observation covariance modules."""
 
@@ -202,10 +258,33 @@ class QRParameters(nn.Module):
         q_init: float = 0.2,
         r_init: float = 0.2,
         jitter: float = 1.0e-5,
+        bounded: bool = False,
+        q_std_min: float = 0.01,
+        q_std_max: float = 1.0,
+        r_std_min: float = 0.01,
+        r_std_max: float = 1.0,
+        q_corr_limit: float = 0.95,
+        r_corr_limit: float = 0.95,
     ) -> None:
         super().__init__()
-        self.q_cov = ComponentSiteCovariance(n_sites=n_sites, diag_init=q_init, jitter=jitter)
-        self.r_cov = ComponentSiteCovariance(n_sites=n_sites, diag_init=r_init, jitter=jitter)
+        if bounded:
+            self.q_cov = BoundedComponentSiteCovariance(
+                n_sites=n_sites,
+                std_init=q_init,
+                std_min=q_std_min,
+                std_max=q_std_max,
+                corr_limit=q_corr_limit,
+            )
+            self.r_cov = BoundedComponentSiteCovariance(
+                n_sites=n_sites,
+                std_init=r_init,
+                std_min=r_std_min,
+                std_max=r_std_max,
+                corr_limit=r_corr_limit,
+            )
+        else:
+            self.q_cov = ComponentSiteCovariance(n_sites=n_sites, diag_init=q_init, jitter=jitter)
+            self.r_cov = ComponentSiteCovariance(n_sites=n_sites, diag_init=r_init, jitter=jitter)
 
     def process(self) -> Tensor:
         return self.q_cov()

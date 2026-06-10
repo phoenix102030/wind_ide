@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from .covariance import covariance_from_cholesky_raw, inverse_softplus
+from .covariance import covariance_from_cholesky_raw, inverse_softplus, safe_cholesky
 
 
 def _logit(value: float) -> float:
@@ -25,6 +25,16 @@ def build_cholesky_4x4(raw: Tensor, jitter: float = 1.0e-4) -> Tensor:
     """Build a 4x4 lower Cholesky factor from 10 raw parameters."""
     L, _ = covariance_from_cholesky_raw(raw, dim=4, jitter=jitter)
     return L
+
+
+def _cholesky_raw_from_diag(stds: list[float], jitter: float) -> Tensor:
+    if len(stds) != 4:
+        raise ValueError("Expected four covariance regime standard deviations")
+    raw = torch.zeros(10, dtype=torch.float32)
+    diag_positions = [0, 2, 5, 9]
+    for pos, std in zip(diag_positions, stds):
+        raw[pos] = inverse_softplus(max(float(std), jitter) - jitter)
+    return raw
 
 
 class ConvBackbone(nn.Module):
@@ -140,6 +150,11 @@ class VectorAdvectionNet(nn.Module):
         transition_residual_decay_max: float = 1.0,
         transition_control_dim: int = 0,
         transition_control_scale: float = 0.0,
+        covariance_mode: str = "free_cholesky",
+        covariance_regimes: int = 3,
+        covariance_floor: float = 0.0,
+        covariance_regime_stds: list[float] | tuple[float, ...] | None = None,
+        advection_component_scale: list[float] | tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
         if output_dim != 18:
@@ -172,6 +187,21 @@ class VectorAdvectionNet(nn.Module):
         self.deformation_scale = float(deformation_scale)
         self.anchored_advection = bool(anchored_advection)
         self.advection_residual_scale = float(advection_residual_scale)
+        self.covariance_mode = covariance_mode.replace("-", "_").lower()
+        if self.covariance_mode not in {"free_cholesky", "regime"}:
+            raise ValueError("covariance_mode must be 'free_cholesky' or 'regime'")
+        self.covariance_regimes = int(covariance_regimes)
+        if self.covariance_regimes <= 0:
+            raise ValueError("covariance_regimes must be positive")
+        self.covariance_floor = float(covariance_floor)
+        if advection_component_scale is None:
+            advection_component_scale = (1.0, 1.0, 1.0, 1.0)
+        if len(advection_component_scale) != 4:
+            raise ValueError("advection_component_scale must contain four values")
+        self.register_buffer(
+            "advection_component_scale",
+            torch.tensor(advection_component_scale, dtype=torch.float32),
+        )
 
         self.backbone = ConvBackbone(in_channels=in_channels, hidden_dim=hidden_dim)
         self.attention = ChannelSpatialAttention(hidden_dim=hidden_dim)
@@ -223,7 +253,19 @@ class VectorAdvectionNet(nn.Module):
             self.mu_v_head_shared = None
             self.mu_u_head = None
             self.mu_v_head = None
-        self.chol_head = nn.Linear(feature_dim, 10) if use_component_heads else None
+        if use_component_heads and self.covariance_mode == "regime":
+            self.chol_head = nn.Linear(feature_dim, self.covariance_regimes)
+            if covariance_regime_stds is None:
+                covariance_regime_stds = (0.25, 1.0, 3.0)
+            if len(covariance_regime_stds) != self.covariance_regimes:
+                raise ValueError("covariance_regime_stds length must match covariance_regimes")
+            raw_regimes = []
+            for std in covariance_regime_stds:
+                raw_regimes.append(_cholesky_raw_from_diag([float(std)] * 4, chol_jitter))
+            self.regime_chol_raw = nn.Parameter(torch.stack(raw_regimes, dim=0))
+        else:
+            self.chol_head = nn.Linear(feature_dim, 10) if use_component_heads else None
+            self.regime_chol_raw = None
         self.alpha_head = nn.Linear(feature_dim, 4) if use_component_heads else None
         if self.advection_mode in {"shared_flow_deformation", "shared_flow_component_kernel"}:
             self.flow_head = nn.Linear(feature_dim, 2)
@@ -299,6 +341,8 @@ class VectorAdvectionNet(nn.Module):
             yield from self.mu_v_head.parameters()
         if self.chol_head is not None:
             yield from self.chol_head.parameters()
+        if self.regime_chol_raw is not None:
+            yield self.regime_chol_raw
         if self.alpha_head is not None:
             yield from self.alpha_head.parameters()
         if self.flow_head is not None:
@@ -331,6 +375,8 @@ class VectorAdvectionNet(nn.Module):
             yield from self.mu_v_head.parameters()
         if self.chol_head is not None:
             yield from self.chol_head.parameters()
+        if self.regime_chol_raw is not None:
+            yield self.regime_chol_raw
         if self.alpha_head is not None:
             yield from self.alpha_head.parameters()
         if self.flow_head is not None:
@@ -518,6 +564,43 @@ class VectorAdvectionNet(nn.Module):
             raise ValueError(f"Expected advection_anchor shape {tuple(target.shape)}, got {tuple(anchor.shape)}")
         return anchor
 
+    def _scaled_component_advection(self, value: Tensor) -> Tensor:
+        scale = self.advection_component_scale.to(device=value.device, dtype=value.dtype)
+        return value * scale
+
+    def component_covariance_from_raw(self, raw_chol: Tensor) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+        if self.covariance_mode == "regime":
+            if self.regime_chol_raw is None:
+                raise RuntimeError("regime_chol_raw is not initialized")
+            regime_L, regime_sigma = covariance_from_cholesky_raw(
+                self.regime_chol_raw.to(device=raw_chol.device, dtype=raw_chol.dtype),
+                dim=4,
+                jitter=self.chol_jitter,
+            )
+            regime_probs = torch.softmax(raw_chol, dim=-1)
+            sigma = torch.einsum("tr,rij->tij", regime_probs, regime_sigma)
+            if self.covariance_floor > 0.0:
+                eye = torch.eye(4, device=raw_chol.device, dtype=raw_chol.dtype).unsqueeze(0)
+                sigma = sigma + self.covariance_floor**2 * eye
+            L = safe_cholesky(sigma)
+            return L, sigma, {
+                "covariance_regime_logits": raw_chol,
+                "covariance_regime_probs": regime_probs,
+                "covariance_regime_Sigma": regime_sigma,
+                "covariance_regime_L": regime_L,
+            }
+
+        L, sigma = covariance_from_cholesky_raw(
+            raw_chol,
+            dim=4,
+            jitter=self.chol_jitter,
+        )
+        if self.covariance_floor > 0.0:
+            eye = torch.eye(4, device=raw_chol.device, dtype=raw_chol.dtype).unsqueeze(0)
+            sigma = sigma + self.covariance_floor**2 * eye
+            L = safe_cholesky(sigma)
+        return L, sigma, {}
+
     def forward(self, x: Tensor, advection_anchor: Tensor | None = None) -> dict[str, Tensor]:
         if x.ndim == 3:
             x = x.unsqueeze(0)
@@ -588,16 +671,13 @@ class VectorAdvectionNet(nn.Module):
                 anchor = torch.zeros_like(delta_mu)
             else:
                 anchor = self._expand_anchor(advection_anchor, delta_mu)
+            anchor = self._scaled_component_advection(anchor)
             mu = anchor + delta_mu
         else:
             delta_mu = None
             anchor = None
-            mu = torch.tanh(raw_mu) * self.mu_scale
-        L, sigma = covariance_from_cholesky_raw(
-            raw_chol,
-            dim=4,
-            jitter=self.chol_jitter,
-        )
+            mu = self._scaled_component_advection(torch.tanh(raw_mu) * self.mu_scale)
+        L, sigma, covariance_extra = self.component_covariance_from_raw(raw_chol)
         alpha_logits = raw_alpha.reshape(-1, 2, 2)
         alpha = torch.softmax(alpha_logits, dim=-1)
         if self.component_mixing_floor > 0.0:
@@ -610,6 +690,8 @@ class VectorAdvectionNet(nn.Module):
             "Sigma": sigma,
             "alpha": alpha,
             "alpha_logits": alpha_logits,
+            "advection_component_scale": self.advection_component_scale.to(device=mu.device, dtype=mu.dtype),
+            **covariance_extra,
         }
         if delta_mu is not None and anchor is not None:
             result["delta_mu"] = delta_mu

@@ -421,6 +421,10 @@ def evaluate(
     with torch.no_grad():
         ell = model.kernel.get_ell().detach().cpu().numpy().astype(np.float32, copy=False)
         gamma = np.asarray(float(model.kernel.gamma_value(device, torch.float32).detach().cpu()), dtype=np.float32)
+        kernel_sigma_scale = np.asarray(
+            float(model.kernel.sigma_scale_value(device, torch.float32).detach().cpu()),
+            dtype=np.float32,
+        )
         kernel_dt = np.asarray(float(model.kernel.dt), dtype=np.float32)
         Q = model.dstm.process_covariance().detach().cpu().numpy().astype(np.float32, copy=False)
         R = model.dstm.observation_covariance().detach().cpu().numpy().astype(np.float32, copy=False)
@@ -458,6 +462,7 @@ def evaluate(
         "advection_anchor": advection_anchor_np,
         "ell": ell,
         "gamma": gamma,
+        "kernel_sigma_scale": kernel_sigma_scale,
         "kernel_dt": kernel_dt,
         "Q": Q,
         "R": R,
@@ -543,6 +548,7 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
         optical_flow_advection=artifacts["optical_flow_advection"],
         ell=artifacts["ell"],
         gamma=artifacts["gamma"],
+        kernel_sigma_scale=artifacts["kernel_sigma_scale"],
         kernel_dt=artifacts["kernel_dt"],
         Q=artifacts["Q"],
         R=artifacts["R"],

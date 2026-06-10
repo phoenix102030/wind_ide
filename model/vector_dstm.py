@@ -27,6 +27,13 @@ class VectorDSTM(nn.Module):
         q_init: float = 0.2,
         r_init: float = 0.2,
         jitter: float = 1.0e-5,
+        bounded_qr: bool = False,
+        q_std_min: float = 0.01,
+        q_std_max: float = 1.0,
+        r_std_min: float = 0.01,
+        r_std_max: float = 1.0,
+        q_corr_limit: float = 0.95,
+        r_corr_limit: float = 0.95,
     ) -> None:
         super().__init__()
         self.n_sites = n_sites
@@ -37,6 +44,13 @@ class VectorDSTM(nn.Module):
             q_init=q_init,
             r_init=r_init,
             jitter=jitter,
+            bounded=bounded_qr,
+            q_std_min=q_std_min,
+            q_std_max=q_std_max,
+            r_std_min=r_std_min,
+            r_std_max=r_std_max,
+            q_corr_limit=q_corr_limit,
+            r_corr_limit=r_corr_limit,
         )
 
     def process_covariance(self) -> Tensor:
@@ -285,6 +299,13 @@ class VectorMIDE(nn.Module):
         learnable_gamma: bool = False,
         q_init: float = 0.2,
         r_init: float = 0.2,
+        bounded_qr: bool = False,
+        q_std_min: float = 0.01,
+        q_std_max: float = 1.0,
+        r_std_min: float = 0.01,
+        r_std_max: float = 1.0,
+        q_corr_limit: float = 0.95,
+        r_corr_limit: float = 0.95,
         kalman_jitter: float = 1.0e-5,
         transition_kernel_weight: bool = False,
         transition_kernel_weight_init: float = 1.0,
@@ -296,6 +317,15 @@ class VectorMIDE(nn.Module):
         transition_residual_decay_max: float = 1.0,
         transition_control: bool = False,
         transition_control_scale: float = 0.0,
+        sigma_scale_init: float = 1.0,
+        sigma_scale_min: float = 1.0,
+        sigma_scale_max: float = 1.0,
+        learnable_sigma_scale: bool = False,
+        covariance_mode: str = "free_cholesky",
+        covariance_regimes: int = 3,
+        covariance_floor: float = 0.0,
+        covariance_regime_stds: Sequence[float] | None = None,
+        advection_component_scale: Sequence[float] | None = None,
     ) -> None:
         super().__init__()
         self.n_sites = n_sites
@@ -328,6 +358,11 @@ class VectorMIDE(nn.Module):
             transition_residual_decay_max=transition_residual_decay_max,
             transition_control_dim=self.state_dim if transition_control else 0,
             transition_control_scale=transition_control_scale,
+            covariance_mode=covariance_mode,
+            covariance_regimes=covariance_regimes,
+            covariance_floor=covariance_floor,
+            covariance_regime_stds=covariance_regime_stds,
+            advection_component_scale=advection_component_scale,
         )
         self.kernel = VectorLagrangianKernel(
             n_dim=n_sites,
@@ -341,12 +376,23 @@ class VectorMIDE(nn.Module):
             ell_max=ell_max,
             learnable_ell=learnable_ell,
             learnable_gamma=learnable_gamma,
+            sigma_scale_init=sigma_scale_init,
+            sigma_scale_min=sigma_scale_min,
+            sigma_scale_max=sigma_scale_max,
+            learnable_sigma_scale=learnable_sigma_scale,
         )
         self.dstm = VectorDSTM(
             n_sites=n_sites,
             q_init=q_init,
             r_init=r_init,
             jitter=kalman_jitter,
+            bounded_qr=bounded_qr,
+            q_std_min=q_std_min,
+            q_std_max=q_std_max,
+            r_std_min=r_std_min,
+            r_std_max=r_std_max,
+            q_corr_limit=q_corr_limit,
+            r_corr_limit=r_corr_limit,
         )
         self.qr_params = self.dstm.qr_params
 
@@ -392,6 +438,7 @@ class VectorMIDE(nn.Module):
         M = self.shape_transition_matrix(base_M, outputs)
         outputs["M_base"] = base_M
         outputs["M"] = M
+        outputs["kernel_sigma_scale"] = self.kernel.sigma_scale_value(M.device, M.dtype)
         return outputs
 
     def kalman_nll(
@@ -492,6 +539,9 @@ class VectorMIDE(nn.Module):
         v_star: Optional[Tensor],
         outputs: dict[str, Tensor],
     ) -> Tensor:
+        if v_star is not None and "advection_component_scale" in outputs and v_star.shape[-1] == 4:
+            scale = outputs["advection_component_scale"].to(device=v_star.device, dtype=v_star.dtype)
+            v_star = v_star * scale
         if "flow_mu" in outputs and "flow_Sigma" in outputs:
             target = self.shared_flow_target(v_star)
             return advection_nll_loss(target, outputs["flow_mu"], outputs["flow_Sigma"])
@@ -510,6 +560,115 @@ class VectorMIDE(nn.Module):
             return B.new_tensor(0.0)
         return (B[valid] - B_star[valid].to(device=B.device, dtype=B.dtype)).pow(2).mean()
 
+    def projected_sigma_ratio(self, outputs: dict[str, Tensor]) -> Tensor:
+        sigma = outputs.get("Sigma")
+        if sigma is None or sigma.shape[-2:] != (4, 4):
+            return outputs["mu"].new_zeros(outputs["mu"].shape[0])
+        device = sigma.device
+        dtype = sigma.dtype
+        selectors = self.kernel.selectors(device, dtype)
+        ell = self.kernel.get_ell().to(device=device, dtype=dtype)
+        gamma = self.kernel.gamma_value(device, dtype)
+        sigma_scale = self.kernel.sigma_scale_value(device, dtype)
+        ratios = []
+        for i in range(2):
+            for j in range(2):
+                projection = self.kernel.component_projection(i, j, selectors, gamma)
+                projected = torch.matmul(projection.unsqueeze(0), sigma)
+                projected = torch.matmul(projected, projection.T)
+                projected_trace = sigma_scale * 2.0 * torch.diagonal(projected, dim1=-2, dim2=-1).sum(dim=-1)
+                base_trace = 2.0 * ell[i, j].pow(2)
+                ratios.append(projected_trace / base_trace.clamp_min(1.0e-12))
+        return torch.stack(ratios, dim=-1).mean(dim=-1)
+
+    @staticmethod
+    def _normalize_proxy(proxy: Tensor) -> Tensor:
+        proxy = proxy.clamp_min(0.0)
+        finite = torch.isfinite(proxy)
+        if finite.sum() == 0:
+            return torch.zeros_like(proxy)
+        values = proxy[finite]
+        lo = values.amin()
+        hi = values.amax()
+        norm = (proxy - lo) / (hi - lo).clamp_min(1.0e-8)
+        return torch.where(finite, norm.clamp(0.0, 1.0), torch.zeros_like(norm))
+
+    def sigma_ratio_loss(
+        self,
+        outputs: dict[str, Tensor],
+        covariance_proxy: Optional[Tensor],
+        ratio_min: float,
+        ratio_max: float,
+        eps: float = 1.0e-8,
+    ) -> Tensor:
+        ratio = self.projected_sigma_ratio(outputs)
+        if covariance_proxy is None:
+            target = ratio.new_full(ratio.shape, float(ratio_min))
+        else:
+            proxy = covariance_proxy.to(device=ratio.device, dtype=ratio.dtype).reshape(-1)
+            if proxy.shape[0] != ratio.shape[0]:
+                raise ValueError(f"Expected covariance_proxy length {ratio.shape[0]}, got {proxy.shape[0]}")
+            proxy_norm = self._normalize_proxy(proxy)
+            target = float(ratio_min) + (float(ratio_max) - float(ratio_min)) * proxy_norm
+        valid = torch.isfinite(ratio) & torch.isfinite(target) & (target > 0)
+        if valid.sum() == 0:
+            return ratio.new_tensor(0.0)
+        return (torch.log(ratio[valid].clamp_min(eps)) - torch.log(target[valid].clamp_min(eps))).pow(2).mean()
+
+    def covariance_proxy_loss(
+        self,
+        outputs: dict[str, Tensor],
+        covariance_proxy_primary: Optional[Tensor],
+        covariance_proxy_secondary: Optional[Tensor],
+        floor: float = 1.0e-4,
+        eps: float = 1.0e-8,
+    ) -> Tensor:
+        sigma = outputs.get("Sigma")
+        if sigma is None or covariance_proxy_primary is None or covariance_proxy_secondary is None:
+            return outputs["mu"].new_tensor(0.0)
+        primary = covariance_proxy_primary.to(device=sigma.device, dtype=sigma.dtype)
+        secondary = covariance_proxy_secondary.to(device=sigma.device, dtype=sigma.dtype)
+        if "advection_component_scale" in outputs and primary.shape[-1] == 4:
+            scale = outputs["advection_component_scale"].to(device=sigma.device, dtype=sigma.dtype)
+            primary = primary * scale
+            secondary = secondary * scale
+        valid = torch.isfinite(primary).all(dim=-1) & torch.isfinite(secondary).all(dim=-1)
+        if valid.sum() == 0:
+            return sigma.new_tensor(0.0)
+        diff = primary[valid] - secondary[valid]
+        target_trace = diff.pow(2).sum(dim=-1) + float(floor) ** 2 * diff.shape[-1]
+        pred_trace = torch.diagonal(sigma[valid], dim1=-2, dim2=-1).sum(dim=-1)
+        return (torch.log(pred_trace.clamp_min(eps)) - torch.log(target_trace.clamp_min(eps))).pow(2).mean()
+
+    @staticmethod
+    def innovation_calibration_loss(kf: dict[str, Tensor], z: Tensor, R: Tensor, H: Optional[Tensor]) -> Tensor:
+        pred_means = kf.get("pred_means")
+        pred_covs = kf.get("pred_covs")
+        if pred_means is None or pred_covs is None:
+            return z.new_tensor(0.0)
+        obs_dim = z.shape[-1]
+        state_dim = pred_means.shape[-1]
+        if H is None:
+            H_full = torch.eye(state_dim, device=z.device, dtype=z.dtype)
+        else:
+            H_full = H.to(device=z.device, dtype=z.dtype)
+        terms = []
+        for t in range(z.shape[0]):
+            obs_mask = torch.isfinite(z[t])
+            if not obs_mask.any():
+                continue
+            H_t = H_full[obs_mask]
+            R_t = R[obs_mask][:, obs_mask]
+            innovation = z[t, obs_mask] - H_t @ pred_means[t]
+            F_t = H_t @ pred_covs[t] @ H_t.T + R_t
+            F_t = F_t + 1.0e-5 * torch.eye(F_t.shape[0], device=z.device, dtype=z.dtype)
+            solved = solve_linear_system(F_t, innovation.unsqueeze(-1)).squeeze(-1)
+            normalized_quad = (innovation * solved).sum() / float(F_t.shape[0])
+            terms.append((normalized_quad - 1.0).pow(2))
+        if not terms:
+            return z.new_tensor(0.0)
+        return torch.stack(terms).mean()
+
     def training_losses(
         self,
         x: Tensor,
@@ -525,15 +684,25 @@ class VectorMIDE(nn.Module):
         lambda_advection_residual: float = 0.0,
         lambda_reg: float = 0.0001,
         lambda_multistep: float = 0.0,
+        lambda_sigma_ratio: float = 0.0,
+        sigma_ratio_min: float = 0.05,
+        sigma_ratio_max: float = 0.5,
+        lambda_covariance_proxy: float = 0.0,
+        covariance_proxy_floor: float = 1.0e-4,
+        lambda_calibration: float = 0.0,
         multistep_horizons: Optional[Sequence[int]] = None,
         multistep_max_origins: int = 0,
         nwp_baseline: Optional[Tensor] = None,
+        covariance_proxy: Optional[Tensor] = None,
+        covariance_proxy_primary: Optional[Tensor] = None,
+        covariance_proxy_secondary: Optional[Tensor] = None,
         hybrid_first_horizon_direct: bool = False,
         hybrid_direct_horizon_steps: int = 1,
     ) -> dict[str, Tensor]:
         outputs = self.forward(x, coords, advection_anchor=advection_anchor)
         use_multistep = lambda_multistep > 0.0 and bool(multistep_horizons)
-        if use_multistep:
+        need_history = use_multistep or lambda_calibration > 0.0
+        if need_history:
             kf = self.dstm.kalman_filter(
                 z=z,
                 M_seq=outputs["M"],
@@ -573,6 +742,23 @@ class VectorMIDE(nn.Module):
         loss_smooth = smoothness_loss(smooth_mu, smooth_matrix) + self.transition_modifier_smoothness(outputs)
         reg_params = list(self.kernel.parameters()) + list(self.qr_params.parameters())
         loss_reg = l2_regularization(reg_params)
+        loss_sigma_ratio = self.sigma_ratio_loss(
+            outputs,
+            covariance_proxy=covariance_proxy,
+            ratio_min=sigma_ratio_min,
+            ratio_max=sigma_ratio_max,
+        )
+        loss_covariance_proxy = self.covariance_proxy_loss(
+            outputs,
+            covariance_proxy_primary=covariance_proxy_primary,
+            covariance_proxy_secondary=covariance_proxy_secondary,
+            floor=covariance_proxy_floor,
+        )
+        if lambda_calibration > 0.0 and need_history:
+            R = self.dstm.observation_covariance().to(device=z.device, dtype=z.dtype)
+            loss_calibration = self.innovation_calibration_loss(kf, z=z, R=R, H=H)
+        else:
+            loss_calibration = loss_kf.new_tensor(0.0)
         total = (
             loss_kf
             + lambda_adv * loss_adv
@@ -581,6 +767,9 @@ class VectorMIDE(nn.Module):
             + lambda_advection_residual * loss_advection_residual
             + lambda_reg * loss_reg
             + lambda_multistep * loss_multistep
+            + lambda_sigma_ratio * loss_sigma_ratio
+            + lambda_covariance_proxy * loss_covariance_proxy
+            + lambda_calibration * loss_calibration
         )
         loss_forecast = loss_kf + lambda_multistep * loss_multistep
         return {
@@ -593,5 +782,8 @@ class VectorMIDE(nn.Module):
             "loss_smooth": loss_smooth,
             "loss_reg": loss_reg,
             "loss_multistep": loss_multistep,
+            "loss_sigma_ratio": loss_sigma_ratio,
+            "loss_covariance_proxy": loss_covariance_proxy,
+            "loss_calibration": loss_calibration,
             **outputs,
         }

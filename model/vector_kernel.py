@@ -43,6 +43,10 @@ class VectorLagrangianKernel(nn.Module):
         ell_max: float = 10.0,
         learnable_ell: bool = True,
         learnable_gamma: bool = False,
+        sigma_scale_init: float = 1.0,
+        sigma_scale_min: float = 1.0,
+        sigma_scale_max: float = 1.0,
+        learnable_sigma_scale: bool = False,
     ) -> None:
         super().__init__()
         if n_dim <= 0:
@@ -68,6 +72,14 @@ class VectorLagrangianKernel(nn.Module):
             self.raw_gamma = nn.Parameter(torch.tensor(_logit(gamma), dtype=torch.float32))
         else:
             self.register_buffer("fixed_gamma", torch.tensor(float(gamma), dtype=torch.float32))
+        self.sigma_scale_min = float(sigma_scale_min)
+        self.sigma_scale_max = float(sigma_scale_max)
+        self.learnable_sigma_scale = bool(learnable_sigma_scale and sigma_scale_max > sigma_scale_min)
+        if self.learnable_sigma_scale:
+            frac = (float(sigma_scale_init) - self.sigma_scale_min) / (self.sigma_scale_max - self.sigma_scale_min)
+            self.raw_sigma_scale = nn.Parameter(torch.tensor(_logit(frac), dtype=torch.float32))
+        else:
+            self.register_buffer("fixed_sigma_scale", torch.tensor(float(sigma_scale_init), dtype=torch.float32))
 
     def get_ell(self) -> Tensor:
         return self.ell_min + (self.ell_max - self.ell_min) * torch.sigmoid(self.raw_ell)
@@ -76,6 +88,14 @@ class VectorLagrangianKernel(nn.Module):
         if self.learnable_gamma:
             return torch.sigmoid(self.raw_gamma).to(device=device, dtype=dtype)
         return self.fixed_gamma.to(device=device, dtype=dtype)
+
+    def sigma_scale_value(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        if self.learnable_sigma_scale:
+            scale = self.sigma_scale_min + (self.sigma_scale_max - self.sigma_scale_min) * torch.sigmoid(
+                self.raw_sigma_scale
+            )
+            return scale.to(device=device, dtype=dtype)
+        return self.fixed_sigma_scale.to(device=device, dtype=dtype)
 
     def component_projection(
         self,
@@ -124,6 +144,7 @@ class VectorLagrangianKernel(nn.Module):
         Es = self.selectors(mu.device, mu.dtype)
         ell = self.get_ell().to(device=mu.device, dtype=mu.dtype)
         gamma = self.gamma_value(mu.device, mu.dtype)
+        sigma_scale = self.sigma_scale_value(mu.device, mu.dtype)
         eye2 = torch.eye(2, device=mu.device, dtype=mu.dtype)
         H = S[:, None, :] - S[None, :, :]
 
@@ -133,7 +154,7 @@ class VectorLagrangianKernel(nn.Module):
             for j in range(2):
                 projection = self.component_projection(i, j, Es, gamma)
                 shift = projection @ mu
-                D = ell[i, j].pow(2) * eye2 + 2.0 * projection @ Sigma @ projection.T
+                D = ell[i, j].pow(2) * eye2 + sigma_scale * 2.0 * projection @ Sigma @ projection.T
                 D = D + self.jitter * eye2
                 L = safe_cholesky(D)
 
@@ -178,6 +199,7 @@ class VectorLagrangianKernel(nn.Module):
         Es = self.selectors(mu_seq.device, mu_seq.dtype)
         ell = self.get_ell().to(device=mu_seq.device, dtype=mu_seq.dtype)
         gamma = self.gamma_value(mu_seq.device, mu_seq.dtype)
+        sigma_scale = self.sigma_scale_value(mu_seq.device, mu_seq.dtype)
         eye2 = torch.eye(2, device=mu_seq.device, dtype=mu_seq.dtype)
         H = S[:, None, :] - S[None, :, :]
         n_pairs = self.n_dim * self.n_dim
@@ -189,7 +211,7 @@ class VectorLagrangianKernel(nn.Module):
                 projection = self.component_projection(i, j, Es, gamma)
                 shift = mu_seq @ projection.T
                 projected_sigma = torch.matmul(projection.unsqueeze(0), Sigma_seq)
-                D = ell[i, j].pow(2) * eye2 + 2.0 * torch.matmul(projected_sigma, projection.T)
+                D = ell[i, j].pow(2) * eye2 + sigma_scale * 2.0 * torch.matmul(projected_sigma, projection.T)
                 D = D + self.jitter * eye2
                 L = safe_cholesky(D)
 
@@ -245,11 +267,12 @@ class VectorLagrangianKernel(nn.Module):
         S = S.to(device=flow_mu_seq.device, dtype=flow_mu_seq.dtype)
         eye2 = torch.eye(2, device=flow_mu_seq.device, dtype=flow_mu_seq.dtype)
         ell = self.get_ell().to(device=flow_mu_seq.device, dtype=flow_mu_seq.dtype).mean()
+        sigma_scale = self.sigma_scale_value(flow_mu_seq.device, flow_mu_seq.dtype)
         H = S[:, None, :] - S[None, :, :]
         n_pairs = self.n_dim * self.n_dim
 
         shift = self.dt * flow_mu_seq
-        D = ell.pow(2) * eye2 + 2.0 * flow_Sigma_seq
+        D = ell.pow(2) * eye2 + sigma_scale * 2.0 * flow_Sigma_seq
         D = D + self.jitter * eye2
         L = safe_cholesky(D)
 
@@ -308,6 +331,7 @@ class VectorLagrangianKernel(nn.Module):
         S = S.to(device=pair_flow_mu_seq.device, dtype=pair_flow_mu_seq.dtype)
         eye2 = torch.eye(2, device=pair_flow_mu_seq.device, dtype=pair_flow_mu_seq.dtype)
         ell = self.get_ell().to(device=pair_flow_mu_seq.device, dtype=pair_flow_mu_seq.dtype)
+        sigma_scale = self.sigma_scale_value(pair_flow_mu_seq.device, pair_flow_mu_seq.dtype)
         H = S[:, None, :] - S[None, :, :]
         n_pairs = self.n_dim * self.n_dim
 
@@ -316,7 +340,7 @@ class VectorLagrangianKernel(nn.Module):
             col_blocks = []
             for j in range(2):
                 shift = self.dt * pair_flow_mu_seq[:, i, j, :]
-                D = ell[i, j].pow(2) * eye2 + 2.0 * pair_flow_Sigma_seq[:, i, j, :, :]
+                D = ell[i, j].pow(2) * eye2 + sigma_scale * 2.0 * pair_flow_Sigma_seq[:, i, j, :, :]
                 D = D + self.jitter * eye2
                 L = safe_cholesky(D)
 

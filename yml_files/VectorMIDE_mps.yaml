@@ -35,6 +35,11 @@ advection_mode: component
 deformation_scale: 0.3
 anchored_advection: true
 advection_residual_scale: 1.0
+advection_component_scale: [1.1, 0.9, 0.9, 1.1]
+covariance_mode: regime
+covariance_regimes: 3
+covariance_regime_stds: [0.25, 1.0, 3.0]
+covariance_floor: 0.05
 
 dt: 1.0
 dt_seconds: 600.0
@@ -47,13 +52,24 @@ use_spectral_scaling: false
 spectral_radius: 0.98
 kernel_jitter: 1.0e-5
 kalman_jitter: 1.0e-5
-ell_init: 60.0
-ell_min: 60.0
-ell_max: 500.0
-learnable_ell: false
+ell_init: 30.0
+ell_min: 8.0
+ell_max: 80.0
+learnable_ell: true
+sigma_scale_init: 100.0
+sigma_scale_min: 1.0
+sigma_scale_max: 10000.0
+learnable_sigma_scale: true
 
 q_init: 0.2
 r_init: 0.2
+bounded_qr: true
+q_std_min: 0.03
+q_std_max: 0.45
+r_std_min: 0.03
+r_std_max: 0.40
+q_corr_limit: 0.6
+r_corr_limit: 0.6
 
 window_size: 128
 rolling_window_size: 24
@@ -85,6 +101,15 @@ adv_lambda_advection_residual: 0.01
 lambda_smooth: 0.001
 lambda_reg: 0.0001
 lambda_multistep: 0.2
+lambda_sigma_ratio: 0.02
+sigma_ratio_min: 0.05
+sigma_ratio_max: 0.5
+lambda_covariance_proxy: 0.0001
+covariance_proxy_floor: 0.05
+lambda_calibration: 0.0001
+covariance_proxy_mode: nwp_vs_pattern
+covariance_proxy_primary: V_nwp_star
+covariance_proxy_secondary: V_pattern_star
 multistep_horizons: [1, 2, 3, 6, 9, 12]
 multistep_max_origins: 64
 multistep_stages: [joint, online]

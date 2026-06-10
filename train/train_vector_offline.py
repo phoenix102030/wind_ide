@@ -39,6 +39,9 @@ class VectorMIDETrainingModule(torch.nn.Module):
         v_star: torch.Tensor | None,
         advection_anchor: torch.Tensor | None,
         B_star: torch.Tensor | None,
+        covariance_proxy: torch.Tensor | None,
+        covariance_proxy_primary: torch.Tensor | None,
+        covariance_proxy_secondary: torch.Tensor | None,
         stage: str,
         loss_kwargs: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
@@ -64,11 +67,25 @@ class VectorMIDETrainingModule(torch.nn.Module):
             smooth_mu = outputs.get("flow_mu", outputs["mu"])
             smooth_matrix = outputs.get("B", outputs["alpha"])
             loss_smooth = smoothness_loss(smooth_mu, smooth_matrix)
+            loss_sigma_ratio = self.model.sigma_ratio_loss(
+                outputs,
+                covariance_proxy=covariance_proxy,
+                ratio_min=float(loss_kwargs.get("sigma_ratio_min", 0.05)),
+                ratio_max=float(loss_kwargs.get("sigma_ratio_max", 0.5)),
+            )
+            loss_covariance_proxy = self.model.covariance_proxy_loss(
+                outputs,
+                covariance_proxy_primary=covariance_proxy_primary,
+                covariance_proxy_secondary=covariance_proxy_secondary,
+                floor=float(loss_kwargs.get("covariance_proxy_floor", 1.0e-4)),
+            )
             loss = (
                 loss_adv
                 + float(loss_kwargs.get("lambda_deform", 0.0)) * loss_deform
                 + float(loss_kwargs.get("lambda_advection_residual", 0.0)) * loss_advection_residual
                 + float(loss_kwargs.get("lambda_smooth", 0.001)) * loss_smooth
+                + float(loss_kwargs.get("lambda_sigma_ratio", 0.0)) * loss_sigma_ratio
+                + float(loss_kwargs.get("lambda_covariance_proxy", 0.0)) * loss_covariance_proxy
             )
             return {
                 "loss": loss,
@@ -76,6 +93,8 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 "loss_deform": loss_deform,
                 "loss_advection_residual": loss_advection_residual,
                 "loss_smooth": loss_smooth,
+                "loss_sigma_ratio": loss_sigma_ratio,
+                "loss_covariance_proxy": loss_covariance_proxy,
                 **outputs,
             }
         if stage == "kf":
@@ -89,6 +108,7 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 lambda_smooth=0.0,
                 lambda_reg=float(loss_kwargs.get("lambda_reg", 0.0001)),
                 lambda_multistep=float(loss_kwargs.get("lambda_multistep", 0.0)),
+                lambda_calibration=float(loss_kwargs.get("lambda_calibration", 0.0)),
                 multistep_horizons=loss_kwargs.get("multistep_horizons", ()),
                 multistep_max_origins=int(loss_kwargs.get("multistep_max_origins", 256)),
                 nwp_baseline=nwp_baseline,
@@ -104,6 +124,9 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 advection_anchor=advection_anchor,
                 B_star=B_star,
                 nwp_baseline=nwp_baseline,
+                covariance_proxy=covariance_proxy,
+                covariance_proxy_primary=covariance_proxy_primary,
+                covariance_proxy_secondary=covariance_proxy_secondary,
                 **loss_kwargs,
             )
         raise ValueError(f"Unknown stage: {stage}")
@@ -242,6 +265,13 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         learnable_gamma=bool(config.get("learnable_gamma", False)),
         q_init=float(config.get("q_init", 0.2)),
         r_init=float(config.get("r_init", 0.2)),
+        bounded_qr=bool(config.get("bounded_qr", False)),
+        q_std_min=float(config.get("q_std_min", 0.01)),
+        q_std_max=float(config.get("q_std_max", 1.0)),
+        r_std_min=float(config.get("r_std_min", 0.01)),
+        r_std_max=float(config.get("r_std_max", 1.0)),
+        q_corr_limit=float(config.get("q_corr_limit", 0.95)),
+        r_corr_limit=float(config.get("r_corr_limit", 0.95)),
         kalman_jitter=float(config.get("kalman_jitter", 1.0e-5)),
         transition_kernel_weight=bool(config.get("transition_kernel_weight", False)),
         transition_kernel_weight_init=float(config.get("transition_kernel_weight_init", 1.0)),
@@ -253,6 +283,15 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         transition_residual_decay_max=float(config.get("transition_residual_decay_max", 1.0)),
         transition_control=bool(config.get("transition_control", False)),
         transition_control_scale=float(config.get("transition_control_scale", 0.0)),
+        sigma_scale_init=float(config.get("sigma_scale_init", 1.0)),
+        sigma_scale_min=float(config.get("sigma_scale_min", 1.0)),
+        sigma_scale_max=float(config.get("sigma_scale_max", 1.0)),
+        learnable_sigma_scale=bool(config.get("learnable_sigma_scale", False)),
+        covariance_mode=str(config.get("covariance_mode", "free_cholesky")),
+        covariance_regimes=int(config.get("covariance_regimes", 3)),
+        covariance_floor=float(config.get("covariance_floor", 0.0)),
+        covariance_regime_stds=config.get("covariance_regime_stds"),
+        advection_component_scale=config.get("advection_component_scale"),
     )
 
 
@@ -293,6 +332,9 @@ def sample_window(
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     T = arrays["X"].shape[0]
     if T <= window_size:
@@ -311,7 +353,31 @@ def sample_window(
     advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
     B_star_np = arrays.get("B_star")
     B_star = torch.from_numpy(B_star_np[start:end]).to(device) if B_star_np is not None else None
-    return x, z, nwp_baseline, v_star, advection_anchor, B_star
+    covariance_proxy_np = arrays.get("covariance_proxy")
+    covariance_proxy = torch.from_numpy(covariance_proxy_np[start:end]).to(device) if covariance_proxy_np is not None else None
+    covariance_proxy_primary_np = arrays.get("covariance_proxy_primary")
+    covariance_proxy_primary = (
+        torch.from_numpy(covariance_proxy_primary_np[start:end]).to(device)
+        if covariance_proxy_primary_np is not None
+        else None
+    )
+    covariance_proxy_secondary_np = arrays.get("covariance_proxy_secondary")
+    covariance_proxy_secondary = (
+        torch.from_numpy(covariance_proxy_secondary_np[start:end]).to(device)
+        if covariance_proxy_secondary_np is not None
+        else None
+    )
+    return (
+        x,
+        z,
+        nwp_baseline,
+        v_star,
+        advection_anchor,
+        B_star,
+        covariance_proxy,
+        covariance_proxy_primary,
+        covariance_proxy_secondary,
+    )
 
 
 def slice_arrays(
@@ -397,6 +463,37 @@ def parse_int_list(raw: Any) -> list[int]:
     return [int(item) for item in raw]
 
 
+def build_covariance_proxy_arrays(data: dict[str, Any], config: dict[str, Any]) -> dict[str, np.ndarray | None]:
+    proxy_mode = str(config.get("covariance_proxy_mode", "nwp_vs_pattern")).lower()
+    if proxy_mode in {"none", "off", "false"}:
+        return {
+            "covariance_proxy": None,
+            "covariance_proxy_primary": None,
+            "covariance_proxy_secondary": None,
+        }
+    primary_key = str(config.get("covariance_proxy_primary", "V_nwp_star"))
+    secondary_key = str(config.get("covariance_proxy_secondary", "V_pattern_star"))
+    primary = data.get(primary_key)
+    secondary = data.get(secondary_key)
+    if primary is None or secondary is None:
+        return {
+            "covariance_proxy": None,
+            "covariance_proxy_primary": primary,
+            "covariance_proxy_secondary": secondary,
+        }
+    primary_arr = np.asarray(primary, dtype=np.float32)
+    secondary_arr = np.asarray(secondary, dtype=np.float32)
+    diff = primary_arr - secondary_arr
+    valid = np.isfinite(diff).all(axis=-1)
+    proxy = np.zeros(diff.shape[0], dtype=np.float32)
+    proxy[valid] = np.sum(diff[valid] * diff[valid], axis=-1).astype(np.float32, copy=False)
+    return {
+        "covariance_proxy": proxy,
+        "covariance_proxy_primary": primary_arr,
+        "covariance_proxy_secondary": secondary_arr,
+    }
+
+
 def lambda_multistep_for_stage(config: dict[str, Any], stage: str) -> float:
     stages = config.get("multistep_stages", ["joint"])
     if isinstance(stages, str):
@@ -424,6 +521,20 @@ def training_loss_kwargs(config: dict[str, Any], stage: str) -> dict[str, Any]:
         "lambda_reg": float(config.get(f"{prefix}lambda_reg", config.get("lambda_reg", 0.0001))),
         "lambda_multistep": float(
             config.get(f"{prefix}lambda_multistep", lambda_multistep_for_stage(config, stage))
+        ),
+        "lambda_sigma_ratio": float(
+            config.get(f"{prefix}lambda_sigma_ratio", config.get("lambda_sigma_ratio", 0.0))
+        ),
+        "sigma_ratio_min": float(config.get(f"{prefix}sigma_ratio_min", config.get("sigma_ratio_min", 0.05))),
+        "sigma_ratio_max": float(config.get(f"{prefix}sigma_ratio_max", config.get("sigma_ratio_max", 0.5))),
+        "lambda_covariance_proxy": float(
+            config.get(f"{prefix}lambda_covariance_proxy", config.get("lambda_covariance_proxy", 0.0))
+        ),
+        "covariance_proxy_floor": float(
+            config.get(f"{prefix}covariance_proxy_floor", config.get("covariance_proxy_floor", 1.0e-4))
+        ),
+        "lambda_calibration": float(
+            config.get(f"{prefix}lambda_calibration", config.get("lambda_calibration", 0.0))
         ),
         "multistep_horizons": parse_int_list(horizons),
         "multistep_max_origins": int(
@@ -472,6 +583,24 @@ def validation_losses(
             advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
             B_star_np = val_arrays.get("B_star")
             B_star = torch.from_numpy(B_star_np[start:end]).to(device) if B_star_np is not None else None
+            covariance_proxy_np = val_arrays.get("covariance_proxy")
+            covariance_proxy = (
+                torch.from_numpy(covariance_proxy_np[start:end]).to(device)
+                if covariance_proxy_np is not None
+                else None
+            )
+            covariance_proxy_primary_np = val_arrays.get("covariance_proxy_primary")
+            covariance_proxy_primary = (
+                torch.from_numpy(covariance_proxy_primary_np[start:end]).to(device)
+                if covariance_proxy_primary_np is not None
+                else None
+            )
+            covariance_proxy_secondary_np = val_arrays.get("covariance_proxy_secondary")
+            covariance_proxy_secondary = (
+                torch.from_numpy(covariance_proxy_secondary_np[start:end]).to(device)
+                if covariance_proxy_secondary_np is not None
+                else None
+            )
             losses = base_model.training_losses(
                 x=x,
                 z=z,
@@ -480,6 +609,9 @@ def validation_losses(
                 advection_anchor=advection_anchor,
                 B_star=B_star,
                 nwp_baseline=nwp_baseline,
+                covariance_proxy=covariance_proxy,
+                covariance_proxy_primary=covariance_proxy_primary,
+                covariance_proxy_secondary=covariance_proxy_secondary,
                 **training_loss_kwargs(config, "joint"),
             )
             for key, value in losses.items():
@@ -508,7 +640,17 @@ def run_epoch(
     sums: dict[str, float] = {}
 
     for _ in range(steps):
-        x, z, nwp_baseline, v_star, advection_anchor, B_star = sample_window(arrays, window_size, device)
+        (
+            x,
+            z,
+            nwp_baseline,
+            v_star,
+            advection_anchor,
+            B_star,
+            covariance_proxy,
+            covariance_proxy_primary,
+            covariance_proxy_secondary,
+        ) = sample_window(arrays, window_size, device)
         optimizer.zero_grad(set_to_none=True)
 
         if isinstance(model, (VectorMIDETrainingModule, DistributedDataParallel)):
@@ -520,6 +662,9 @@ def run_epoch(
                 v_star=v_star,
                 advection_anchor=advection_anchor,
                 B_star=B_star,
+                covariance_proxy=covariance_proxy,
+                covariance_proxy_primary=covariance_proxy_primary,
+                covariance_proxy_secondary=covariance_proxy_secondary,
                 stage=stage,
                 loss_kwargs=training_loss_kwargs(config, stage),
             )
@@ -532,6 +677,9 @@ def run_epoch(
                 advection_anchor=advection_anchor,
                 B_star=B_star,
                 nwp_baseline=nwp_baseline,
+                covariance_proxy=covariance_proxy,
+                covariance_proxy_primary=covariance_proxy_primary,
+                covariance_proxy_secondary=covariance_proxy_secondary,
                 stage=stage,
                 loss_kwargs=training_loss_kwargs(config, stage),
             )
@@ -596,6 +744,7 @@ def main() -> None:
     if is_main_process():
         print_data_input_summary(data, "offline")
 
+    covariance_arrays = build_covariance_proxy_arrays(data, config)
     arrays = {
         "X": data["X"],
         "Z": data["Z"],
@@ -603,6 +752,7 @@ def main() -> None:
         "V_star": data["V_star"],
         "A_anchor": data.get("A_anchor"),
         "B_star": data.get("B_star"),
+        **covariance_arrays,
     }
     train_arrays, val_arrays, val_starts = split_train_validation(arrays, config)
     if val_arrays is not None and is_main_process():
@@ -626,7 +776,17 @@ def main() -> None:
     optimizer = build_optimizer(train_model, config)
 
     if args.dry_run:
-        x, z, nwp_baseline, v_star, advection_anchor, B_star = sample_window(
+        (
+            x,
+            z,
+            nwp_baseline,
+            v_star,
+            advection_anchor,
+            B_star,
+            covariance_proxy,
+            covariance_proxy_primary,
+            covariance_proxy_secondary,
+        ) = sample_window(
             arrays,
             min(16, arrays["X"].shape[0]),
             device,
@@ -640,6 +800,9 @@ def main() -> None:
                 advection_anchor=advection_anchor,
                 B_star=B_star,
                 nwp_baseline=nwp_baseline,
+                covariance_proxy=covariance_proxy,
+                covariance_proxy_primary=covariance_proxy_primary,
+                covariance_proxy_secondary=covariance_proxy_secondary,
                 **training_loss_kwargs(config, "joint"),
             )
         if is_main_process():

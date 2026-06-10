@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from dataset.vector_data_utils import load_vector_dataset
 from model.vector_dstm import VectorMIDE
 from train.train_vector_offline import (
+    build_covariance_proxy_arrays,
     build_model,
     checkpoint_name_with_suffix,
     print_data_input_summary,
@@ -57,6 +58,8 @@ def configure_online_trainable(
         model.kernel.raw_ell.requires_grad = True
         if getattr(model.kernel, "learnable_gamma", False):
             model.kernel.raw_gamma.requires_grad = True
+        if getattr(model.kernel, "learnable_sigma_scale", False):
+            model.kernel.raw_sigma_scale.requires_grad = True
 
 
 def trainable_parameter_summary(model: VectorMIDE) -> str:
@@ -126,6 +129,9 @@ def window_tensors(
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     x = torch.from_numpy(data["X"][start:end]).to(device)
     z = torch.from_numpy(data["Z"][start:end]).to(device)
@@ -137,7 +143,31 @@ def window_tensors(
     advection_anchor = torch.from_numpy(anchor_np[start:end]).to(device) if anchor_np is not None else None
     B_star = data.get("B_star")
     B = torch.from_numpy(B_star[start:end]).to(device) if B_star is not None else None
-    return x, z, nwp_baseline, v, advection_anchor, B
+    covariance_proxy_np = data.get("covariance_proxy")
+    covariance_proxy = torch.from_numpy(covariance_proxy_np[start:end]).to(device) if covariance_proxy_np is not None else None
+    covariance_proxy_primary_np = data.get("covariance_proxy_primary")
+    covariance_proxy_primary = (
+        torch.from_numpy(covariance_proxy_primary_np[start:end]).to(device)
+        if covariance_proxy_primary_np is not None
+        else None
+    )
+    covariance_proxy_secondary_np = data.get("covariance_proxy_secondary")
+    covariance_proxy_secondary = (
+        torch.from_numpy(covariance_proxy_secondary_np[start:end]).to(device)
+        if covariance_proxy_secondary_np is not None
+        else None
+    )
+    return (
+        x,
+        z,
+        nwp_baseline,
+        v,
+        advection_anchor,
+        B,
+        covariance_proxy,
+        covariance_proxy_primary,
+        covariance_proxy_secondary,
+    )
 
 
 def evaluate_window_loss(
@@ -153,7 +183,17 @@ def evaluate_window_loss(
         return {}
     model.eval()
     with torch.no_grad():
-        x, z, nwp_baseline, v_star, advection_anchor, B_star = window_tensors(data, start, end, device)
+        (
+            x,
+            z,
+            nwp_baseline,
+            v_star,
+            advection_anchor,
+            B_star,
+            covariance_proxy,
+            covariance_proxy_primary,
+            covariance_proxy_secondary,
+        ) = window_tensors(data, start, end, device)
         losses = model.training_losses(
             x=x,
             z=z,
@@ -162,6 +202,9 @@ def evaluate_window_loss(
             advection_anchor=advection_anchor,
             B_star=B_star,
             nwp_baseline=nwp_baseline,
+            covariance_proxy=covariance_proxy,
+            covariance_proxy_primary=covariance_proxy_primary,
+            covariance_proxy_secondary=covariance_proxy_secondary,
             **training_loss_kwargs(config, "online"),
         )
     return {
@@ -312,7 +355,17 @@ def train_one_window(
     lambda_anchor: float,
     grad_clip: float,
 ) -> dict[str, torch.Tensor]:
-    x, z, nwp_baseline, v_star, advection_anchor, B_star = window_tensors(data, start, end, device)
+    (
+        x,
+        z,
+        nwp_baseline,
+        v_star,
+        advection_anchor,
+        B_star,
+        covariance_proxy,
+        covariance_proxy_primary,
+        covariance_proxy_secondary,
+    ) = window_tensors(data, start, end, device)
     optimizer.zero_grad(set_to_none=True)
     losses = model.training_losses(
         x=x,
@@ -320,10 +373,13 @@ def train_one_window(
         coords=coords,
         v_star=v_star,
         advection_anchor=advection_anchor,
-        B_star=B_star,
-        nwp_baseline=nwp_baseline,
-        **training_loss_kwargs(config, "online"),
-    )
+            B_star=B_star,
+            nwp_baseline=nwp_baseline,
+            covariance_proxy=covariance_proxy,
+            covariance_proxy_primary=covariance_proxy_primary,
+            covariance_proxy_secondary=covariance_proxy_secondary,
+            **training_loss_kwargs(config, "online"),
+        )
     current = trainable_named_parameters(model)
     loss = losses["loss"] + lambda_anchor * anchor_loss(current, anchor)
     loss.backward()
@@ -596,6 +652,7 @@ def main() -> None:
     optimizer = build_online_optimizer(model, config)
 
     data = load_vector_dataset(config, split="online", time_limit=args.limit)
+    data.update(build_covariance_proxy_arrays(data, config))
     print_data_input_summary(data, "online")
 
     coords = torch.from_numpy(data["coords"]).to(device)
