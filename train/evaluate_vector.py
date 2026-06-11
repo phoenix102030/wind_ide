@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from dataset.vector_data_utils import load_vector_dataset
-from train.train_vector_offline import build_model, print_device_info, resolve_device
+from train.train_vector_offline import build_covariance_proxy_arrays, build_model, print_device_info, resolve_device
 
 
 STATE_NAMES = ["U1", "U2", "U3", "V1", "V2", "V3"]
@@ -154,6 +154,7 @@ def collect_model_outputs(
         "Sigma": np.zeros((T, 4, 4), dtype=np.float64),
         "alpha": np.zeros((T, 2, 2), dtype=np.float64),
     }
+    static_outputs: dict[str, np.ndarray] = {}
 
     model.eval()
     with torch.no_grad():
@@ -170,6 +171,16 @@ def collect_model_outputs(
             sums["mu"][start:end] += outputs["mu"].detach().cpu().numpy()
             sums["Sigma"][start:end] += outputs["Sigma"].detach().cpu().numpy()
             sums["alpha"][start:end] += outputs["alpha"].detach().cpu().numpy()
+            for key in ("covariance_regime_logits", "covariance_regime_probs", "covariance_scale"):
+                if key not in outputs:
+                    continue
+                value = outputs[key].detach().cpu().numpy()
+                if key not in sums:
+                    sums[key] = np.zeros((T,) + value.shape[1:], dtype=np.float64)
+                sums[key][start:end] += value
+            for key in ("covariance_regime_Sigma",):
+                if key in outputs:
+                    static_outputs[key] = outputs[key].detach().cpu().numpy().astype(np.float32, copy=False)
             counts[start:end] += 1.0
 
     valid = counts[:, 0] > 0
@@ -179,12 +190,9 @@ def collect_model_outputs(
 
     averaged: dict[str, np.ndarray] = {}
     for key, value in sums.items():
-        if value.ndim == 3:
-            averaged[key] = (value / counts[:, :, None]).astype(np.float32)
-        elif value.ndim == 4:
-            averaged[key] = (value / counts[:, :, None, None]).astype(np.float32)
-        else:
-            averaged[key] = (value / counts).astype(np.float32)
+        denom = counts.reshape((T,) + (1,) * (value.ndim - 1))
+        averaged[key] = (value / denom).astype(np.float32)
+    averaged.update(static_outputs)
     return averaged
 
 
@@ -232,6 +240,103 @@ def advection_summary(mu: np.ndarray, Sigma: np.ndarray, alpha: np.ndarray) -> d
             name: float(value) for name, value in zip(ALPHA_NAMES, np.nanmean(alpha.reshape(alpha.shape[0], 4), axis=0))
         },
     }
+
+
+def component_projection_np(target_idx: int, source_idx: int, gamma: float) -> np.ndarray:
+    e_u = np.asarray([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float64)
+    e_v = np.asarray([[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
+    selectors = (e_u, e_v)
+    if target_idx == source_idx:
+        return selectors[target_idx]
+    return selectors[target_idx] - float(gamma) * selectors[source_idx]
+
+
+def covariance_kernel_diagnostics(
+    Sigma: np.ndarray,
+    ell: np.ndarray,
+    gamma: float,
+    sigma_scale: float,
+) -> dict[str, np.ndarray]:
+    sigma = np.asarray(Sigma, dtype=np.float64)
+    ell_arr = np.asarray(ell, dtype=np.float64)
+    T = sigma.shape[0]
+    eye2 = np.eye(2, dtype=np.float64)
+    projected_sigma = np.zeros((T, 2, 2, 2, 2), dtype=np.float32)
+    effective_D = np.zeros((T, 2, 2, 2, 2), dtype=np.float32)
+    projected_trace = np.zeros((T, 2, 2), dtype=np.float32)
+    base_trace = np.zeros((2, 2), dtype=np.float32)
+    ratio = np.zeros((T, 2, 2), dtype=np.float32)
+    for i in range(2):
+        for j in range(2):
+            projection = component_projection_np(i, j, float(gamma))
+            projected = np.einsum("ab,tbc,dc->tad", projection, sigma, projection)
+            scaled_projected = float(sigma_scale) * 2.0 * projected
+            base = float(ell_arr[i, j]) ** 2 * eye2
+            D = base[None, :, :] + scaled_projected
+            projected_sigma[:, i, j] = scaled_projected.astype(np.float32, copy=False)
+            effective_D[:, i, j] = D.astype(np.float32, copy=False)
+            projected_trace[:, i, j] = np.trace(scaled_projected, axis1=1, axis2=2).astype(np.float32, copy=False)
+            base_trace[i, j] = np.float32(2.0 * float(ell_arr[i, j]) ** 2)
+            ratio[:, i, j] = projected_trace[:, i, j] / max(float(base_trace[i, j]), 1.0e-12)
+    return {
+        "projected_sigma": projected_sigma,
+        "effective_diffusion_D": effective_D,
+        "projected_sigma_trace": projected_trace,
+        "effective_diffusion_trace": np.trace(effective_D, axis1=-2, axis2=-1).astype(np.float32, copy=False),
+        "base_diffusion_trace": base_trace,
+        "projected_sigma_ratio": ratio,
+        "projected_sigma_ratio_mean": np.nanmean(ratio.reshape(T, 4), axis=1).astype(np.float32, copy=False),
+    }
+
+
+def covariance_diagnostics_summary(artifacts: dict[str, np.ndarray]) -> dict[str, Any]:
+    ratio = artifacts.get("projected_sigma_ratio")
+    out: dict[str, Any] = {}
+    if ratio is not None:
+        flat = np.asarray(ratio, dtype=np.float64).reshape(ratio.shape[0], -1)
+        out["projected_sigma_ratio_mean"] = float(np.nanmean(flat))
+        out["projected_sigma_ratio_quantiles"] = {
+            str(q): float(v)
+            for q, v in zip(
+                [0.0, 0.1, 0.5, 0.9, 0.99, 1.0],
+                np.nanquantile(flat, [0.0, 0.1, 0.5, 0.9, 0.99, 1.0]),
+            )
+        }
+    regime_probs = artifacts.get("covariance_regime_probs")
+    if regime_probs is not None:
+        regime_probs64 = np.asarray(regime_probs, dtype=np.float64)
+        out["covariance_regime_prob_mean"] = {
+            f"pi_{i + 1}": float(v) for i, v in enumerate(np.nanmean(regime_probs64, axis=0))
+        }
+        out["covariance_regime_prob_std"] = {
+            f"pi_{i + 1}": float(v) for i, v in enumerate(np.nanstd(regime_probs64, axis=0))
+        }
+    regime_sigma = artifacts.get("covariance_regime_Sigma")
+    if regime_sigma is not None:
+        traces = np.trace(np.asarray(regime_sigma, dtype=np.float64), axis1=1, axis2=2)
+        out["covariance_regime_trace"] = {
+            f"Sigma_{i + 1}": float(v) for i, v in enumerate(traces)
+        }
+    proxy = artifacts.get("covariance_proxy")
+    ratio_mean = artifacts.get("projected_sigma_ratio_mean")
+    if proxy is not None and ratio_mean is not None:
+        out["proxy_ratio_correlation"] = corrcoef_finite(
+            np.asarray(proxy, dtype=np.float64),
+            np.asarray(ratio_mean, dtype=np.float64),
+        )
+    covariance_scale = artifacts.get("covariance_scale")
+    if covariance_scale is not None:
+        scale = np.asarray(covariance_scale, dtype=np.float64).reshape(-1)
+        out["covariance_scale_mean"] = float(np.nanmean(scale))
+        out["covariance_scale_std"] = float(np.nanstd(scale))
+        out["covariance_scale_quantiles"] = {
+            str(q): float(v)
+            for q, v in zip(
+                [0.0, 0.1, 0.5, 0.9, 0.99, 1.0],
+                np.nanquantile(scale, [0.0, 0.1, 0.5, 0.9, 0.99, 1.0]),
+            )
+        }
+    return out
 
 
 def advection_validation_summary(
@@ -469,6 +574,21 @@ def evaluate(
         "coords": data["coords"].astype(np.float32, copy=False),
         "baseline_grid_indices": data.get("baseline_grid_indices", np.empty((0, 2), dtype=np.int64)),
     }
+    for key in ("covariance_regime_logits", "covariance_regime_probs", "covariance_regime_Sigma"):
+        if key in outputs:
+            artifacts[key] = outputs[key]
+    if "covariance_scale" in outputs:
+        artifacts["covariance_scale"] = outputs["covariance_scale"]
+    if data.get("covariance_proxy") is not None:
+        artifacts["covariance_proxy"] = np.asarray(data["covariance_proxy"], dtype=np.float32)
+    artifacts.update(
+        covariance_kernel_diagnostics(
+            Sigma=outputs["Sigma"],
+            ell=ell,
+            gamma=float(gamma),
+            sigma_scale=float(kernel_sigma_scale),
+        )
+    )
 
     results = {
         "kalman_nll_per_observation": float(kf["nll_sum"].detach().cpu())
@@ -491,6 +611,7 @@ def evaluate(
             optical_flow_np,
         ),
         "transition": transition_summary(outputs["M"], outputs["M_base"], ell),
+        "covariance_diagnostics": covariance_diagnostics_summary(artifacts),
         "eval_window_size": eval_window_size,
         "eval_stride": eval_stride,
     }
@@ -533,42 +654,75 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
         M_row_sums=np.nansum(artifacts["transition_matrices"], axis=2),
         state_names=np.asarray(STATE_NAMES),
     )
-    np.savez_compressed(
-        output_dir / "advection_parameters.npz",
-        mu=artifacts["mu"],
-        Au=artifacts["Au"],
-        Av=artifacts["Av"],
-        Sigma=artifacts["Sigma"],
-        Sigma_diag=artifacts["Sigma_diag"],
-        alpha=artifacts["alpha"],
-        advection_training_target=artifacts["advection_training_target"],
-        advection_anchor=artifacts["advection_anchor"],
-        nwp_wind_displacement=artifacts["nwp_wind_displacement"],
-        nwp_advection_target=artifacts["nwp_advection_target"],
-        optical_flow_advection=artifacts["optical_flow_advection"],
-        ell=artifacts["ell"],
-        gamma=artifacts["gamma"],
-        kernel_sigma_scale=artifacts["kernel_sigma_scale"],
-        kernel_dt=artifacts["kernel_dt"],
-        Q=artifacts["Q"],
-        R=artifacts["R"],
-        coords=artifacts["coords"],
-        baseline_grid_indices=artifacts["baseline_grid_indices"],
-        advection_names=np.asarray(ADV_NAMES),
-        sigma_diag_names=np.asarray(SIGMA_DIAG_NAMES),
-        alpha_names=np.asarray(ALPHA_NAMES),
-        state_names=np.asarray(STATE_NAMES),
-    )
+    advection_payload = {
+        "mu": artifacts["mu"],
+        "Au": artifacts["Au"],
+        "Av": artifacts["Av"],
+        "Sigma": artifacts["Sigma"],
+        "Sigma_diag": artifacts["Sigma_diag"],
+        "alpha": artifacts["alpha"],
+        "advection_training_target": artifacts["advection_training_target"],
+        "advection_anchor": artifacts["advection_anchor"],
+        "nwp_wind_displacement": artifacts["nwp_wind_displacement"],
+        "nwp_advection_target": artifacts["nwp_advection_target"],
+        "optical_flow_advection": artifacts["optical_flow_advection"],
+        "ell": artifacts["ell"],
+        "gamma": artifacts["gamma"],
+        "kernel_sigma_scale": artifacts["kernel_sigma_scale"],
+        "kernel_dt": artifacts["kernel_dt"],
+        "Q": artifacts["Q"],
+        "R": artifacts["R"],
+        "coords": artifacts["coords"],
+        "baseline_grid_indices": artifacts["baseline_grid_indices"],
+        "advection_names": np.asarray(ADV_NAMES),
+        "sigma_diag_names": np.asarray(SIGMA_DIAG_NAMES),
+        "alpha_names": np.asarray(ALPHA_NAMES),
+        "state_names": np.asarray(STATE_NAMES),
+    }
+    for key in (
+        "covariance_regime_logits",
+        "covariance_regime_probs",
+        "covariance_regime_Sigma",
+        "covariance_scale",
+        "covariance_proxy",
+        "projected_sigma",
+        "effective_diffusion_D",
+        "projected_sigma_trace",
+        "effective_diffusion_trace",
+        "base_diffusion_trace",
+        "projected_sigma_ratio",
+        "projected_sigma_ratio_mean",
+    ):
+        if key in artifacts:
+            advection_payload[key] = artifacts[key]
+    np.savez_compressed(output_dir / "advection_parameters.npz", **advection_payload)
 
-    param_csv = np.column_stack(
-        [
-            np.arange(artifacts["mu"].shape[0]),
-            artifacts["mu"],
-            artifacts["Sigma_diag"],
-            artifacts["alpha"].reshape(artifacts["alpha"].shape[0], 4),
-        ]
-    )
-    header = ",".join(["time_index", *ADV_NAMES, *SIGMA_DIAG_NAMES, *ALPHA_NAMES])
+    param_columns = [
+        np.arange(artifacts["mu"].shape[0])[:, None],
+        artifacts["mu"],
+        artifacts["Sigma_diag"],
+        artifacts["alpha"].reshape(artifacts["alpha"].shape[0], 4),
+    ]
+    header_names = ["time_index", *ADV_NAMES, *SIGMA_DIAG_NAMES, *ALPHA_NAMES]
+    if "projected_sigma_ratio_mean" in artifacts:
+        param_columns.append(artifacts["projected_sigma_ratio_mean"][:, None])
+        header_names.append("projected_sigma_ratio_mean")
+    if "projected_sigma_ratio" in artifacts:
+        ratio = artifacts["projected_sigma_ratio"].reshape(artifacts["projected_sigma_ratio"].shape[0], 4)
+        param_columns.append(ratio)
+        header_names.extend(["ratio_uu", "ratio_uv", "ratio_vu", "ratio_vv"])
+    if "covariance_scale" in artifacts:
+        param_columns.append(artifacts["covariance_scale"].reshape(-1, 1))
+        header_names.append("covariance_scale")
+    if "covariance_proxy" in artifacts:
+        param_columns.append(artifacts["covariance_proxy"].reshape(-1, 1))
+        header_names.append("covariance_proxy")
+    if "covariance_regime_probs" in artifacts:
+        probs = artifacts["covariance_regime_probs"]
+        param_columns.append(probs)
+        header_names.extend([f"pi_{idx + 1}" for idx in range(probs.shape[1])])
+    param_csv = np.column_stack(param_columns)
+    header = ",".join(header_names)
     np.savetxt(output_dir / "time_parameters.csv", param_csv, delimiter=",", header=header, comments="")
 
 
@@ -1063,6 +1217,78 @@ def save_plots(output_dir: Path, artifacts: dict[str, np.ndarray], max_points: i
 
     line_plot(plots_dir / "advection_mu.png", artifacts["mu"], ADV_NAMES, "Advection mean", "km / step", max_points)
     line_plot(plots_dir / "advection_sigma_diag.png", artifacts["Sigma_diag"], SIGMA_DIAG_NAMES, "Advection covariance diagonal", "variance", max_points)
+    if "covariance_regime_probs" in artifacts:
+        probs = artifacts["covariance_regime_probs"]
+        line_plot(
+            plots_dir / "covariance_regime_probs.png",
+            probs,
+            [f"pi_{idx + 1}" for idx in range(probs.shape[1])],
+            "Covariance regime probabilities",
+            "probability",
+            max_points,
+        )
+    if "projected_sigma_ratio" in artifacts:
+        ratio = artifacts["projected_sigma_ratio"].reshape(artifacts["projected_sigma_ratio"].shape[0], 4)
+        values = np.column_stack([artifacts["projected_sigma_ratio_mean"], ratio])
+        line_plot(
+            plots_dir / "projected_sigma_ratio.png",
+            values,
+            ["mean", "uu", "uv", "vu", "vv"],
+            "Projected covariance contribution ratio",
+            r"trace(lambda * 2P Sigma P^T) / trace(ell^2 I)",
+            max_points,
+        )
+    if "covariance_scale" in artifacts:
+        line_plot(
+            plots_dir / "covariance_scale.png",
+            artifacts["covariance_scale"].reshape(-1, 1),
+            ["covariance_scale"],
+            "Dynamic covariance scale",
+            "scale",
+            max_points,
+        )
+    if "covariance_proxy" in artifacts:
+        line_plot(
+            plots_dir / "covariance_proxy.png",
+            artifacts["covariance_proxy"].reshape(-1, 1),
+            ["covariance_proxy"],
+            "Covariance proxy",
+            "proxy",
+            max_points,
+        )
+    if "effective_diffusion_trace" in artifacts:
+        diffusion_trace = artifacts["effective_diffusion_trace"].reshape(
+            artifacts["effective_diffusion_trace"].shape[0],
+            4,
+        )
+        line_plot(
+            plots_dir / "effective_diffusion_trace.png",
+            diffusion_trace,
+            ["D_uu", "D_uv", "D_vu", "D_vv"],
+            "Effective kernel diffusion trace",
+            r"trace(D_t)",
+            max_points,
+        )
+    if "effective_diffusion_D" in artifacts:
+        mean_blocks = np.nanmean(artifacts["effective_diffusion_D"], axis=0)
+        mean_D = np.block([[mean_blocks[0, 0], mean_blocks[0, 1]], [mean_blocks[1, 0], mean_blocks[1, 1]]])
+        heatmap(
+            plots_dir / "effective_diffusion_D_mean.png",
+            mean_D,
+            "Mean effective diffusion D",
+            ["Ux src", "Uy src", "Vx src", "Vy src"],
+            ["Ux tgt", "Uy tgt", "Vx tgt", "Vy tgt"],
+            center_zero=False,
+        )
+    if "covariance_regime_Sigma" in artifacts:
+        traces = np.trace(artifacts["covariance_regime_Sigma"], axis1=1, axis2=2).reshape(-1, 1)
+        heatmap(
+            plots_dir / "covariance_regime_trace.png",
+            traces,
+            "Covariance regime trace",
+            ["trace"],
+            [f"Sigma_{idx + 1}" for idx in range(traces.shape[0])],
+        )
     line_plot(
         plots_dir / "advection_speed.png",
         np.column_stack(
@@ -1224,6 +1450,7 @@ def main() -> None:
     eval_stride = int(args.eval_stride or eval_window_size)
     forecast_horizon = int(args.forecast_horizon or config.get("forecast_horizon", 1))
     data = load_vector_dataset(config, split=args.split, time_limit=args.limit)
+    data.update(build_covariance_proxy_arrays(data, model_config))
 
     results, artifacts = evaluate(
         model=model,

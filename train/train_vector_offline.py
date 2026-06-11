@@ -79,6 +79,11 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 covariance_proxy_secondary=covariance_proxy_secondary,
                 floor=float(loss_kwargs.get("covariance_proxy_floor", 1.0e-4)),
             )
+            loss_covariance_correlation = self.model.covariance_correlation_loss(
+                outputs,
+                covariance_proxy=covariance_proxy,
+            )
+            loss_regime_usage = self.model.regime_usage_loss(outputs)
             loss = (
                 loss_adv
                 + float(loss_kwargs.get("lambda_deform", 0.0)) * loss_deform
@@ -86,6 +91,8 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 + float(loss_kwargs.get("lambda_smooth", 0.001)) * loss_smooth
                 + float(loss_kwargs.get("lambda_sigma_ratio", 0.0)) * loss_sigma_ratio
                 + float(loss_kwargs.get("lambda_covariance_proxy", 0.0)) * loss_covariance_proxy
+                + float(loss_kwargs.get("lambda_covariance_correlation", 0.0)) * loss_covariance_correlation
+                + float(loss_kwargs.get("lambda_regime_usage", 0.0)) * loss_regime_usage
             )
             return {
                 "loss": loss,
@@ -95,6 +102,8 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 "loss_smooth": loss_smooth,
                 "loss_sigma_ratio": loss_sigma_ratio,
                 "loss_covariance_proxy": loss_covariance_proxy,
+                "loss_covariance_correlation": loss_covariance_correlation,
+                "loss_regime_usage": loss_regime_usage,
                 **outputs,
             }
         if stage == "kf":
@@ -291,6 +300,10 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         covariance_regimes=int(config.get("covariance_regimes", 3)),
         covariance_floor=float(config.get("covariance_floor", 0.0)),
         covariance_regime_stds=config.get("covariance_regime_stds"),
+        covariance_dynamic_scale=bool(config.get("covariance_dynamic_scale", False)),
+        covariance_scale_init=float(config.get("covariance_scale_init", 1.0)),
+        covariance_scale_min=float(config.get("covariance_scale_min", 0.25)),
+        covariance_scale_max=float(config.get("covariance_scale_max", 4.0)),
         advection_component_scale=config.get("advection_component_scale"),
     )
 
@@ -532,6 +545,15 @@ def training_loss_kwargs(config: dict[str, Any], stage: str) -> dict[str, Any]:
         ),
         "covariance_proxy_floor": float(
             config.get(f"{prefix}covariance_proxy_floor", config.get("covariance_proxy_floor", 1.0e-4))
+        ),
+        "lambda_covariance_correlation": float(
+            config.get(
+                f"{prefix}lambda_covariance_correlation",
+                config.get("lambda_covariance_correlation", 0.0),
+            )
+        ),
+        "lambda_regime_usage": float(
+            config.get(f"{prefix}lambda_regime_usage", config.get("lambda_regime_usage", 0.0))
         ),
         "lambda_calibration": float(
             config.get(f"{prefix}lambda_calibration", config.get("lambda_calibration", 0.0))

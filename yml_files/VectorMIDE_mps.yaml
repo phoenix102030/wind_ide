@@ -35,11 +35,15 @@ advection_mode: component
 deformation_scale: 0.3
 anchored_advection: true
 advection_residual_scale: 1.0
-advection_component_scale: [1.1, 0.9, 0.9, 1.1]
+advection_component_scale: [1.2, 0.8, 0.8, 1.2]
 covariance_mode: regime
 covariance_regimes: 3
-covariance_regime_stds: [0.25, 1.0, 3.0]
-covariance_floor: 0.05
+covariance_regime_stds: [0.3, 1.0, 3.0]
+covariance_floor: 0.03
+covariance_dynamic_scale: true
+covariance_scale_init: 1.0
+covariance_scale_min: 0.25
+covariance_scale_max: 4.0
 
 dt: 1.0
 dt_seconds: 600.0
@@ -52,14 +56,14 @@ use_spectral_scaling: false
 spectral_radius: 0.98
 kernel_jitter: 1.0e-5
 kalman_jitter: 1.0e-5
-ell_init: 30.0
-ell_min: 8.0
-ell_max: 80.0
+ell_init: 4.0
+ell_min: 2.0
+ell_max: 12.0
 learnable_ell: true
-sigma_scale_init: 100.0
-sigma_scale_min: 1.0
-sigma_scale_max: 10000.0
-learnable_sigma_scale: true
+sigma_scale_init: 10.0
+sigma_scale_min: 10.0
+sigma_scale_max: 10.0
+learnable_sigma_scale: false
 
 q_init: 0.2
 r_init: 0.2
@@ -101,10 +105,12 @@ adv_lambda_advection_residual: 0.01
 lambda_smooth: 0.001
 lambda_reg: 0.0001
 lambda_multistep: 0.2
-lambda_sigma_ratio: 0.02
+lambda_sigma_ratio: 0.05
 sigma_ratio_min: 0.05
 sigma_ratio_max: 0.5
-lambda_covariance_proxy: 0.0001
+lambda_covariance_proxy: 0.001
+lambda_covariance_correlation: 0.02
+lambda_regime_usage: 0.005
 covariance_proxy_floor: 0.05
 lambda_calibration: 0.0001
 covariance_proxy_mode: nwp_vs_pattern

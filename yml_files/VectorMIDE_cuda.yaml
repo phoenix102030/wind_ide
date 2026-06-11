@@ -1,5 +1,5 @@
 experiment_type: VectorMIDE
-seed: 123
+seed: 234
 device: cuda
 allow_device_fallback: false
 
@@ -36,11 +36,15 @@ deformation_scale: 0.3
 anchored_advection: true
 advection_residual_scale: 1.0
 # Manual component prior for [u_x, u_y, v_x, v_y]. Keep an ablation at [1,1,1,1].
-advection_component_scale: [1.1, 0.9, 0.9, 1.1]
+advection_component_scale: [ 1.2, 0.8, 0.8, 1.2 ]
 covariance_mode: regime
 covariance_regimes: 3
-covariance_regime_stds: [0.25, 1.0, 3.0]
-covariance_floor: 0.05
+covariance_regime_stds: [ 0.3, 1.0, 3.0 ]
+covariance_floor: 0.03
+covariance_dynamic_scale: true
+covariance_scale_init: 1.0
+covariance_scale_min: 0.25
+covariance_scale_max: 4.0
 
 dt: 1.0
 dt_seconds: 600.0
@@ -53,22 +57,22 @@ use_spectral_scaling: false
 spectral_radius: 0.98
 kernel_jitter: 1e-5
 kalman_jitter: 1e-5
-ell_init: 30.0
-ell_min: 8.0
-ell_max: 80.0
+ell_init: 4.0
+ell_min: 2.0
+ell_max: 12.0
 learnable_ell: true
-sigma_scale_init: 100.0
-sigma_scale_min: 1.0
-sigma_scale_max: 10000.0
-learnable_sigma_scale: true
+sigma_scale_init: 10.0
+sigma_scale_min: 10.0
+sigma_scale_max: 10.0
+learnable_sigma_scale: false
 
-q_init: 0.2
-r_init: 0.2
+q_init: 0.15
+r_init: 0.15
 bounded_qr: true
 q_std_min: 0.03
-q_std_max: 0.45
+q_std_max: 0.30
 r_std_min: 0.03
-r_std_max: 0.40
+r_std_max: 0.30
 q_corr_limit: 0.6
 r_corr_limit: 0.6
 
@@ -102,24 +106,26 @@ adv_lambda_advection_residual: 0.01
 lambda_smooth: 0.001
 lambda_reg: 0.0001
 lambda_multistep: 0.2
-lambda_sigma_ratio: 0.02
+lambda_sigma_ratio: 0.05
 sigma_ratio_min: 0.05
 sigma_ratio_max: 0.5
-lambda_covariance_proxy: 0.0001
+lambda_covariance_proxy: 0.001
+lambda_covariance_correlation: 0.02
+lambda_regime_usage: 0.005
 covariance_proxy_floor: 0.05
 lambda_calibration: 0.0001
 covariance_proxy_mode: nwp_vs_pattern
 covariance_proxy_primary: V_nwp_star
 covariance_proxy_secondary: V_pattern_star
-multistep_horizons: [1, 2, 3, 6, 9, 12, 18, 24, 36]
+multistep_horizons: [ 1, 2, 3, 6, 9, 12, 18, 24, 36 ]
 multistep_max_origins: 256
-multistep_stages: [joint, online]
+multistep_stages: [ joint, online ]
 hybrid_first_horizon_direct: true
 hybrid_direct_horizon_steps: 6
 lambda_anchor: 0.01
 
-offline_epochs_pretrain_adv: 20
-offline_epochs_kf: 10
+offline_epochs_pretrain_adv: 1
+offline_epochs_kf: 1
 offline_epochs_finetune: 250
 
 online_window_size: 168
@@ -135,18 +141,18 @@ online_min_delta: 0.0
 online_checkpoint_every_updates: 0
 online_adaptation_scope: output_head
 online_update_ell: false
-online_lr: 5.0e-5
+online_lr: 5e-5
 online_lambda_adv: 0.0
 online_lambda_deform: 0.0
 online_lambda_multistep: 0.1
-online_multistep_horizons: [1, 3, 6, 12, 24, 36]
+online_multistep_horizons: [ 1, 3, 6, 12, 24, 36 ]
 online_require_improvement_over_initial: true
 online_global_steps: 1000
 global_online_checkpoint_name: vector_mide_online_cuda_global.pt
 initial_global_online_checkpoint_name: vector_mide_online_cuda_global_initial.pt
 last_global_online_checkpoint_name: vector_mide_online_cuda_global_last.pt
 
-checkpoint_dir: outputs/cnn_transformer_new
+checkpoint_dir: outputs/A1_sigma_bkup
 offline_checkpoint_name: vector_mide_offline_cuda.pt
 last_offline_checkpoint_name: vector_mide_offline_cuda_last.pt
 offline_checkpoint_every_epochs: 25
@@ -177,7 +183,7 @@ data:
   - [ 18, 18 ]
   - [ 20, 20 ]
   - [ 22, 22 ]
-  advection_anchor_mode: pattern_tracking
+  advection_anchor_mode: nwp
   advection_label_mode: anchor
   advection_nwp_weight: 0.75
   advection_anchor_nwp_weight: 0.5
@@ -188,7 +194,7 @@ data:
   deformation_label_mode: none
   deformation_label_clip: 0.3
   optical_flow_stride: 2
-  optical_flow_ridge: 1.0e-4
+  optical_flow_ridge: 1e-4
   patch_radius: 2
   standardize_x: true
   standardize_z: false

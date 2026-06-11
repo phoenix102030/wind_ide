@@ -325,6 +325,10 @@ class VectorMIDE(nn.Module):
         covariance_regimes: int = 3,
         covariance_floor: float = 0.0,
         covariance_regime_stds: Sequence[float] | None = None,
+        covariance_dynamic_scale: bool = False,
+        covariance_scale_init: float = 1.0,
+        covariance_scale_min: float = 0.25,
+        covariance_scale_max: float = 4.0,
         advection_component_scale: Sequence[float] | None = None,
     ) -> None:
         super().__init__()
@@ -362,6 +366,10 @@ class VectorMIDE(nn.Module):
             covariance_regimes=covariance_regimes,
             covariance_floor=covariance_floor,
             covariance_regime_stds=covariance_regime_stds,
+            covariance_dynamic_scale=covariance_dynamic_scale,
+            covariance_scale_init=covariance_scale_init,
+            covariance_scale_min=covariance_scale_min,
+            covariance_scale_max=covariance_scale_max,
             advection_component_scale=advection_component_scale,
         )
         self.kernel = VectorLagrangianKernel(
@@ -640,6 +648,42 @@ class VectorMIDE(nn.Module):
         pred_trace = torch.diagonal(sigma[valid], dim1=-2, dim2=-1).sum(dim=-1)
         return (torch.log(pred_trace.clamp_min(eps)) - torch.log(target_trace.clamp_min(eps))).pow(2).mean()
 
+    def covariance_correlation_loss(
+        self,
+        outputs: dict[str, Tensor],
+        covariance_proxy: Optional[Tensor],
+        eps: float = 1.0e-8,
+    ) -> Tensor:
+        if covariance_proxy is None or outputs.get("Sigma") is None:
+            return outputs["mu"].new_tensor(0.0)
+        ratio = self.projected_sigma_ratio(outputs)
+        proxy = covariance_proxy.to(device=ratio.device, dtype=ratio.dtype).reshape(-1)
+        if proxy.shape[0] != ratio.shape[0]:
+            raise ValueError(f"Expected covariance_proxy length {ratio.shape[0]}, got {proxy.shape[0]}")
+        valid = torch.isfinite(ratio) & torch.isfinite(proxy)
+        if valid.sum() < 3:
+            return ratio.new_tensor(0.0)
+        pred = torch.log(ratio[valid].clamp_min(eps))
+        target = self._normalize_proxy(proxy[valid])
+        pred_centered = pred - pred.mean()
+        target_centered = target - target.mean()
+        pred_std = pred_centered.pow(2).mean().sqrt()
+        target_std = target_centered.pow(2).mean().sqrt()
+        if float(target_std.detach().cpu()) <= eps:
+            return ratio.new_tensor(0.0)
+        corr = (pred_centered * target_centered).mean() / (pred_std * target_std).clamp_min(eps)
+        return 1.0 - corr.clamp(-1.0, 1.0)
+
+    @staticmethod
+    def regime_usage_loss(outputs: dict[str, Tensor], eps: float = 1.0e-8) -> Tensor:
+        probs = outputs.get("covariance_regime_probs")
+        if probs is None:
+            return outputs["mu"].new_tensor(0.0)
+        probs = probs.clamp_min(eps)
+        mean_probs = probs.mean(dim=0)
+        target = mean_probs.new_full(mean_probs.shape, 1.0 / float(mean_probs.numel()))
+        return (mean_probs * (torch.log(mean_probs.clamp_min(eps)) - torch.log(target))).sum()
+
     @staticmethod
     def innovation_calibration_loss(kf: dict[str, Tensor], z: Tensor, R: Tensor, H: Optional[Tensor]) -> Tensor:
         pred_means = kf.get("pred_means")
@@ -689,6 +733,8 @@ class VectorMIDE(nn.Module):
         sigma_ratio_max: float = 0.5,
         lambda_covariance_proxy: float = 0.0,
         covariance_proxy_floor: float = 1.0e-4,
+        lambda_covariance_correlation: float = 0.0,
+        lambda_regime_usage: float = 0.0,
         lambda_calibration: float = 0.0,
         multistep_horizons: Optional[Sequence[int]] = None,
         multistep_max_origins: int = 0,
@@ -754,6 +800,11 @@ class VectorMIDE(nn.Module):
             covariance_proxy_secondary=covariance_proxy_secondary,
             floor=covariance_proxy_floor,
         )
+        loss_covariance_correlation = self.covariance_correlation_loss(
+            outputs,
+            covariance_proxy=covariance_proxy,
+        )
+        loss_regime_usage = self.regime_usage_loss(outputs)
         if lambda_calibration > 0.0 and need_history:
             R = self.dstm.observation_covariance().to(device=z.device, dtype=z.dtype)
             loss_calibration = self.innovation_calibration_loss(kf, z=z, R=R, H=H)
@@ -769,6 +820,8 @@ class VectorMIDE(nn.Module):
             + lambda_multistep * loss_multistep
             + lambda_sigma_ratio * loss_sigma_ratio
             + lambda_covariance_proxy * loss_covariance_proxy
+            + lambda_covariance_correlation * loss_covariance_correlation
+            + lambda_regime_usage * loss_regime_usage
             + lambda_calibration * loss_calibration
         )
         loss_forecast = loss_kf + lambda_multistep * loss_multistep
@@ -784,6 +837,8 @@ class VectorMIDE(nn.Module):
             "loss_multistep": loss_multistep,
             "loss_sigma_ratio": loss_sigma_ratio,
             "loss_covariance_proxy": loss_covariance_proxy,
+            "loss_covariance_correlation": loss_covariance_correlation,
+            "loss_regime_usage": loss_regime_usage,
             "loss_calibration": loss_calibration,
             **outputs,
         }
