@@ -648,6 +648,95 @@ class VectorMIDE(nn.Module):
         pred_trace = torch.diagonal(sigma[valid], dim1=-2, dim2=-1).sum(dim=-1)
         return (torch.log(pred_trace.clamp_min(eps)) - torch.log(target_trace.clamp_min(eps))).pow(2).mean()
 
+    @staticmethod
+    def _advection_disagreement(
+        outputs: dict[str, Tensor],
+        covariance_proxy_primary: Optional[Tensor],
+        covariance_proxy_secondary: Optional[Tensor],
+        residual_scale: float,
+    ) -> tuple[Tensor, Tensor] | None:
+        sigma = outputs.get("Sigma")
+        if sigma is None or covariance_proxy_primary is None or covariance_proxy_secondary is None:
+            return None
+        primary = covariance_proxy_primary.to(device=sigma.device, dtype=sigma.dtype)
+        secondary = covariance_proxy_secondary.to(device=sigma.device, dtype=sigma.dtype)
+        if primary.shape[-1] != 4 or secondary.shape[-1] != 4:
+            return None
+        if "advection_component_scale" in outputs:
+            scale = outputs["advection_component_scale"].to(device=sigma.device, dtype=sigma.dtype)
+            primary = primary * scale
+            secondary = secondary * scale
+        valid = (
+            torch.isfinite(primary).all(dim=-1)
+            & torch.isfinite(secondary).all(dim=-1)
+            & torch.isfinite(sigma).all(dim=(-1, -2))
+        )
+        if valid.sum() == 0:
+            return None
+        scaled_residual = (primary[valid] - secondary[valid]) / max(float(residual_scale), 1.0e-8)
+        return sigma[valid], scaled_residual
+
+    def covariance_residual_nll_loss(
+        self,
+        outputs: dict[str, Tensor],
+        covariance_proxy_primary: Optional[Tensor],
+        covariance_proxy_secondary: Optional[Tensor],
+        residual_scale: float = 10.0,
+        eps: float = 1.0e-6,
+    ) -> Tensor:
+        prepared = self._advection_disagreement(
+            outputs,
+            covariance_proxy_primary=covariance_proxy_primary,
+            covariance_proxy_secondary=covariance_proxy_secondary,
+            residual_scale=residual_scale,
+        )
+        if prepared is None:
+            return outputs["mu"].new_tensor(0.0)
+        sigma, residual = prepared
+        terms = []
+        eye2 = torch.eye(2, device=sigma.device, dtype=sigma.dtype).unsqueeze(0)
+        for block_idx, start in enumerate((0, 2)):
+            cov = sigma[:, start : start + 2, start : start + 2] + eps * eye2
+            resid = residual[:, start : start + 2]
+            L = safe_cholesky(cov)
+            solved = solve_linear_system(cov, resid.unsqueeze(-1)).squeeze(-1)
+            quad = (resid * solved).sum(dim=-1)
+            logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)
+            terms.append(0.5 * (logdet + quad))
+        return torch.cat(terms, dim=0).mean()
+
+    def covariance_shape_loss(
+        self,
+        outputs: dict[str, Tensor],
+        covariance_proxy_primary: Optional[Tensor],
+        covariance_proxy_secondary: Optional[Tensor],
+        residual_scale: float = 10.0,
+        floor: float = 0.05,
+        eps: float = 1.0e-8,
+    ) -> Tensor:
+        prepared = self._advection_disagreement(
+            outputs,
+            covariance_proxy_primary=covariance_proxy_primary,
+            covariance_proxy_secondary=covariance_proxy_secondary,
+            residual_scale=residual_scale,
+        )
+        if prepared is None:
+            return outputs["mu"].new_tensor(0.0)
+        sigma, residual = prepared
+        losses = []
+        eye2 = torch.eye(2, device=sigma.device, dtype=sigma.dtype).unsqueeze(0)
+        for start in (0, 2):
+            pred = sigma[:, start : start + 2, start : start + 2]
+            resid = residual[:, start : start + 2]
+            target = resid.unsqueeze(-1) @ resid.unsqueeze(-2)
+            target = target + float(floor) ** 2 * eye2
+            pred_trace = torch.diagonal(pred, dim1=-2, dim2=-1).sum(dim=-1).clamp_min(eps)
+            target_trace = torch.diagonal(target, dim1=-2, dim2=-1).sum(dim=-1).clamp_min(eps)
+            pred_shape = pred / pred_trace[:, None, None]
+            target_shape = target / target_trace[:, None, None]
+            losses.append((pred_shape - target_shape).pow(2).mean(dim=(-1, -2)))
+        return torch.cat(losses, dim=0).mean()
+
     def covariance_correlation_loss(
         self,
         outputs: dict[str, Tensor],
@@ -735,6 +824,10 @@ class VectorMIDE(nn.Module):
         covariance_proxy_floor: float = 1.0e-4,
         lambda_covariance_correlation: float = 0.0,
         lambda_regime_usage: float = 0.0,
+        lambda_covariance_residual_nll: float = 0.0,
+        lambda_covariance_shape: float = 0.0,
+        covariance_residual_scale: float = 10.0,
+        covariance_shape_floor: float = 0.05,
         lambda_calibration: float = 0.0,
         multistep_horizons: Optional[Sequence[int]] = None,
         multistep_max_origins: int = 0,
@@ -805,6 +898,19 @@ class VectorMIDE(nn.Module):
             covariance_proxy=covariance_proxy,
         )
         loss_regime_usage = self.regime_usage_loss(outputs)
+        loss_covariance_residual_nll = self.covariance_residual_nll_loss(
+            outputs,
+            covariance_proxy_primary=covariance_proxy_primary,
+            covariance_proxy_secondary=covariance_proxy_secondary,
+            residual_scale=covariance_residual_scale,
+        )
+        loss_covariance_shape = self.covariance_shape_loss(
+            outputs,
+            covariance_proxy_primary=covariance_proxy_primary,
+            covariance_proxy_secondary=covariance_proxy_secondary,
+            residual_scale=covariance_residual_scale,
+            floor=covariance_shape_floor,
+        )
         if lambda_calibration > 0.0 and need_history:
             R = self.dstm.observation_covariance().to(device=z.device, dtype=z.dtype)
             loss_calibration = self.innovation_calibration_loss(kf, z=z, R=R, H=H)
@@ -822,6 +928,8 @@ class VectorMIDE(nn.Module):
             + lambda_covariance_proxy * loss_covariance_proxy
             + lambda_covariance_correlation * loss_covariance_correlation
             + lambda_regime_usage * loss_regime_usage
+            + lambda_covariance_residual_nll * loss_covariance_residual_nll
+            + lambda_covariance_shape * loss_covariance_shape
             + lambda_calibration * loss_calibration
         )
         loss_forecast = loss_kf + lambda_multistep * loss_multistep
@@ -839,6 +947,8 @@ class VectorMIDE(nn.Module):
             "loss_covariance_proxy": loss_covariance_proxy,
             "loss_covariance_correlation": loss_covariance_correlation,
             "loss_regime_usage": loss_regime_usage,
+            "loss_covariance_residual_nll": loss_covariance_residual_nll,
+            "loss_covariance_shape": loss_covariance_shape,
             "loss_calibration": loss_calibration,
             **outputs,
         }

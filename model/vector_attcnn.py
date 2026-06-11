@@ -192,8 +192,8 @@ class VectorAdvectionNet(nn.Module):
         self.anchored_advection = bool(anchored_advection)
         self.advection_residual_scale = float(advection_residual_scale)
         self.covariance_mode = covariance_mode.replace("-", "_").lower()
-        if self.covariance_mode not in {"free_cholesky", "regime"}:
-            raise ValueError("covariance_mode must be 'free_cholesky' or 'regime'")
+        if self.covariance_mode not in {"free_cholesky", "regime", "block_cholesky"}:
+            raise ValueError("covariance_mode must be 'free_cholesky', 'regime', or 'block_cholesky'")
         self.covariance_regimes = int(covariance_regimes)
         if self.covariance_regimes <= 0:
             raise ValueError("covariance_regimes must be positive")
@@ -275,6 +275,22 @@ class VectorAdvectionNet(nn.Module):
             for std in covariance_regime_stds:
                 raw_regimes.append(_cholesky_raw_from_diag([float(std)] * 4, chol_jitter))
             self.regime_chol_raw = nn.Parameter(torch.stack(raw_regimes, dim=0))
+            if self.covariance_dynamic_scale:
+                self.covariance_scale_head = nn.Linear(feature_dim, 1)
+                nn.init.zeros_(self.covariance_scale_head.weight)
+                nn.init.constant_(
+                    self.covariance_scale_head.bias,
+                    _bounded_logit(
+                        self.covariance_scale_init,
+                        self.covariance_scale_min,
+                        self.covariance_scale_max,
+                    ),
+                )
+            else:
+                self.covariance_scale_head = None
+        elif use_component_heads and self.covariance_mode == "block_cholesky":
+            self.chol_head = nn.Linear(feature_dim, 6)
+            self.regime_chol_raw = None
             if self.covariance_dynamic_scale:
                 self.covariance_scale_head = nn.Linear(feature_dim, 1)
                 nn.init.zeros_(self.covariance_scale_head.weight)
@@ -603,6 +619,42 @@ class VectorAdvectionNet(nn.Module):
         raw_chol: Tensor,
         raw_scale: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+        if self.covariance_mode == "block_cholesky":
+            raw_u = raw_chol[..., :3]
+            raw_v = raw_chol[..., 3:]
+            L_u, sigma_u = covariance_from_cholesky_raw(raw_u, dim=2, jitter=self.chol_jitter)
+            L_v, sigma_v = covariance_from_cholesky_raw(raw_v, dim=2, jitter=self.chol_jitter)
+            scale = None
+            if raw_scale is not None:
+                scale = self._bounded_sigmoid(
+                    raw_scale.squeeze(-1),
+                    self.covariance_scale_min,
+                    self.covariance_scale_max,
+                )
+                sigma_u = sigma_u * scale[:, None, None]
+                sigma_v = sigma_v * scale[:, None, None]
+            if self.covariance_floor > 0.0:
+                eye2 = torch.eye(2, device=raw_chol.device, dtype=raw_chol.dtype).unsqueeze(0)
+                sigma_u = sigma_u + self.covariance_floor**2 * eye2
+                sigma_v = sigma_v + self.covariance_floor**2 * eye2
+                L_u = safe_cholesky(sigma_u)
+                L_v = safe_cholesky(sigma_v)
+            n_time = raw_chol.shape[0]
+            L = raw_chol.new_zeros(n_time, 4, 4)
+            L[:, :2, :2] = L_u
+            L[:, 2:, 2:] = L_v
+            sigma = raw_chol.new_zeros(n_time, 4, 4)
+            sigma[:, :2, :2] = sigma_u
+            sigma[:, 2:, 2:] = sigma_v
+            extra = {
+                "covariance_block_Sigma": torch.stack([sigma_u, sigma_v], dim=1),
+                "covariance_block_L": torch.stack([L_u, L_v], dim=1),
+            }
+            if scale is not None:
+                extra["raw_covariance_scale"] = raw_scale
+                extra["covariance_scale"] = scale
+            return L, sigma, extra
+
         if self.covariance_mode == "regime":
             if self.regime_chol_raw is None:
                 raise RuntimeError("regime_chol_raw is not initialized")

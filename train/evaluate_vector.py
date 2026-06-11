@@ -171,7 +171,12 @@ def collect_model_outputs(
             sums["mu"][start:end] += outputs["mu"].detach().cpu().numpy()
             sums["Sigma"][start:end] += outputs["Sigma"].detach().cpu().numpy()
             sums["alpha"][start:end] += outputs["alpha"].detach().cpu().numpy()
-            for key in ("covariance_regime_logits", "covariance_regime_probs", "covariance_scale"):
+            for key in (
+                "covariance_regime_logits",
+                "covariance_regime_probs",
+                "covariance_scale",
+                "covariance_block_Sigma",
+            ):
                 if key not in outputs:
                     continue
                 value = outputs[key].detach().cpu().numpy()
@@ -335,6 +340,18 @@ def covariance_diagnostics_summary(artifacts: dict[str, np.ndarray]) -> dict[str
                 [0.0, 0.1, 0.5, 0.9, 0.99, 1.0],
                 np.nanquantile(scale, [0.0, 0.1, 0.5, 0.9, 0.99, 1.0]),
             )
+        }
+    block_sigma = artifacts.get("covariance_block_Sigma")
+    if block_sigma is not None:
+        blocks = np.asarray(block_sigma, dtype=np.float64)
+        traces = np.trace(blocks, axis1=-2, axis2=-1)
+        out["covariance_block_trace_mean"] = {
+            "u": float(np.nanmean(traces[:, 0])),
+            "v": float(np.nanmean(traces[:, 1])),
+        }
+        out["covariance_block_offdiag_mean"] = {
+            "u_xy": float(np.nanmean(blocks[:, 0, 0, 1])),
+            "v_xy": float(np.nanmean(blocks[:, 1, 0, 1])),
         }
     return out
 
@@ -579,6 +596,8 @@ def evaluate(
             artifacts[key] = outputs[key]
     if "covariance_scale" in outputs:
         artifacts["covariance_scale"] = outputs["covariance_scale"]
+    if "covariance_block_Sigma" in outputs:
+        artifacts["covariance_block_Sigma"] = outputs["covariance_block_Sigma"]
     if data.get("covariance_proxy") is not None:
         artifacts["covariance_proxy"] = np.asarray(data["covariance_proxy"], dtype=np.float32)
     artifacts.update(
@@ -684,6 +703,7 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
         "covariance_regime_probs",
         "covariance_regime_Sigma",
         "covariance_scale",
+        "covariance_block_Sigma",
         "covariance_proxy",
         "projected_sigma",
         "effective_diffusion_D",
@@ -697,13 +717,28 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
             advection_payload[key] = artifacts[key]
     np.savez_compressed(output_dir / "advection_parameters.npz", **advection_payload)
 
+    sigma = artifacts["Sigma"]
+    cov_u_xy = sigma[:, 0, 1]
+    cov_v_xy = sigma[:, 2, 3]
+    corr_u_xy = cov_u_xy / np.sqrt(np.maximum(sigma[:, 0, 0] * sigma[:, 1, 1], 1.0e-12))
+    corr_v_xy = cov_v_xy / np.sqrt(np.maximum(sigma[:, 2, 2] * sigma[:, 3, 3], 1.0e-12))
     param_columns = [
         np.arange(artifacts["mu"].shape[0])[:, None],
         artifacts["mu"],
         artifacts["Sigma_diag"],
+        np.column_stack([cov_u_xy, cov_v_xy, corr_u_xy, corr_v_xy]),
         artifacts["alpha"].reshape(artifacts["alpha"].shape[0], 4),
     ]
-    header_names = ["time_index", *ADV_NAMES, *SIGMA_DIAG_NAMES, *ALPHA_NAMES]
+    header_names = [
+        "time_index",
+        *ADV_NAMES,
+        *SIGMA_DIAG_NAMES,
+        "cov_u_xy",
+        "cov_v_xy",
+        "corr_u_xy",
+        "corr_v_xy",
+        *ALPHA_NAMES,
+    ]
     if "projected_sigma_ratio_mean" in artifacts:
         param_columns.append(artifacts["projected_sigma_ratio_mean"][:, None])
         header_names.append("projected_sigma_ratio_mean")

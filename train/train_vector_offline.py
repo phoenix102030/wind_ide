@@ -84,8 +84,21 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 covariance_proxy=covariance_proxy,
             )
             loss_regime_usage = self.model.regime_usage_loss(outputs)
+            loss_covariance_residual_nll = self.model.covariance_residual_nll_loss(
+                outputs,
+                covariance_proxy_primary=covariance_proxy_primary,
+                covariance_proxy_secondary=covariance_proxy_secondary,
+                residual_scale=float(loss_kwargs.get("covariance_residual_scale", 10.0)),
+            )
+            loss_covariance_shape = self.model.covariance_shape_loss(
+                outputs,
+                covariance_proxy_primary=covariance_proxy_primary,
+                covariance_proxy_secondary=covariance_proxy_secondary,
+                residual_scale=float(loss_kwargs.get("covariance_residual_scale", 10.0)),
+                floor=float(loss_kwargs.get("covariance_shape_floor", 0.05)),
+            )
             loss = (
-                loss_adv
+                float(loss_kwargs.get("lambda_adv", 1.0)) * loss_adv
                 + float(loss_kwargs.get("lambda_deform", 0.0)) * loss_deform
                 + float(loss_kwargs.get("lambda_advection_residual", 0.0)) * loss_advection_residual
                 + float(loss_kwargs.get("lambda_smooth", 0.001)) * loss_smooth
@@ -93,6 +106,8 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 + float(loss_kwargs.get("lambda_covariance_proxy", 0.0)) * loss_covariance_proxy
                 + float(loss_kwargs.get("lambda_covariance_correlation", 0.0)) * loss_covariance_correlation
                 + float(loss_kwargs.get("lambda_regime_usage", 0.0)) * loss_regime_usage
+                + float(loss_kwargs.get("lambda_covariance_residual_nll", 0.0)) * loss_covariance_residual_nll
+                + float(loss_kwargs.get("lambda_covariance_shape", 0.0)) * loss_covariance_shape
             )
             return {
                 "loss": loss,
@@ -104,6 +119,8 @@ class VectorMIDETrainingModule(torch.nn.Module):
                 "loss_covariance_proxy": loss_covariance_proxy,
                 "loss_covariance_correlation": loss_covariance_correlation,
                 "loss_regime_usage": loss_regime_usage,
+                "loss_covariance_residual_nll": loss_covariance_residual_nll,
+                "loss_covariance_shape": loss_covariance_shape,
                 **outputs,
             }
         if stage == "kf":
@@ -554,6 +571,21 @@ def training_loss_kwargs(config: dict[str, Any], stage: str) -> dict[str, Any]:
         ),
         "lambda_regime_usage": float(
             config.get(f"{prefix}lambda_regime_usage", config.get("lambda_regime_usage", 0.0))
+        ),
+        "lambda_covariance_residual_nll": float(
+            config.get(
+                f"{prefix}lambda_covariance_residual_nll",
+                config.get("lambda_covariance_residual_nll", 0.0),
+            )
+        ),
+        "lambda_covariance_shape": float(
+            config.get(f"{prefix}lambda_covariance_shape", config.get("lambda_covariance_shape", 0.0))
+        ),
+        "covariance_residual_scale": float(
+            config.get(f"{prefix}covariance_residual_scale", config.get("covariance_residual_scale", 10.0))
+        ),
+        "covariance_shape_floor": float(
+            config.get(f"{prefix}covariance_shape_floor", config.get("covariance_shape_floor", 0.05))
         ),
         "lambda_calibration": float(
             config.get(f"{prefix}lambda_calibration", config.get("lambda_calibration", 0.0))
