@@ -30,6 +30,20 @@ def load_config(path: str | Path) -> dict[str, Any]:
         return yaml.safe_load(handle)
 
 
+def load_compatible_state_dict(model: torch.nn.Module, checkpoint: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    state = checkpoint["model_state"]
+    current = model.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in state.items():
+        if key in current and tuple(current[key].shape) == tuple(value.shape):
+            compatible[key] = value
+        else:
+            skipped.append(key)
+    missing, unexpected = model.load_state_dict(compatible, strict=False)
+    return list(missing), list(unexpected), skipped
+
+
 def default_output_dir(checkpoint_path: str | Path, split: str) -> Path:
     stem = Path(checkpoint_path).stem
     return Path("outputs") / "evaluation" / f"{stem}_{split}"
@@ -474,6 +488,11 @@ def evaluate(
         optical_flow_np = training_advection_target_np
     else:
         optical_flow_np = np.asarray(optical_flow_np, dtype=np.float32)
+    station_optical_flow_np = data.get("V_station_optical_star")
+    if station_optical_flow_np is None:
+        station_optical_flow_np = np.full_like(outputs["mu"], np.nan, dtype=np.float32)
+    else:
+        station_optical_flow_np = np.asarray(station_optical_flow_np, dtype=np.float32)
     nwp_advection_target_np = data.get("V_nwp_star")
     if nwp_advection_target_np is None:
         nwp_advection_target_np = np.full_like(outputs["mu"], np.nan, dtype=np.float32)
@@ -581,6 +600,7 @@ def evaluate(
         "nwp_wind_displacement": nwp_displacement_np,
         "nwp_advection_target": nwp_advection_target_np,
         "optical_flow_advection": optical_flow_np,
+        "station_optical_flow_advection": station_optical_flow_np,
         "advection_anchor": advection_anchor_np,
         "ell": ell,
         "gamma": gamma,
@@ -598,6 +618,10 @@ def evaluate(
         artifacts["covariance_scale"] = outputs["covariance_scale"]
     if "covariance_block_Sigma" in outputs:
         artifacts["covariance_block_Sigma"] = outputs["covariance_block_Sigma"]
+    if "covariance_cross_Sigma" in outputs:
+        artifacts["covariance_cross_Sigma"] = outputs["covariance_cross_Sigma"]
+    if "covariance_cross_correlation" in outputs:
+        artifacts["covariance_cross_correlation"] = outputs["covariance_cross_correlation"]
     if data.get("covariance_proxy") is not None:
         artifacts["covariance_proxy"] = np.asarray(data["covariance_proxy"], dtype=np.float32)
     artifacts.update(
@@ -685,6 +709,7 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
         "nwp_wind_displacement": artifacts["nwp_wind_displacement"],
         "nwp_advection_target": artifacts["nwp_advection_target"],
         "optical_flow_advection": artifacts["optical_flow_advection"],
+        "station_optical_flow_advection": artifacts["station_optical_flow_advection"],
         "ell": artifacts["ell"],
         "gamma": artifacts["gamma"],
         "kernel_sigma_scale": artifacts["kernel_sigma_scale"],
@@ -704,6 +729,8 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
         "covariance_regime_Sigma",
         "covariance_scale",
         "covariance_block_Sigma",
+        "covariance_cross_Sigma",
+        "covariance_cross_correlation",
         "covariance_proxy",
         "projected_sigma",
         "effective_diffusion_D",
@@ -720,13 +747,36 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
     sigma = artifacts["Sigma"]
     cov_u_xy = sigma[:, 0, 1]
     cov_v_xy = sigma[:, 2, 3]
+    cov_uv_xx = sigma[:, 0, 2]
+    cov_uv_xy = sigma[:, 0, 3]
+    cov_uv_yx = sigma[:, 1, 2]
+    cov_uv_yy = sigma[:, 1, 3]
     corr_u_xy = cov_u_xy / np.sqrt(np.maximum(sigma[:, 0, 0] * sigma[:, 1, 1], 1.0e-12))
     corr_v_xy = cov_v_xy / np.sqrt(np.maximum(sigma[:, 2, 2] * sigma[:, 3, 3], 1.0e-12))
+    corr_uv_xx = cov_uv_xx / np.sqrt(np.maximum(sigma[:, 0, 0] * sigma[:, 2, 2], 1.0e-12))
+    corr_uv_xy = cov_uv_xy / np.sqrt(np.maximum(sigma[:, 0, 0] * sigma[:, 3, 3], 1.0e-12))
+    corr_uv_yx = cov_uv_yx / np.sqrt(np.maximum(sigma[:, 1, 1] * sigma[:, 2, 2], 1.0e-12))
+    corr_uv_yy = cov_uv_yy / np.sqrt(np.maximum(sigma[:, 1, 1] * sigma[:, 3, 3], 1.0e-12))
     param_columns = [
         np.arange(artifacts["mu"].shape[0])[:, None],
         artifacts["mu"],
         artifacts["Sigma_diag"],
-        np.column_stack([cov_u_xy, cov_v_xy, corr_u_xy, corr_v_xy]),
+        np.column_stack(
+            [
+                cov_u_xy,
+                cov_v_xy,
+                cov_uv_xx,
+                cov_uv_xy,
+                cov_uv_yx,
+                cov_uv_yy,
+                corr_u_xy,
+                corr_v_xy,
+                corr_uv_xx,
+                corr_uv_xy,
+                corr_uv_yx,
+                corr_uv_yy,
+            ]
+        ),
         artifacts["alpha"].reshape(artifacts["alpha"].shape[0], 4),
     ]
     header_names = [
@@ -735,8 +785,16 @@ def save_artifact_arrays(output_dir: Path, artifacts: dict[str, np.ndarray]) -> 
         *SIGMA_DIAG_NAMES,
         "cov_u_xy",
         "cov_v_xy",
+        "cov_Au_x_Av_x",
+        "cov_Au_x_Av_y",
+        "cov_Au_y_Av_x",
+        "cov_Au_y_Av_y",
         "corr_u_xy",
         "corr_v_xy",
+        "corr_Au_x_Av_x",
+        "corr_Au_x_Av_y",
+        "corr_Au_y_Av_x",
+        "corr_Au_y_Av_y",
         *ALPHA_NAMES,
     ]
     if "projected_sigma_ratio_mean" in artifacts:
@@ -1468,11 +1526,13 @@ def main() -> None:
     checkpoint = torch.load(ckpt_path, map_location=device)
     model_config = checkpoint.get("config", config)
     model = build_model(model_config).to(device)
-    missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+    missing, unexpected, skipped = load_compatible_state_dict(model, checkpoint)
     if missing:
         print(f"Initialized model parameters not found in checkpoint: {missing}")
     if unexpected:
         print(f"Ignored checkpoint parameters not used by this config: {unexpected}")
+    if skipped:
+        print(f"Skipped checkpoint parameters with incompatible shapes: {skipped}")
 
     eval_window_size = args.eval_window_size
     if eval_window_size is None:

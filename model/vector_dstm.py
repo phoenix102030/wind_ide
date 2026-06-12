@@ -329,6 +329,7 @@ class VectorMIDE(nn.Module):
         covariance_scale_init: float = 1.0,
         covariance_scale_min: float = 0.25,
         covariance_scale_max: float = 4.0,
+        covariance_cross_corr_limit: float = 0.6,
         advection_component_scale: Sequence[float] | None = None,
     ) -> None:
         super().__init__()
@@ -370,6 +371,7 @@ class VectorMIDE(nn.Module):
             covariance_scale_init=covariance_scale_init,
             covariance_scale_min=covariance_scale_min,
             covariance_scale_max=covariance_scale_max,
+            covariance_cross_corr_limit=covariance_cross_corr_limit,
             advection_component_scale=advection_component_scale,
         )
         self.kernel = VectorLagrangianKernel(
@@ -694,6 +696,14 @@ class VectorMIDE(nn.Module):
             return outputs["mu"].new_tensor(0.0)
         sigma, residual = prepared
         terms = []
+        if outputs.get("covariance_cross_Sigma") is not None:
+            eye4 = torch.eye(4, device=sigma.device, dtype=sigma.dtype).unsqueeze(0)
+            cov4 = sigma + eps * eye4
+            L4 = safe_cholesky(cov4)
+            solved4 = solve_linear_system(cov4, residual.unsqueeze(-1)).squeeze(-1)
+            quad4 = (residual * solved4).sum(dim=-1)
+            logdet4 = 2.0 * torch.log(torch.diagonal(L4, dim1=-2, dim2=-1)).sum(dim=-1)
+            terms.append(0.5 * (logdet4 + quad4))
         eye2 = torch.eye(2, device=sigma.device, dtype=sigma.dtype).unsqueeze(0)
         for block_idx, start in enumerate((0, 2)):
             cov = sigma[:, start : start + 2, start : start + 2] + eps * eye2
@@ -735,6 +745,20 @@ class VectorMIDE(nn.Module):
             pred_shape = pred / pred_trace[:, None, None]
             target_shape = target / target_trace[:, None, None]
             losses.append((pred_shape - target_shape).pow(2).mean(dim=(-1, -2)))
+        if outputs.get("covariance_cross_Sigma") is not None:
+            pred_cross = sigma[:, :2, 2:]
+            resid_u = residual[:, :2]
+            resid_v = residual[:, 2:]
+            target_cross = resid_u.unsqueeze(-1) @ resid_v.unsqueeze(-2)
+            trace_u = torch.diagonal(sigma[:, :2, :2], dim1=-2, dim2=-1).sum(dim=-1).clamp_min(eps)
+            trace_v = torch.diagonal(sigma[:, 2:, 2:], dim1=-2, dim2=-1).sum(dim=-1).clamp_min(eps)
+            target_u = resid_u.unsqueeze(-1) @ resid_u.unsqueeze(-2) + float(floor) ** 2 * eye2
+            target_v = resid_v.unsqueeze(-1) @ resid_v.unsqueeze(-2) + float(floor) ** 2 * eye2
+            target_trace_u = torch.diagonal(target_u, dim1=-2, dim2=-1).sum(dim=-1).clamp_min(eps)
+            target_trace_v = torch.diagonal(target_v, dim1=-2, dim2=-1).sum(dim=-1).clamp_min(eps)
+            pred_cross_shape = pred_cross / torch.sqrt(trace_u * trace_v)[:, None, None]
+            target_cross_shape = target_cross / torch.sqrt(target_trace_u * target_trace_v)[:, None, None]
+            losses.append((pred_cross_shape - target_cross_shape).pow(2).mean(dim=(-1, -2)))
         return torch.cat(losses, dim=0).mean()
 
     def covariance_correlation_loss(

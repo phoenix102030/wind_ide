@@ -36,7 +36,7 @@ deformation_scale: 0.3
 anchored_advection: true
 advection_residual_scale: 1.0
 advection_component_scale: [1.2, 0.8, 0.8, 1.2]
-covariance_mode: block_cholesky
+covariance_mode: coupled_block_cholesky
 covariance_regimes: 3
 covariance_regime_stds: [0.3, 1.0, 3.0]
 covariance_floor: 0.02
@@ -44,11 +44,12 @@ covariance_dynamic_scale: false
 covariance_scale_init: 1.0
 covariance_scale_min: 0.25
 covariance_scale_max: 4.0
+covariance_cross_corr_limit: 0.5
 
 dt: 1.0
 dt_seconds: 600.0
-time_mode: target_only
-gamma: 0.0
+time_mode: relative_component
+gamma: 0.3
 learnable_gamma: false
 
 row_normalize: true
@@ -118,7 +119,7 @@ covariance_shape_floor: 0.05
 covariance_proxy_floor: 0.05
 lambda_calibration: 0.0001
 covariance_proxy_mode: nwp_vs_pattern
-covariance_proxy_primary: V_nwp_star
+covariance_proxy_primary: V_station_optical_star
 covariance_proxy_secondary: V_pattern_star
 multistep_horizons: [1, 2, 3, 6, 9, 12]
 multistep_max_origins: 64
@@ -192,12 +193,16 @@ data:
     - [18, 18]
     - [20, 20]
     - [22, 22]
-  advection_anchor_mode: pattern_tracking
+  advection_anchor_mode: hybrid_nwp_station_optical_flow
   advection_label_mode: anchor
   advection_nwp_weight: 0.75
   advection_anchor_nwp_weight: 0.5
   advection_pattern_weight: 0.75
   optical_flow_label_scale: 1.0
+  station_optical_flow_patch_radius: 2
+  station_optical_flow_stride: 1
+  station_optical_flow_ridge: 0.001
+  station_optical_flow_max_displacement_km: 20.0
   pattern_tracking_patch_radius: 6
   pattern_tracking_max_shift_cells: 4
   deformation_label_mode: none

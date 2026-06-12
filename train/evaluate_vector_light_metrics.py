@@ -19,6 +19,7 @@ from dataset.vector_data_utils import load_vector_dataset
 from train.evaluate_vector import (
     STATE_NAMES,
     load_config,
+    load_compatible_state_dict,
 )
 from train.train_vector_offline import build_model, print_device_info, resolve_device
 
@@ -454,11 +455,13 @@ def run_light_eval(
     checkpoint = torch.load(ckpt_path, map_location=device)
     model_config = checkpoint.get("config", config)
     model = build_model(model_config).to(device)
-    missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+    missing, unexpected, skipped = load_compatible_state_dict(model, checkpoint)
     if missing:
         print(f"Initialized model parameters not found in checkpoint: {missing}")
     if unexpected:
         print(f"Ignored checkpoint parameters not used by this config: {unexpected}")
+    if skipped:
+        print(f"Skipped checkpoint parameters with incompatible shapes: {skipped}")
 
     data = load_vector_dataset(config, split=split, time_limit=limit)
     T = int(data["X"].shape[0])

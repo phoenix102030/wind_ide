@@ -45,6 +45,25 @@ def test_advection_net_cnn_mode_still_works():
     assert out["alpha"].shape == (3, 2, 2)
 
 
+def test_coupled_block_cholesky_outputs_cross_covariance():
+    x = torch.randn(4, 6, 40, 40)
+    net = VectorAdvectionNet(
+        in_channels=6,
+        hidden_dim=32,
+        network_type="cnn",
+        covariance_mode="coupled_block_cholesky",
+        covariance_cross_corr_limit=0.5,
+    )
+    out = net(x)
+
+    assert out["Sigma"].shape == (4, 4, 4)
+    assert out["covariance_cross_Sigma"].shape == (4, 2, 2)
+    assert out["covariance_cross_correlation"].shape == (4, 2, 2)
+    corr_norm = torch.linalg.matrix_norm(out["covariance_cross_correlation"], ord="fro", dim=(-2, -1))
+    assert torch.all(corr_norm <= 0.5 + 1.0e-6)
+    assert torch.all(torch.linalg.eigvalsh(out["Sigma"]) > 0)
+
+
 def test_component_specific_mu_uses_shared_full_input_with_separate_heads():
     x = torch.randn(3, 6, 40, 40)
     net = VectorAdvectionNet(

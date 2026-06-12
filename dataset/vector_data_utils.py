@@ -548,6 +548,84 @@ def build_optical_flow_advection_labels_from_uv(
     return labels
 
 
+def build_station_patch_optical_flow_advection_labels_from_uv(
+    u140: np.ndarray,
+    v140: np.ndarray,
+    lat_grid: np.ndarray,
+    lon_grid: np.ndarray,
+    station_grid_indices: Optional[list[list[int]]] = None,
+    dt_seconds: float = 600.0,
+    patch_radius: int = 2,
+    stride: int = 1,
+    ridge: float = 1.0e-3,
+    max_displacement_km: float = 20.0,
+) -> np.ndarray:
+    """Estimate component-specific advection from station-local NWP patches.
+
+    Unlike the simple carrier-wind label, this solves a local optical-flow
+    equation separately for the U and V fields over the station patches, so the
+    returned ``[A_u,x, A_u,y, A_v,x, A_v,y]`` need not share the same 2D shift.
+    """
+    dx, dy = _latlon_grid_spacing_km(lat_grid, lon_grid)
+    u = u140.astype(np.float64)
+    v = v140.astype(np.float64)
+    T = u.shape[2]
+    labels = np.zeros((T, 4), dtype=np.float32)
+    height, width = u.shape[:2]
+    patch_stride = max(int(stride), 1)
+
+    if station_grid_indices:
+        centers = [(int(i), int(j)) for i, j in station_grid_indices]
+    else:
+        centers = [(height // 2, width // 2)]
+
+    def patch_values(array: np.ndarray, center: tuple[int, int]) -> np.ndarray:
+        i, j = center
+        radius = int(patch_radius)
+        i0, i1 = max(i - radius, 0), min(i + radius + 1, height)
+        j0, j1 = max(j - radius, 0), min(j + radius + 1, width)
+        return array[i0:i1:patch_stride, j0:j1:patch_stride].reshape(-1)
+
+    def solve_component(field: np.ndarray, t: int) -> np.ndarray:
+        d_dt = (field[..., t + 1] - field[..., t]) / dt_seconds
+        d_y, d_x = np.gradient(field[..., t], dy, dx)
+        rows = []
+        rhs = []
+        for center in centers:
+            rows.append(
+                np.stack(
+                    [
+                        patch_values(d_x, center),
+                        patch_values(d_y, center),
+                    ],
+                    axis=1,
+                )
+            )
+            rhs.append(-patch_values(d_dt, center))
+        A = np.concatenate(rows, axis=0)
+        b = np.concatenate(rhs, axis=0)
+        valid = np.isfinite(A).all(axis=1) & np.isfinite(b)
+        if valid.sum() < 2:
+            return np.zeros(2, dtype=np.float32)
+        lhs = A[valid].T @ A[valid] + float(ridge) * np.eye(2)
+        rhs_vec = A[valid].T @ b[valid]
+        return np.linalg.solve(lhs, rhs_vec).astype(np.float32)
+
+    for t in range(T - 1):
+        au = solve_component(u, t) * dt_seconds
+        av = solve_component(v, t) * dt_seconds
+        max_disp = float(max_displacement_km)
+        if max_disp > 0.0:
+            for vec in (au, av):
+                norm = float(np.linalg.norm(vec))
+                if np.isfinite(norm) and norm > max_disp:
+                    vec *= max_disp / max(norm, 1.0e-8)
+        labels[t] = [au[0], au[1], av[0], av[1]]
+    if T > 1:
+        labels[-1] = labels[-2]
+    return labels
+
+
 def build_shared_optical_flow_advection_labels_from_uv(
     u140: np.ndarray,
     v140: np.ndarray,
@@ -894,6 +972,25 @@ def load_vector_dataset(
             )[:T]
         return pattern_advection_star
 
+    station_optical_advection_star: Optional[np.ndarray] = None
+
+    def station_optical_flow_star() -> np.ndarray:
+        nonlocal station_optical_advection_star
+        if station_optical_advection_star is None:
+            station_optical_advection_star = build_station_patch_optical_flow_advection_labels_from_uv(
+                u140,
+                v140,
+                lat_grid,
+                lon_grid,
+                station_grid_indices=label_grid_indices,
+                dt_seconds=float(config.get("dt_seconds", 600.0)),
+                patch_radius=int(data_cfg.get("station_optical_flow_patch_radius", data_cfg.get("patch_radius", 2))),
+                stride=int(data_cfg.get("station_optical_flow_stride", 1)),
+                ridge=float(data_cfg.get("station_optical_flow_ridge", data_cfg.get("optical_flow_ridge", 1.0e-3))),
+                max_displacement_km=float(data_cfg.get("station_optical_flow_max_displacement_km", 20.0)),
+            )[:T]
+        return station_optical_advection_star
+
     anchor_mode_raw = data_cfg.get("advection_anchor_mode", "none")
     anchor_mode = None if anchor_mode_raw is None else str(anchor_mode_raw).lower()
     if anchor_mode in {"none", "off", "false", None}:
@@ -902,6 +999,16 @@ def load_vector_dataset(
         advection_anchor = nwp_advection_star
     elif anchor_mode in {"pattern", "pattern_tracking", "shift_tracking"}:
         advection_anchor = pattern_tracking_star()
+    elif anchor_mode in {"station_optical_flow", "patch_optical_flow", "local_optical_flow"}:
+        advection_anchor = station_optical_flow_star()
+    elif anchor_mode in {
+        "hybrid_nwp_station_optical_flow",
+        "hybrid_station_optical_flow_nwp",
+        "nwp_station_optical_flow",
+    }:
+        station_term = station_optical_flow_star()
+        nwp_weight = float(data_cfg.get("advection_anchor_nwp_weight", 0.5))
+        advection_anchor = blend_advection_labels(nwp_advection_star, station_term, nwp_weight)
     elif anchor_mode in {"hybrid_nwp_pattern", "hybrid_pattern_nwp", "nwp_pattern"}:
         pattern_term = pattern_tracking_star()
         nwp_weight = float(data_cfg.get("advection_anchor_nwp_weight", 0.5))
@@ -939,6 +1046,16 @@ def load_vector_dataset(
         v_star = nwp_advection_star
     elif label_mode in {"pattern", "pattern_tracking", "shift_tracking"}:
         v_star = pattern_tracking_star()
+    elif label_mode in {"station_optical_flow", "patch_optical_flow", "local_optical_flow"}:
+        v_star = station_optical_flow_star()
+    elif label_mode in {
+        "hybrid_nwp_station_optical_flow",
+        "hybrid_station_optical_flow_nwp",
+        "nwp_station_optical_flow",
+    }:
+        station_term = station_optical_flow_star()
+        nwp_weight = float(data_cfg.get("advection_nwp_weight", 0.75))
+        v_star = blend_advection_labels(nwp_advection_star, station_term, nwp_weight)
     elif label_mode in {"shared_optical_flow", "joint_optical_flow"}:
         optical_advection_star = optical_flow_star(shared=True)
         v_star = optical_advection_star
@@ -979,6 +1096,17 @@ def load_vector_dataset(
     else:
         raise ValueError(f"Unknown deformation_label_mode: {deformation_label_mode}")
 
+    proxy_keys = {
+        str(config.get("covariance_proxy_primary", "")),
+        str(config.get("covariance_proxy_secondary", "")),
+    }
+    if "V_pattern_star" in proxy_keys:
+        pattern_tracking_star()
+    if "V_station_optical_star" in proxy_keys:
+        station_optical_flow_star()
+    if "V_optical_star" in proxy_keys and optical_advection_star is None:
+        optical_advection_star = optical_flow_star(shared=False)
+
     if data_cfg.get("standardize_x", True):
         x, x_standardizer = standardize_maps(x)
     else:
@@ -997,6 +1125,7 @@ def load_vector_dataset(
         "A_anchor": advection_anchor,
         "V_nwp_star": nwp_advection_star,
         "V_pattern_star": pattern_advection_star,
+        "V_station_optical_star": station_optical_advection_star,
         "V_optical_star": optical_advection_star,
         "B_star": B_star,
         "coords": coords,

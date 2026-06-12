@@ -37,6 +37,16 @@ def _cholesky_raw_from_diag(stds: list[float], jitter: float) -> Tensor:
     return raw
 
 
+def _bounded_cross_correlation(raw: Tensor, limit: float) -> Tensor:
+    """Return a 2x2 contraction matrix for stable block covariance coupling."""
+    if limit <= 0.0:
+        return raw.new_zeros(raw.shape[:-1] + (2, 2))
+    matrix = torch.tanh(raw).reshape(raw.shape[:-1] + (2, 2))
+    fro = torch.linalg.matrix_norm(matrix, ord="fro", dim=(-2, -1), keepdim=True)
+    factor = torch.clamp(float(limit) / fro.clamp_min(1.0e-6), max=1.0)
+    return matrix * factor
+
+
 class ConvBackbone(nn.Module):
     """Compact CNN backbone for 40x40 NWP maps."""
 
@@ -158,6 +168,7 @@ class VectorAdvectionNet(nn.Module):
         covariance_scale_init: float = 1.0,
         covariance_scale_min: float = 0.25,
         covariance_scale_max: float = 4.0,
+        covariance_cross_corr_limit: float = 0.6,
         advection_component_scale: list[float] | tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
@@ -192,8 +203,11 @@ class VectorAdvectionNet(nn.Module):
         self.anchored_advection = bool(anchored_advection)
         self.advection_residual_scale = float(advection_residual_scale)
         self.covariance_mode = covariance_mode.replace("-", "_").lower()
-        if self.covariance_mode not in {"free_cholesky", "regime", "block_cholesky"}:
-            raise ValueError("covariance_mode must be 'free_cholesky', 'regime', or 'block_cholesky'")
+        if self.covariance_mode not in {"free_cholesky", "regime", "block_cholesky", "coupled_block_cholesky"}:
+            raise ValueError(
+                "covariance_mode must be 'free_cholesky', 'regime', "
+                "'block_cholesky', or 'coupled_block_cholesky'"
+            )
         self.covariance_regimes = int(covariance_regimes)
         if self.covariance_regimes <= 0:
             raise ValueError("covariance_regimes must be positive")
@@ -206,6 +220,9 @@ class VectorAdvectionNet(nn.Module):
             raise ValueError("Require 0 < covariance_scale_min < covariance_scale_max")
         if not self.covariance_scale_min <= self.covariance_scale_init <= self.covariance_scale_max:
             raise ValueError("Require covariance_scale_init within [covariance_scale_min, covariance_scale_max]")
+        self.covariance_cross_corr_limit = float(covariance_cross_corr_limit)
+        if not 0.0 <= self.covariance_cross_corr_limit < 1.0:
+            raise ValueError("covariance_cross_corr_limit must be in [0, 1)")
         if advection_component_scale is None:
             advection_component_scale = (1.0, 1.0, 1.0, 1.0)
         if len(advection_component_scale) != 4:
@@ -288,8 +305,8 @@ class VectorAdvectionNet(nn.Module):
                 )
             else:
                 self.covariance_scale_head = None
-        elif use_component_heads and self.covariance_mode == "block_cholesky":
-            self.chol_head = nn.Linear(feature_dim, 6)
+        elif use_component_heads and self.covariance_mode in {"block_cholesky", "coupled_block_cholesky"}:
+            self.chol_head = nn.Linear(feature_dim, 10 if self.covariance_mode == "coupled_block_cholesky" else 6)
             self.regime_chol_raw = None
             if self.covariance_dynamic_scale:
                 self.covariance_scale_head = nn.Linear(feature_dim, 1)
@@ -619,7 +636,7 @@ class VectorAdvectionNet(nn.Module):
         raw_chol: Tensor,
         raw_scale: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
-        if self.covariance_mode == "block_cholesky":
+        if self.covariance_mode in {"block_cholesky", "coupled_block_cholesky"}:
             raw_u = raw_chol[..., :3]
             raw_v = raw_chol[..., 3:]
             L_u, sigma_u = covariance_from_cholesky_raw(raw_u, dim=2, jitter=self.chol_jitter)
@@ -637,12 +654,10 @@ class VectorAdvectionNet(nn.Module):
                 eye2 = torch.eye(2, device=raw_chol.device, dtype=raw_chol.dtype).unsqueeze(0)
                 sigma_u = sigma_u + self.covariance_floor**2 * eye2
                 sigma_v = sigma_v + self.covariance_floor**2 * eye2
-                L_u = safe_cholesky(sigma_u)
-                L_v = safe_cholesky(sigma_v)
+            L_u = safe_cholesky(sigma_u)
+            L_v = safe_cholesky(sigma_v)
             n_time = raw_chol.shape[0]
             L = raw_chol.new_zeros(n_time, 4, 4)
-            L[:, :2, :2] = L_u
-            L[:, 2:, 2:] = L_v
             sigma = raw_chol.new_zeros(n_time, 4, 4)
             sigma[:, :2, :2] = sigma_u
             sigma[:, 2:, 2:] = sigma_v
@@ -650,6 +665,16 @@ class VectorAdvectionNet(nn.Module):
                 "covariance_block_Sigma": torch.stack([sigma_u, sigma_v], dim=1),
                 "covariance_block_L": torch.stack([L_u, L_v], dim=1),
             }
+            if self.covariance_mode == "coupled_block_cholesky":
+                raw_cross = raw_chol[..., 6:10]
+                cross_corr = _bounded_cross_correlation(raw_cross, self.covariance_cross_corr_limit)
+                cross_sigma = torch.matmul(torch.matmul(L_u, cross_corr), L_v.transpose(-1, -2))
+                sigma[:, :2, 2:] = cross_sigma
+                sigma[:, 2:, :2] = cross_sigma.transpose(-1, -2)
+                sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
+                extra["covariance_cross_correlation"] = cross_corr
+                extra["covariance_cross_Sigma"] = cross_sigma
+            L = safe_cholesky(sigma)
             if scale is not None:
                 extra["raw_covariance_scale"] = raw_scale
                 extra["covariance_scale"] = scale

@@ -34,6 +34,20 @@ def load_config(path: str | Path) -> dict[str, Any]:
         return yaml.safe_load(handle)
 
 
+def load_compatible_state_dict(model: VectorMIDE, checkpoint: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    state = checkpoint["model_state"]
+    current = model.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in state.items():
+        if key in current and tuple(current[key].shape) == tuple(value.shape):
+            compatible[key] = value
+        else:
+            skipped.append(key)
+    missing, unexpected = model.load_state_dict(compatible, strict=False)
+    return list(missing), list(unexpected), skipped
+
+
 def configure_online_trainable(
     model: VectorMIDE,
     update_ell: bool = True,
@@ -639,11 +653,13 @@ def main() -> None:
     checkpoint = torch.load(ckpt_path, map_location=device)
 
     model = build_model(config).to(device)
-    missing, unexpected = model.load_state_dict(checkpoint["model_state"], strict=False)
+    missing, unexpected, skipped = load_compatible_state_dict(model, checkpoint)
     if missing:
         print(f"Initialized new online parameters not found in checkpoint: {missing}")
     if unexpected:
         print(f"Ignored checkpoint parameters not used by this config: {unexpected}")
+    if skipped:
+        print(f"Skipped checkpoint parameters with incompatible shapes: {skipped}")
     adaptation_scope = str(args.adaptation_scope or config.get("online_adaptation_scope", "full_head"))
     update_ell = bool(config.get("online_update_ell", config.get("learnable_ell", True))) and not args.no_update_ell
     configure_online_trainable(model, update_ell=update_ell, scope=adaptation_scope)

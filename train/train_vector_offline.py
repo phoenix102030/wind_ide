@@ -321,6 +321,7 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         covariance_scale_init=float(config.get("covariance_scale_init", 1.0)),
         covariance_scale_min=float(config.get("covariance_scale_min", 0.25)),
         covariance_scale_max=float(config.get("covariance_scale_max", 4.0)),
+        covariance_cross_corr_limit=float(config.get("covariance_cross_corr_limit", 0.6)),
         advection_component_scale=config.get("advection_component_scale"),
     )
 
