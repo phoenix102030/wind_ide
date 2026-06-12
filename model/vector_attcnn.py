@@ -638,7 +638,7 @@ class VectorAdvectionNet(nn.Module):
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
         if self.covariance_mode in {"block_cholesky", "coupled_block_cholesky"}:
             raw_u = raw_chol[..., :3]
-            raw_v = raw_chol[..., 3:]
+            raw_v = raw_chol[..., 3:6] if self.covariance_mode == "coupled_block_cholesky" else raw_chol[..., 3:]
             L_u, sigma_u = covariance_from_cholesky_raw(raw_u, dim=2, jitter=self.chol_jitter)
             L_v, sigma_v = covariance_from_cholesky_raw(raw_v, dim=2, jitter=self.chol_jitter)
             scale = None

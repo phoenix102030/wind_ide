@@ -703,7 +703,7 @@ class VectorMIDE(nn.Module):
             solved4 = solve_linear_system(cov4, residual.unsqueeze(-1)).squeeze(-1)
             quad4 = (residual * solved4).sum(dim=-1)
             logdet4 = 2.0 * torch.log(torch.diagonal(L4, dim1=-2, dim2=-1)).sum(dim=-1)
-            terms.append(0.5 * (logdet4 + quad4))
+            return (0.5 * (logdet4 + quad4)).mean()
         eye2 = torch.eye(2, device=sigma.device, dtype=sigma.dtype).unsqueeze(0)
         for block_idx, start in enumerate((0, 2)):
             cov = sigma[:, start : start + 2, start : start + 2] + eps * eye2

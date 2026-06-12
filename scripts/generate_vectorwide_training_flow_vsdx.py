@@ -252,6 +252,54 @@ class VsdxBuilder:
             self.add_text(sx - 0.04, sy - 0.04, 0.08, 0.08, "*", 10, "#D7191C", True)
         self.add_text(x - 0.05, y + 0.62, 0.95, 0.22, label, 13, "#111111", True)
 
+    def add_feature_map_icon(self, x: float, y: float, w: float = 0.58, h: float = 0.38) -> None:
+        """Editable stacked feature-map motif adapted from ML-visual template style."""
+        for dx, dy, fill in [(0.09, -0.07, "#D8C6F2"), (0.045, -0.035, "#C8D9F7"), (0.0, 0.0, "#B9E5F0")]:
+            self.add_rect(x + dx, y + dy, w, h, fill=fill, line="#5E5E6A", weight=0.004, radius=0.012)
+
+    def add_mlp_icon(self, x: float, y: float, scale: float = 1.0) -> None:
+        """Small native node-link neural-net icon; no embedded raster."""
+        r = 0.055 * scale
+        layers = [
+            [(x, y + 0.00 * scale), (x, y + 0.22 * scale), (x, y + 0.44 * scale)],
+            [(x + 0.32 * scale, y + 0.10 * scale), (x + 0.32 * scale, y + 0.34 * scale)],
+            [(x + 0.62 * scale, y + 0.22 * scale)],
+        ]
+        for left, right in zip(layers, layers[1:]):
+            for a in left:
+                for c in right:
+                    self.add_line(a[0] + r, a[1], c[0] - r, c[1], "#777777", 0.004, arrow=False)
+        for layer in layers:
+            for cx, cy in layer:
+                self.add_rect(cx - r, cy - r, 2 * r, 2 * r, fill="#EEF0FF", line="#4E4E5A", weight=0.004, radius=r)
+
+    def add_cnn_template(self, x: float, y: float, w: float, h: float, title: str = "CNN") -> None:
+        self.add_rect(x, y, w, h, fill="#F6DADB", line="#333333", weight=0.01, radius=0.07)
+        self.add_feature_map_icon(x + 0.11 * w, y + 0.20 * h, 0.22 * w, 0.32 * h)
+        self.add_line(x + 0.42 * w, y + 0.50 * h, x + 0.55 * w, y + 0.50 * h, "#555555", 0.006)
+        self.add_mlp_icon(x + 0.61 * w, y + 0.23 * h, scale=0.54 * w)
+        self.add_text(x + 0.06 * w, y + 0.70 * h, 0.88 * w, 0.22 * h, title, 8.7, "#111111", True)
+
+    def add_transformer_template(self, x: float, y: float, w: float, h: float, title: str) -> None:
+        self.add_rect(x, y, w, h, fill="#CFEAF5", line="#333333", weight=0.01, radius=0.07)
+        block_w = w * 0.17
+        gap = w * 0.035
+        bx = x + w * 0.06
+        labels = ["MHA", "Norm", "FFN", "Norm"]
+        fills = ["#E6F2FF", "#FFFFFF", "#FFF7C8", "#FFFFFF"]
+        for i, (lab, fill) in enumerate(zip(labels, fills)):
+            self.add_rect(bx + i * (block_w + gap), y + h * 0.18, block_w, h * 0.42, lab, fill, "#4C6A7A", 0.005, font_size=5.6)
+            if i < len(labels) - 1:
+                self.add_line(
+                    bx + (i + 1) * block_w + i * gap,
+                    y + h * 0.39,
+                    bx + (i + 1) * (block_w + gap),
+                    y + h * 0.39,
+                    "#4C6A7A",
+                    0.004,
+                )
+        self.add_text(x + w * 0.58, y + h * 0.68, w * 0.36, h * 0.20, title, 7.9, "#111111", True)
+
     def page_xml(self) -> str:
         return (
             "<?xml version='1.0' encoding='utf-8'?>"
@@ -276,7 +324,7 @@ class VsdxBuilder:
 
 def draw_figure() -> VsdxBuilder:
     b = VsdxBuilder()
-    b.add_text(0.25, 0.08, 14.1, 0.32, "VectorWIDE training and rolling forecasting workflow", 16, "#1B1B1B", True)
+    b.add_text(0.25, 0.08, 14.1, 0.32, "VectorWIDE training workflow", 16, "#1B1B1B", True)
 
     b.add_rect(0.45, 0.65, 5.25, 6.35, fill="#EAF5E3", line="#5DAA45", weight=0.018, dash="2", radius=0.18)
     b.add_rect(5.95, 0.65, 6.35, 6.35, fill="#EAF2FF", line="#4078C8", weight=0.018, dash="2", radius=0.18)
@@ -292,14 +340,14 @@ def draw_figure() -> VsdxBuilder:
         else:
             b.add_heatmap_stack(x, 5.35, lab)
     b.add_text(0.63, 5.98, 1.18, 0.40, "RU-WRF grids\n6 channels", 8.5, "#111111")
-    b.add_rect(0.95, 4.70, 0.95, 0.34, "CNN", "#F6DADB", "#333333", 0.01, font_size=10)
-    b.add_rect(3.95, 4.70, 0.95, 0.34, "CNN", "#F6DADB", "#333333", 0.01, font_size=10)
+    b.add_cnn_template(0.84, 4.55, 1.18, 0.58, "CNN")
+    b.add_cnn_template(3.84, 4.55, 1.18, 0.58, "CNN")
     b.add_text(2.65, 4.80, 0.38, 0.20, "...", 13, "#111111", True)
     b.add_line(1.42, 5.26, 1.42, 5.04, "#777777", 0.01)
     b.add_line(4.42, 5.26, 4.42, 5.04, "#777777", 0.01)
-    b.add_rect(1.05, 3.95, 3.85, 0.40, "Causal Transformer: temporal feature fusion", "#CFEAF5", "#333333", 0.01, font_size=10)
-    b.add_line(1.42, 4.70, 1.42, 4.35, "#777777", 0.01)
-    b.add_line(4.42, 4.70, 4.42, 4.35, "#777777", 0.01)
+    b.add_transformer_template(1.05, 3.88, 3.85, 0.52, "causal temporal fusion")
+    b.add_line(1.42, 4.55, 1.42, 4.40, "#777777", 0.01)
+    b.add_line(4.42, 4.55, 4.42, 4.40, "#777777", 0.01)
     b.add_rect(1.00, 3.22, 3.95, 0.42, "Heads:  μ_t, Σ_t, α_t  (+ anchored Δμ_t)", "#FFF7C8", "#333333", 0.01, font_size=10)
     b.add_line(2.97, 3.95, 2.97, 3.64, "#777777", 0.01)
     b.add_rect(0.82, 2.42, 4.30, 0.47, "Vector Lagrangian IDE kernel  →  transition M_t", "#F5F2FF", "#4A3A8A", 0.012, font_size=10)
@@ -326,13 +374,13 @@ def draw_figure() -> VsdxBuilder:
         else:
             b.add_heatmap_stack(x, 5.35, lab)
     for x in [6.70, 9.90, 11.30]:
-        b.add_rect(x - 0.45, 4.70, 0.95, 0.34, "CNN", "#F6DADB", "#333333", 0.01, font_size=10)
+        b.add_cnn_template(x - 0.56, 4.55, 1.18, 0.58, "CNN")
         b.add_line(x, 5.26, x, 5.04, "#777777", 0.01)
-        b.add_line(x, 4.70, x, 4.35, "#777777", 0.01)
-    b.add_rect(6.25, 3.95, 3.95, 0.40, "reused CNN + causal Transformer", "#CFEAF5", "#333333", 0.01, font_size=10)
-    b.add_rect(10.65, 3.95, 1.35, 0.40, "future\nNWP", "#CFEAF5", "#333333", 0.01, font_size=9)
-    b.add_line(8.22, 3.95, 8.22, 3.55, "#777777", 0.01)
-    b.add_line(11.33, 3.95, 11.33, 3.55, "#777777", 0.01)
+        b.add_line(x, 4.55, x, 4.40, "#777777", 0.01)
+    b.add_transformer_template(6.25, 3.88, 3.95, 0.52, "reused causal Transformer")
+    b.add_rect(10.65, 3.88, 1.35, 0.52, "future\nNWP", "#CFEAF5", "#333333", 0.01, font_size=9)
+    b.add_line(8.22, 3.88, 8.22, 3.55, "#777777", 0.01)
+    b.add_line(11.33, 3.88, 11.33, 3.55, "#777777", 0.01)
     b.add_rect(6.15, 3.08, 4.15, 0.42, "online loss on recent observations: L_KF + λ_anchor ||θ-θ_off||²", "#FFF7C8", "#333333", 0.01, font_size=9)
     b.add_rect(10.62, 3.08, 1.45, 0.42, "θ_{r+1:r+h}", "#FFF7C8", "#333333", 0.01, font_size=11, bold=True)
     b.add_line(8.22, 3.50, 8.22, 3.08, "#777777", 0.01)
