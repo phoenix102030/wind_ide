@@ -331,6 +331,11 @@ class VectorMIDE(nn.Module):
         covariance_scale_max: float = 4.0,
         covariance_cross_corr_limit: float = 0.6,
         advection_component_scale: Sequence[float] | None = None,
+        component_mean_mode: str | None = None,
+        component_residual_scale: float = 0.5,
+        station_feature_pooling: bool = False,
+        station_grid_indices: Sequence[Sequence[int]] | None = None,
+        img_size: int = 40,
     ) -> None:
         super().__init__()
         self.n_sites = n_sites
@@ -373,6 +378,11 @@ class VectorMIDE(nn.Module):
             covariance_scale_max=covariance_scale_max,
             covariance_cross_corr_limit=covariance_cross_corr_limit,
             advection_component_scale=advection_component_scale,
+            component_mean_mode=component_mean_mode,
+            component_residual_scale=component_residual_scale,
+            station_feature_pooling=station_feature_pooling,
+            station_grid_indices=station_grid_indices,
+            img_size=img_size,
         )
         self.kernel = VectorLagrangianKernel(
             n_dim=n_sites,
@@ -548,10 +558,29 @@ class VectorMIDE(nn.Module):
         self,
         v_star: Optional[Tensor],
         outputs: dict[str, Tensor],
+        mode: str = "nll",
     ) -> Tensor:
+        if v_star is None:
+            return outputs["mu"].new_tensor(0.0)
+        mode = str(mode).replace("-", "_").lower()
         if v_star is not None and "advection_component_scale" in outputs and v_star.shape[-1] == 4:
             scale = outputs["advection_component_scale"].to(device=v_star.device, dtype=v_star.dtype)
             v_star = v_star * scale
+        if mode in {"residual_mse", "delta_mse", "anchor_residual_mse"}:
+            anchor = outputs.get("advection_anchor")
+            delta_mu = outputs.get("delta_mu")
+            if anchor is None or delta_mu is None:
+                valid = torch.isfinite(v_star).all(dim=-1)
+                if valid.sum() == 0:
+                    return outputs["mu"].new_tensor(0.0)
+                return (outputs["mu"][valid] - v_star[valid].to(device=outputs["mu"].device, dtype=outputs["mu"].dtype)).pow(2).mean()
+            target_delta = v_star.to(device=anchor.device, dtype=anchor.dtype) - anchor
+            valid = torch.isfinite(target_delta).all(dim=-1)
+            if valid.sum() == 0:
+                return outputs["mu"].new_tensor(0.0)
+            return (delta_mu[valid] - target_delta[valid]).pow(2).mean()
+        if mode not in {"nll", "gaussian_nll"}:
+            raise ValueError(f"Unknown advection_supervision_mode: {mode}")
         if "flow_mu" in outputs and "flow_Sigma" in outputs:
             target = self.shared_flow_target(v_star)
             return advection_nll_loss(target, outputs["flow_mu"], outputs["flow_Sigma"])
@@ -836,6 +865,7 @@ class VectorMIDE(nn.Module):
         B_star: Optional[Tensor] = None,
         H: Optional[Tensor] = None,
         lambda_adv: float = 0.1,
+        advection_supervision_mode: str = "nll",
         lambda_deform: float = 0.0,
         lambda_smooth: float = 0.001,
         lambda_advection_residual: float = 0.0,
@@ -894,7 +924,7 @@ class VectorMIDE(nn.Module):
                 H=H,
             )
             loss_multistep = loss_kf.new_tensor(0.0)
-        loss_adv = self.advection_supervision_loss(v_star, outputs)
+        loss_adv = self.advection_supervision_loss(v_star, outputs, mode=advection_supervision_mode)
         loss_deform = self.deformation_supervision_loss(B_star, outputs)
         delta_mu = outputs.get("delta_mu")
         loss_advection_residual = (

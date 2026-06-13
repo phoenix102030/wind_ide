@@ -58,7 +58,11 @@ class VectorMIDETrainingModule(torch.nn.Module):
                     **outputs,
                 }
             outputs = self.model(x, coords, advection_anchor=advection_anchor)
-            loss_adv = self.model.advection_supervision_loss(v_star, outputs)
+            loss_adv = self.model.advection_supervision_loss(
+                v_star,
+                outputs,
+                mode=str(loss_kwargs.get("advection_supervision_mode", "nll")),
+            )
             loss_deform = self.model.deformation_supervision_loss(B_star, outputs)
             delta_mu = outputs.get("delta_mu")
             loss_advection_residual = (
@@ -275,10 +279,12 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         transformer_causal=bool(config.get("transformer_causal", True)),
         transformer_max_len=int(config.get("transformer_max_len", 4096)),
         component_specific_mu=bool(config.get("component_specific_mu", False)),
+        component_mean_mode=config.get("component_mean_mode"),
         advection_mode=str(config.get("advection_mode", "component")),
         deformation_scale=float(config.get("deformation_scale", 0.3)),
         anchored_advection=bool(config.get("anchored_advection", False)),
         advection_residual_scale=float(config.get("advection_residual_scale", 1.0)),
+        component_residual_scale=float(config.get("component_residual_scale", 0.5)),
         dt=float(config.get("dt", 1.0)),
         gamma=gamma,
         row_normalize=bool(config.get("row_normalize", True)),
@@ -323,6 +329,9 @@ def build_model(config: dict[str, Any]) -> VectorMIDE:
         covariance_scale_max=float(config.get("covariance_scale_max", 4.0)),
         covariance_cross_corr_limit=float(config.get("covariance_cross_corr_limit", 0.6)),
         advection_component_scale=config.get("advection_component_scale"),
+        station_feature_pooling=bool(config.get("station_feature_pooling", False)),
+        station_grid_indices=config.get("data", {}).get("station_grid_indices"),
+        img_size=int(config.get("img_size", 40)),
     )
 
 
@@ -541,6 +550,9 @@ def training_loss_kwargs(config: dict[str, Any], stage: str) -> dict[str, Any]:
         horizons = multistep_horizons(config)
     return {
         "lambda_adv": float(config.get(f"{prefix}lambda_adv", config.get("lambda_adv", 0.1))),
+        "advection_supervision_mode": str(
+            config.get(f"{prefix}advection_supervision_mode", config.get("advection_supervision_mode", "nll"))
+        ),
         "lambda_deform": float(config.get(f"{prefix}lambda_deform", config.get("lambda_deform", 0.0))),
         "lambda_smooth": float(config.get(f"{prefix}lambda_smooth", config.get("lambda_smooth", 0.001))),
         "lambda_advection_residual": float(

@@ -241,11 +241,15 @@ def multi_horizon_forecasts(
     return predictions
 
 
-def advection_summary(mu: np.ndarray, Sigma: np.ndarray, alpha: np.ndarray) -> dict[str, Any]:
+def advection_summary(mu: np.ndarray, Sigma: np.ndarray, alpha: np.ndarray, covariance_floor: float = 0.0) -> dict[str, Any]:
     au = mu[:, :2]
     av = mu[:, 2:]
     diff = au - av
     sigma_diag = np.diagonal(Sigma, axis1=1, axis2=2)
+    eig = np.linalg.eigvalsh(Sigma.astype(np.float64))
+    cross_fro = np.linalg.norm(Sigma[:, :2, 2:], axis=(1, 2))
+    floor_var = float(covariance_floor) ** 2
+    floor_hit_rate = float(np.nanmean(sigma_diag <= floor_var * 1.001 + 1.0e-8)) if floor_var > 0.0 else float("nan")
     return {
         "mu_mean": {name: float(value) for name, value in zip(ADV_NAMES, np.nanmean(mu, axis=0))},
         "mu_std": {name: float(value) for name, value in zip(ADV_NAMES, np.nanstd(mu, axis=0))},
@@ -255,6 +259,14 @@ def advection_summary(mu: np.ndarray, Sigma: np.ndarray, alpha: np.ndarray) -> d
         "Sigma_diag_mean": {
             name: float(value) for name, value in zip(SIGMA_DIAG_NAMES, np.nanmean(sigma_diag, axis=0))
         },
+        "Sigma_diag_std": {
+            name: float(value) for name, value in zip(SIGMA_DIAG_NAMES, np.nanstd(sigma_diag, axis=0))
+        },
+        "Sigma_floor_hit_rate": floor_hit_rate,
+        "Sigma_eig_min_mean": float(np.nanmean(eig[:, 0])),
+        "Sigma_eig_max_mean": float(np.nanmean(eig[:, -1])),
+        "Sigma_cross_fro_mean": float(np.nanmean(cross_fro)),
+        "Sigma_cross_fro_std": float(np.nanstd(cross_fro)),
         "alpha_mean": {
             name: float(value) for name, value in zip(ALPHA_NAMES, np.nanmean(alpha.reshape(alpha.shape[0], 4), axis=0))
         },
@@ -646,7 +658,12 @@ def evaluate(
         "target_mode": data.get("target_mode", "measurement"),
         "forecast_horizon": forecast_horizon,
         "multi_step": multi_step,
-        "advection": advection_summary(outputs["mu"], outputs["Sigma"], outputs["alpha"]),
+        "advection": advection_summary(
+            outputs["mu"],
+            outputs["Sigma"],
+            outputs["alpha"],
+            covariance_floor=float(getattr(model.net, "covariance_floor", 0.0)),
+        ),
         "advection_validation": advection_validation_summary(
             outputs["mu"][:, :2],
             outputs["mu"][:, 2:],

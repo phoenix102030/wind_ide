@@ -31,12 +31,14 @@ nwp_channel_names:
 - u180
 - v180
 component_specific_mu: true
+component_mean_mode: shared_residual
 advection_mode: component
 deformation_scale: 0.3
 anchored_advection: true
 advection_residual_scale: 1.0
-# Manual component prior for [u_x, u_y, v_x, v_y]. Keep an ablation at [1,1,1,1].
-advection_component_scale: [ 1.2, 0.8, 0.8, 1.2 ]
+component_residual_scale: 0.5
+station_feature_pooling: true
+advection_component_scale: [ 1.0, 1.0, 1.0, 1.0 ]
 covariance_mode: coupled_block_cholesky
 covariance_regimes: 3
 covariance_regime_stds: [ 0.3, 1.0, 3.0 ]
@@ -49,8 +51,8 @@ covariance_cross_corr_limit: 0.5
 
 dt: 1.0
 dt_seconds: 600.0
-time_mode: relative_component
-gamma: 0.3
+time_mode: target_only
+gamma: 0.0
 learnable_gamma: false
 
 row_normalize: true
@@ -61,7 +63,7 @@ kalman_jitter: 1e-5
 ell_init: 4.0
 ell_min: 2.0
 ell_max: 12.0
-learnable_ell: true
+learnable_ell: false
 sigma_scale_init: 10.0
 sigma_scale_min: 10.0
 sigma_scale_max: 10.0
@@ -101,26 +103,27 @@ weight_decay: 1e-4
 grad_clip: 1.0
 
 lambda_adv: 0.1
+advection_supervision_mode: residual_mse
 lambda_deform: 0.0
 lambda_advection_residual: 0.001
 adv_lambda_advection_residual: 0.01
 lambda_smooth: 0.001
 lambda_reg: 0.0001
 lambda_multistep: 0.2
-lambda_sigma_ratio: 0.08
-sigma_ratio_min: 0.08
-sigma_ratio_max: 0.8
+lambda_sigma_ratio: 0.0
+sigma_ratio_min: 0.05
+sigma_ratio_max: 0.5
 lambda_covariance_proxy: 0.02
 lambda_covariance_correlation: 0.0
 lambda_regime_usage: 0.0
 lambda_covariance_residual_nll: 0.0
-lambda_covariance_shape: 1.0
+lambda_covariance_shape: 0.5
 covariance_residual_scale: 5.0
 covariance_shape_floor: 0.05
 covariance_proxy_floor: 0.05
 lambda_calibration: 0.0001
 covariance_proxy_mode: nwp_vs_pattern
-covariance_proxy_primary: V_station_optical_star
+covariance_proxy_primary: V_nwp_star
 covariance_proxy_secondary: V_pattern_star
 multistep_horizons: [ 1, 2, 3, 6, 9, 12, 18, 24, 36 ]
 multistep_max_origins: 256
@@ -197,8 +200,8 @@ data:
   - [ 18, 18 ]
   - [ 20, 20 ]
   - [ 22, 22 ]
-  advection_anchor_mode: hybrid_nwp_station_optical_flow
-  advection_label_mode: anchor
+  advection_anchor_mode: nwp
+  advection_label_mode: pattern_tracking
   advection_nwp_weight: 0.75
   advection_anchor_nwp_weight: 0.5
   advection_pattern_weight: 0.75

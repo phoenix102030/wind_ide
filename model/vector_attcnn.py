@@ -170,6 +170,11 @@ class VectorAdvectionNet(nn.Module):
         covariance_scale_max: float = 4.0,
         covariance_cross_corr_limit: float = 0.6,
         advection_component_scale: list[float] | tuple[float, ...] | None = None,
+        component_mean_mode: str | None = None,
+        component_residual_scale: float = 0.5,
+        station_feature_pooling: bool = False,
+        station_grid_indices: list[list[int]] | tuple[tuple[int, int], ...] | None = None,
+        img_size: int = 40,
     ) -> None:
         super().__init__()
         if output_dim != 18:
@@ -202,6 +207,14 @@ class VectorAdvectionNet(nn.Module):
         self.deformation_scale = float(deformation_scale)
         self.anchored_advection = bool(anchored_advection)
         self.advection_residual_scale = float(advection_residual_scale)
+        if component_mean_mode is None:
+            component_mean_mode = "component_specific" if self.component_specific_mu else "direct"
+        self.component_mean_mode = str(component_mean_mode).replace("-", "_").lower()
+        if self.component_mean_mode not in {"direct", "component_specific", "shared_residual"}:
+            raise ValueError("component_mean_mode must be 'direct', 'component_specific', or 'shared_residual'")
+        self.component_residual_scale = float(component_residual_scale)
+        if self.component_residual_scale < 0.0:
+            raise ValueError("component_residual_scale must be non-negative")
         self.covariance_mode = covariance_mode.replace("-", "_").lower()
         if self.covariance_mode not in {"free_cholesky", "regime", "block_cholesky", "coupled_block_cholesky"}:
             raise ValueError(
@@ -235,10 +248,23 @@ class VectorAdvectionNet(nn.Module):
         self.backbone = ConvBackbone(in_channels=in_channels, hidden_dim=hidden_dim)
         self.attention = ChannelSpatialAttention(hidden_dim=hidden_dim)
         self.pool = nn.AdaptiveAvgPool2d(1)
+        self.station_feature_pooling = bool(station_feature_pooling)
+        self.img_size = int(img_size)
+        if self.station_feature_pooling:
+            if station_grid_indices is None or len(station_grid_indices) == 0:
+                raise ValueError("station_feature_pooling requires station_grid_indices")
+            station_tensor = torch.tensor(station_grid_indices, dtype=torch.float32)
+            if station_tensor.ndim != 2 or station_tensor.shape[1] != 2:
+                raise ValueError("station_grid_indices must have shape [n_station,2]")
+            self.register_buffer("station_grid_indices", station_tensor)
+            encoder_feature_dim = hidden_dim * (1 + int(station_tensor.shape[0]))
+        else:
+            self.register_buffer("station_grid_indices", torch.empty(0, 2))
+            encoder_feature_dim = hidden_dim
 
-        feature_dim = hidden_dim
+        feature_dim = encoder_feature_dim
         if network_type == "cnn_transformer":
-            self.temporal_proj = nn.Linear(hidden_dim, transformer_d_model)
+            self.temporal_proj = nn.Linear(encoder_feature_dim, transformer_d_model)
             self.positional_encoding = SinusoidalPositionalEncoding(
                 d_model=transformer_d_model,
                 max_len=transformer_max_len,
@@ -265,8 +291,8 @@ class VectorAdvectionNet(nn.Module):
             nn.SiLU(),
         )
         use_component_heads = self.advection_mode == "component"
-        self.mu_head = None if (self.component_specific_mu or not use_component_heads) else nn.Linear(feature_dim, 4)
-        if use_component_heads and self.component_specific_mu:
+        self.mu_head = None if (self.component_mean_mode != "direct" or not use_component_heads) else nn.Linear(feature_dim, 4)
+        if use_component_heads and self.component_mean_mode in {"component_specific", "shared_residual"}:
             self.mu_u_head_shared = nn.Sequential(
                 nn.Linear(feature_dim, feature_dim),
                 nn.SiLU(),
@@ -467,6 +493,9 @@ class VectorAdvectionNet(nn.Module):
         features = self.backbone(x)
         features = self.attention(features)
         pooled = self.pool(features).flatten(1)
+        if self.station_feature_pooling:
+            station_features = self._station_pool_features(features)
+            pooled = torch.cat([pooled, station_features], dim=-1)
 
         if self.network_type == "cnn":
             return pooled
@@ -477,8 +506,19 @@ class VectorAdvectionNet(nn.Module):
         encoded = self.temporal_encoder(seq, mask=mask)
         return encoded.squeeze(0)
 
+    def _station_pool_features(self, features: Tensor) -> Tensor:
+        if self.station_grid_indices.numel() == 0:
+            return features.new_empty(features.shape[0], 0)
+        _, _, height, width = features.shape
+        scale_y = (height - 1) / max(float(self.img_size - 1), 1.0)
+        scale_x = (width - 1) / max(float(self.img_size - 1), 1.0)
+        rows = torch.round(self.station_grid_indices[:, 0] * scale_y).long().clamp(0, height - 1)
+        cols = torch.round(self.station_grid_indices[:, 1] * scale_x).long().clamp(0, width - 1)
+        sampled = features[:, :, rows, cols]
+        return sampled.transpose(1, 2).reshape(features.shape[0], -1)
+
     def predict_raw_mu(self, shared_features: Tensor) -> Tensor:
-        if not self.component_specific_mu:
+        if self.component_mean_mode == "direct":
             if self.mu_head is None:
                 raise RuntimeError("mu_head is not initialized")
             return self.mu_head(shared_features)
@@ -486,6 +526,52 @@ class VectorAdvectionNet(nn.Module):
         features_u = self.mu_u_head_shared(shared_features)
         features_v = self.mu_v_head_shared(shared_features)
         return torch.cat([self.mu_u_head(features_u), self.mu_v_head(features_v)], dim=-1)
+
+    def component_mean_from_raw(
+        self,
+        raw_mu: Tensor,
+        advection_anchor: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None]:
+        if self.component_mean_mode != "shared_residual":
+            if self.anchored_advection:
+                delta_mu = torch.tanh(raw_mu) * self.advection_residual_scale
+                if advection_anchor is None:
+                    anchor = torch.zeros_like(delta_mu)
+                else:
+                    anchor = self._expand_anchor(advection_anchor, delta_mu)
+                anchor = self._scaled_component_advection(anchor)
+                return anchor + delta_mu, delta_mu, anchor, None
+            mu = self._scaled_component_advection(torch.tanh(raw_mu) * self.mu_scale)
+            return mu, None, None, None
+
+        raw_u = raw_mu[..., :2]
+        raw_v = raw_mu[..., 2:]
+        raw_shared = 0.5 * (raw_u + raw_v)
+        raw_delta_u = raw_u - raw_shared
+        raw_delta_v = raw_v - raw_shared
+        component_delta = self.component_residual_scale * torch.tanh(torch.cat([raw_delta_u, raw_delta_v], dim=-1))
+
+        if self.anchored_advection:
+            if advection_anchor is None:
+                anchor = torch.zeros_like(raw_mu)
+            else:
+                anchor = self._expand_anchor(advection_anchor, raw_mu)
+            anchor = self._scaled_component_advection(anchor)
+            shared_anchor = 0.5 * (anchor[..., :2] + anchor[..., 2:])
+            shared_mu = shared_anchor + self.advection_residual_scale * torch.tanh(raw_shared)
+        else:
+            anchor = None
+            shared_mu = torch.tanh(raw_shared) * self.mu_scale
+
+        mu = torch.cat(
+            [
+                shared_mu + component_delta[..., :2],
+                shared_mu + component_delta[..., 2:],
+            ],
+            dim=-1,
+        )
+        delta_mu = mu - anchor if anchor is not None else None
+        return mu, delta_mu, anchor, component_delta
 
     @staticmethod
     def _expand_flow_cholesky_raw(raw_flow_chol: Tensor) -> Tensor:
@@ -792,18 +878,7 @@ class VectorAdvectionNet(nn.Module):
         raw_alpha = self.alpha_head(features)
         raw = torch.cat([raw_mu, raw_chol, raw_alpha], dim=-1)
 
-        if self.anchored_advection:
-            delta_mu = torch.tanh(raw_mu) * self.advection_residual_scale
-            if advection_anchor is None:
-                anchor = torch.zeros_like(delta_mu)
-            else:
-                anchor = self._expand_anchor(advection_anchor, delta_mu)
-            anchor = self._scaled_component_advection(anchor)
-            mu = anchor + delta_mu
-        else:
-            delta_mu = None
-            anchor = None
-            mu = self._scaled_component_advection(torch.tanh(raw_mu) * self.mu_scale)
+        mu, delta_mu, anchor, component_delta = self.component_mean_from_raw(raw_mu, advection_anchor)
         L, sigma, covariance_extra = self.component_covariance_from_raw(raw_chol, raw_scale=raw_covariance_scale)
         alpha_logits = raw_alpha.reshape(-1, 2, 2)
         alpha = torch.softmax(alpha_logits, dim=-1)
@@ -823,6 +898,9 @@ class VectorAdvectionNet(nn.Module):
         if delta_mu is not None and anchor is not None:
             result["delta_mu"] = delta_mu
             result["advection_anchor"] = anchor
+        if component_delta is not None:
+            result["component_delta"] = component_delta
+            result["shared_mu"] = 0.5 * (mu[..., :2] + mu[..., 2:])
         if self.kernel_weight_head is not None:
             raw_kernel_weight = self.kernel_weight_head(features)
             result["raw_kernel_weight"] = raw_kernel_weight
